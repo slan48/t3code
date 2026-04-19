@@ -14,8 +14,11 @@ import {
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ServerProvider } from "@t3tools/contracts";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import {
   COMPOSER_DRAFT_STORAGE_KEY,
+  deriveEffectiveComposerModelState,
   finalizePromotedDraftThreadByRef,
   markPromotedDraftThread,
   markPromotedDraftThreadByRef,
@@ -1444,5 +1447,103 @@ describe("createDebouncedStorage", () => {
     vi.advanceTimersByTime(300);
     expect(base.setItem).toHaveBeenCalledTimes(1);
     expect(base.setItem).toHaveBeenCalledWith("key", "v2");
+  });
+});
+
+const PROVIDERS_FOR_EFFECTIVE_MODEL_STATE: ReadonlyArray<ServerProvider> = [
+  {
+    provider: "codex",
+    enabled: true,
+    installed: true,
+    version: "0.1.0",
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    slashCommands: [],
+    skills: [],
+    models: [
+      {
+        slug: "gpt-5.4",
+        name: "GPT-5.4",
+        isCustom: false,
+        capabilities: {
+          reasoningEffortLevels: [],
+          supportsFastMode: false,
+          supportsThinkingToggle: false,
+          contextWindowOptions: [],
+          promptInjectedEffortLevels: [],
+        },
+      },
+    ],
+  },
+  {
+    provider: "claudeAgent",
+    enabled: true,
+    installed: true,
+    version: "0.1.0",
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: "2026-01-01T00:00:00.000Z",
+    slashCommands: [],
+    skills: [],
+    models: [
+      {
+        slug: "claude-sonnet-4-6",
+        name: "Claude Sonnet 4.6",
+        isCustom: false,
+        capabilities: {
+          reasoningEffortLevels: [],
+          supportsFastMode: false,
+          supportsThinkingToggle: false,
+          contextWindowOptions: [],
+          promptInjectedEffortLevels: [],
+        },
+      },
+    ],
+  },
+];
+
+describe("deriveEffectiveComposerModelState", () => {
+  it("ignores a cross-provider project model when picking the base model for a new thread", () => {
+    // Simulates the original bug: a codex-scoped selection (e.g. "gpt-5.4")
+    // survived on the project/thread entity, but the user has since switched
+    // to claudeAgent. Without the fix, the claudeAgent picker rendered the
+    // stale codex slug next to the Claude icon.
+    const result = deriveEffectiveComposerModelState({
+      draft: null,
+      providers: PROVIDERS_FOR_EFFECTIVE_MODEL_STATE,
+      selectedProvider: "claudeAgent",
+      threadModelSelection: null,
+      projectModelSelection: { provider: "codex", model: "gpt-5.4" },
+      settings: DEFAULT_UNIFIED_SETTINGS,
+    });
+
+    expect(result.selectedModel).toBe("claude-sonnet-4-6");
+  });
+
+  it("carries the thread model over when its provider matches the selected provider", () => {
+    const result = deriveEffectiveComposerModelState({
+      draft: null,
+      providers: PROVIDERS_FOR_EFFECTIVE_MODEL_STATE,
+      selectedProvider: "claudeAgent",
+      threadModelSelection: { provider: "claudeAgent", model: "claude-sonnet-4-6" },
+      projectModelSelection: { provider: "codex", model: "gpt-5.4" },
+      settings: DEFAULT_UNIFIED_SETTINGS,
+    });
+
+    expect(result.selectedModel).toBe("claude-sonnet-4-6");
+  });
+
+  it("falls back to the provider default when no matching selection exists and no draft is present", () => {
+    const result = deriveEffectiveComposerModelState({
+      draft: null,
+      providers: PROVIDERS_FOR_EFFECTIVE_MODEL_STATE,
+      selectedProvider: "claudeAgent",
+      threadModelSelection: null,
+      projectModelSelection: null,
+      settings: DEFAULT_UNIFIED_SETTINGS,
+    });
+
+    expect(result.selectedModel).toBe("claude-sonnet-4-6");
   });
 });
