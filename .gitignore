@@ -22,3 +22,6 @@ apps/web/src/components/__screenshots__
 __screenshots__/
 .tanstack
 squashfs-root/
+.playwright-mcp/
+test-screenshots/
+t3code-*.png
