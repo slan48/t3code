@@ -1,8 +1,10 @@
 import { createFileRoute, retainSearchParams, useNavigate } from "@tanstack/react-router";
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 
-import ChatView from "../components/ChatView";
+import ChatView, { RIGHT_DOCK_TERMINAL_SLOT_ID } from "../components/ChatView";
 import { threadHasStarted } from "../components/ChatView.logic";
+import { scopeThreadRef } from "@t3tools/client-runtime";
+import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
 import { DiffWorkerPoolProvider } from "../components/DiffWorkerPoolProvider";
 import {
   DiffPanelHeaderSkeleton,
@@ -53,17 +55,32 @@ const DiffPanelInlineSidebar = (props: {
   onCloseDiff: () => void;
   onOpenDiff: () => void;
   renderDiffContent: boolean;
+  terminalDockedRight: boolean;
+  terminalHeightPx: number;
+  onDockTerminalBottom: () => void;
 }) => {
-  const { diffOpen, onCloseDiff, onOpenDiff, renderDiffContent } = props;
+  const {
+    diffOpen,
+    onCloseDiff,
+    onOpenDiff,
+    renderDiffContent,
+    terminalDockedRight,
+    terminalHeightPx,
+    onDockTerminalBottom,
+  } = props;
+  const sidebarOpen = diffOpen || terminalDockedRight;
   const onOpenChange = useCallback(
     (open: boolean) => {
       if (open) {
         onOpenDiff();
         return;
       }
+      if (terminalDockedRight) {
+        onDockTerminalBottom();
+      }
       onCloseDiff();
     },
-    [onCloseDiff, onOpenDiff],
+    [onCloseDiff, onDockTerminalBottom, onOpenDiff, terminalDockedRight],
   );
   const shouldAcceptInlineSidebarWidth = useCallback(
     ({ nextWidth, wrapper }: { nextWidth: number; wrapper: HTMLElement }) => {
@@ -111,10 +128,13 @@ const DiffPanelInlineSidebar = (props: {
     [],
   );
 
+  const showDiff = diffOpen && renderDiffContent;
+  const showStacked = showDiff && terminalDockedRight;
+
   return (
     <SidebarProvider
       defaultOpen={false}
-      open={diffOpen}
+      open={sidebarOpen}
       onOpenChange={onOpenChange}
       className="w-auto min-h-0 flex-none bg-transparent"
       style={{ "--sidebar-width": DIFF_INLINE_DEFAULT_WIDTH } as React.CSSProperties}
@@ -129,7 +149,20 @@ const DiffPanelInlineSidebar = (props: {
           storageKey: DIFF_INLINE_SIDEBAR_WIDTH_STORAGE_KEY,
         }}
       >
-        {renderDiffContent ? <LazyDiffPanel mode="sidebar" /> : null}
+        <div className="flex h-full min-h-0 flex-col">
+          {showDiff ? (
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <LazyDiffPanel mode="sidebar" />
+            </div>
+          ) : null}
+          <div
+            id={RIGHT_DOCK_TERMINAL_SLOT_ID}
+            className={`flex min-w-0 flex-col ${
+              showStacked ? "flex-none border-t border-border/80" : "min-h-0 flex-1"
+            } ${terminalDockedRight ? "" : "hidden"}`}
+            style={showStacked ? { height: `${terminalHeightPx}px` } : undefined}
+          />
+        </div>
         <SidebarRail />
       </Sidebar>
     </SidebarProvider>
@@ -142,6 +175,20 @@ function ChatThreadRouteView() {
     select: (params) => resolveThreadRouteRef(params),
   });
   const search = Route.useSearch();
+  const routeThreadRef = useMemo(
+    () => (threadRef ? scopeThreadRef(threadRef.environmentId, threadRef.threadId) : null),
+    [threadRef],
+  );
+  const terminalDockPosition = useTerminalStateStore((s) => s.terminalDockPosition);
+  const setTerminalDockPosition = useTerminalStateStore((s) => s.setTerminalDockPosition);
+  const terminalStateForRoute = useTerminalStateStore((s) =>
+    selectThreadTerminalState(s.terminalStateByThreadKey, routeThreadRef),
+  );
+  const terminalDockedRight =
+    terminalDockPosition === "right" && terminalStateForRoute.terminalOpen;
+  const onDockTerminalBottom = useCallback(() => {
+    setTerminalDockPosition("bottom");
+  }, [setTerminalDockPosition]);
   const bootstrapComplete = useStore(
     (store) => selectEnvironmentState(store, threadRef?.environmentId ?? null).bootstrapComplete,
   );
@@ -252,6 +299,9 @@ function ChatThreadRouteView() {
           onCloseDiff={closeDiff}
           onOpenDiff={openDiff}
           renderDiffContent={shouldRenderDiffContent}
+          terminalDockedRight={terminalDockedRight}
+          terminalHeightPx={terminalStateForRoute.terminalHeight}
+          onDockTerminalBottom={onDockTerminalBottom}
         />
       </>
     );

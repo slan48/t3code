@@ -1,5 +1,13 @@
 import { FitAddon } from "@xterm/addon-fit";
-import { Plus, SquareSplitHorizontal, TerminalSquare, Trash2, XIcon } from "lucide-react";
+import {
+  PanelBottom,
+  PanelRight,
+  Plus,
+  SquareSplitHorizontal,
+  TerminalSquare,
+  Trash2,
+  XIcon,
+} from "lucide-react";
 import {
   type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
@@ -47,7 +55,11 @@ import {
 } from "../types";
 import { readEnvironmentApi } from "~/environmentApi";
 import { readLocalApi } from "~/localApi";
-import { selectTerminalEventEntries, useTerminalStateStore } from "../terminalStateStore";
+import {
+  selectTerminalEventEntries,
+  useTerminalStateStore,
+  type TerminalDockPosition,
+} from "../terminalStateStore";
 
 const MIN_DRAWER_HEIGHT = 180;
 const MAX_DRAWER_HEIGHT_RATIO = 0.75;
@@ -811,6 +823,8 @@ interface ThreadTerminalDrawerProps {
   terminalGroups: ThreadTerminalGroup[];
   activeTerminalGroupId: string;
   focusRequestId: number;
+  dockPosition: TerminalDockPosition;
+  onToggleDockPosition: () => void;
   onSplitTerminal: () => void;
   onNewTerminal: () => void;
   splitShortcutLabel?: string | undefined;
@@ -865,6 +879,8 @@ export default function ThreadTerminalDrawer({
   terminalGroups,
   activeTerminalGroupId,
   focusRequestId,
+  dockPosition,
+  onToggleDockPosition,
   onSplitTerminal,
   onNewTerminal,
   splitShortcutLabel,
@@ -876,6 +892,9 @@ export default function ThreadTerminalDrawer({
   onAddTerminalContext,
   keybindings,
 }: ThreadTerminalDrawerProps) {
+  const isRightDocked = dockPosition === "right";
+  const toggleDockLabel = isRightDocked ? "Dock terminal to bottom" : "Dock terminal to right";
+  const ToggleDockIcon = isRightDocked ? PanelBottom : PanelRight;
   const [drawerHeight, setDrawerHeight] = useState(() => clampDrawerHeight(height));
   const [resizeEpoch, setResizeEpoch] = useState(0);
   const drawerHeightRef = useRef(drawerHeight);
@@ -1111,20 +1130,32 @@ export default function ThreadTerminalDrawer({
 
   return (
     <aside
-      className="thread-terminal-drawer relative flex min-w-0 shrink-0 flex-col overflow-hidden border-t border-border/80 bg-background"
-      style={{ height: `${drawerHeight}px` }}
+      className={`thread-terminal-drawer relative flex min-w-0 shrink-0 flex-col overflow-hidden bg-background ${
+        isRightDocked ? "" : "border-t border-border/80"
+      }`}
+      style={isRightDocked ? { flex: "1 1 auto", minHeight: 0 } : { height: `${drawerHeight}px` }}
     >
-      <div
-        className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-        onPointerDown={handleResizePointerDown}
-        onPointerMove={handleResizePointerMove}
-        onPointerUp={handleResizePointerEnd}
-        onPointerCancel={handleResizePointerEnd}
-      />
+      {!isRightDocked && (
+        <div
+          className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={handleResizePointerEnd}
+          onPointerCancel={handleResizePointerEnd}
+        />
+      )}
 
       {!hasTerminalSidebar && (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
           <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70">
+            <TerminalActionButton
+              className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+              onClick={onToggleDockPosition}
+              label={toggleDockLabel}
+            >
+              <ToggleDockIcon className="size-3.25" />
+            </TerminalActionButton>
+            <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
               className={`p-1 text-foreground/90 transition-colors ${
                 hasReachedSplitLimit
@@ -1227,7 +1258,14 @@ export default function ThreadTerminalDrawer({
               <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
                 <div className="inline-flex h-full items-stretch">
                   <TerminalActionButton
-                    className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
+                    className="inline-flex h-full items-center px-1 text-foreground/90 transition-colors hover:bg-accent/70"
+                    onClick={onToggleDockPosition}
+                    label={toggleDockLabel}
+                  >
+                    <ToggleDockIcon className="size-3.25" />
+                  </TerminalActionButton>
+                  <TerminalActionButton
+                    className={`inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors ${
                       hasReachedSplitLimit
                         ? "cursor-not-allowed opacity-45 hover:bg-transparent"
                         : "hover:bg-accent/70"
