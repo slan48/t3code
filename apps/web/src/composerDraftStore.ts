@@ -797,11 +797,19 @@ export function deriveEffectiveComposerModelState(input: {
   projectModelSelection: ModelSelection | null | undefined;
   settings: UnifiedSettings;
 }): EffectiveComposerModelState {
+  // Only carry over the thread/project model when it belongs to the active
+  // provider. Otherwise a stale cross-provider model (e.g. a codex slug like
+  // "gpt-5.4" on a claudeAgent thread) would leak through and render as a
+  // mismatched label next to the wrong provider icon.
+  const carryOverSelection =
+    input.threadModelSelection?.provider === input.selectedProvider
+      ? input.threadModelSelection
+      : input.projectModelSelection?.provider === input.selectedProvider
+        ? input.projectModelSelection
+        : null;
   const baseModel =
-    normalizeModelSlug(
-      input.threadModelSelection?.model ?? input.projectModelSelection?.model,
-      input.selectedProvider,
-    ) ?? getDefaultServerModel(input.providers, input.selectedProvider);
+    normalizeModelSlug(carryOverSelection?.model, input.selectedProvider) ??
+    getDefaultServerModel(input.providers, input.selectedProvider);
   const activeSelection = input.draft?.modelSelectionByProvider?.[input.selectedProvider];
   const selectedModel = activeSelection?.model
     ? resolveAppModelSelection(
