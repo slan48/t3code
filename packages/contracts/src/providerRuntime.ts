@@ -278,6 +278,8 @@ const SessionExitedPayload = Schema.Struct({
   reason: Schema.optional(TrimmedNonEmptyStringSchema),
   recoverable: Schema.optional(Schema.Boolean),
   exitKind: Schema.optional(RuntimeSessionExitKind),
+  /** Latest resume cursor snapshot at the time the session exited. */
+  resumeCursor: Schema.optional(Schema.Unknown),
 });
 export type SessionExitedPayload = typeof SessionExitedPayload.Type;
 

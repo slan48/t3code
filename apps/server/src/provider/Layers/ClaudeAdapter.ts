@@ -272,6 +272,19 @@ function isInterruptedResult(result: SDKResultMessage): boolean {
   );
 }
 
+// Claude returns these errors when a resumed session id no longer exists
+// server-side (the SDK silently assigns a new session at init, then rejects
+// the first turn). Surface this as a recoverable condition so we can wipe
+// the stale cursor and let the next turn start fresh.
+function isSessionRejectionResult(result: SDKResultMessage): boolean {
+  const errors = resultErrorsText(result);
+  return (
+    errors.includes("no conversation found with session id") ||
+    errors.includes("unknown session") ||
+    errors.includes("session not found")
+  );
+}
+
 function asRuntimeItemId(value: string): RuntimeItemId {
   return RuntimeItemId.make(value);
 }
@@ -2007,6 +2020,29 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     const status = turnStatusFromResult(message);
     const errorMessage = message.subtype === "success" ? undefined : message.errors[0];
 
+    if (status === "failed" && isSessionRejectionResult(message)) {
+      const recoveryMessage =
+        "Claude rejected the resumed session. Conversation state was cleared; send your message again to continue with transcript context.";
+      yield* Effect.logWarning("claude.session.rejected-by-sdk", {
+        threadId: context.session.threadId,
+        rejectedSessionId: context.resumeSessionId,
+        claudeError: errorMessage,
+      });
+      // Wipe in-memory resume tracking so updateResumeCursor and
+      // stopSessionInternal don't carry the stale id forward.
+      context.resumeSessionId = undefined;
+      context.lastAssistantUuid = undefined;
+      yield* emitRuntimeWarning(context, recoveryMessage, {
+        claudeError: errorMessage,
+      });
+      yield* completeTurn(context, "failed", recoveryMessage, message);
+      yield* stopSessionInternal(context, {
+        emitExitEvent: true,
+        clearResumeCursor: true,
+      });
+      return;
+    }
+
     if (status === "failed") {
       yield* emitRuntimeError(context, errorMessage ?? "Claude turn failed.");
     }
@@ -2367,7 +2403,16 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     context: ClaudeSessionContext,
-    options?: { readonly emitExitEvent?: boolean },
+    options?: {
+      readonly emitExitEvent?: boolean;
+      /**
+       * When true, the emitted session.exited payload carries an explicit
+       * `resumeCursor: null` so the persistence layer wipes any stale cursor.
+       * Used after Claude rejects a resumed session id — keeping the stale
+       * cursor would cause the next session to fail with the same error.
+       */
+      readonly clearResumeCursor?: boolean;
+    },
   ) {
     if (context.stopped) return;
 
@@ -2397,6 +2442,44 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* completeTurn(context, "interrupted", "Session stopped.");
     }
 
+    const updatedAt = yield* nowIso;
+    context.session = {
+      ...context.session,
+      status: "closed",
+      activeTurnId: undefined,
+      updatedAt,
+    };
+
+    // Emit session.exited BEFORE interrupting the stream fiber. When
+    // stopSessionInternal is invoked from within the stream fiber itself
+    // (e.g. after handleResultMessage detects a rejected resume), the
+    // interrupt would otherwise kill the fiber before session.exited fires.
+    if (options?.emitExitEvent !== false) {
+      const stamp = yield* makeEventStamp();
+      const clearResumeCursor = options?.clearResumeCursor === true;
+      yield* offerRuntimeEvent({
+        type: "session.exited",
+        eventId: stamp.eventId,
+        provider: PROVIDER,
+        createdAt: stamp.createdAt,
+        threadId: context.session.threadId,
+        payload: {
+          reason: clearResumeCursor ? "Session rejected by Claude" : "Session stopped",
+          exitKind: "graceful",
+          // Persist the latest resume cursor so session recovery can use it
+          // even after stream crashes or unexpected exits. When Claude
+          // rejects the resumed session, emit `null` explicitly to wipe the
+          // stale cursor from persistence.
+          ...(clearResumeCursor
+            ? { resumeCursor: null }
+            : context.session.resumeCursor !== undefined
+              ? { resumeCursor: context.session.resumeCursor }
+              : {}),
+        },
+        providerRefs: {},
+      });
+    }
+
     yield* Queue.shutdown(context.promptQueue);
 
     const streamFiber = context.streamFiber;
@@ -2410,30 +2493,6 @@ const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       context.query.close();
     } catch (cause) {
       yield* emitRuntimeError(context, "Failed to close Claude runtime query.", cause);
-    }
-
-    const updatedAt = yield* nowIso;
-    context.session = {
-      ...context.session,
-      status: "closed",
-      activeTurnId: undefined,
-      updatedAt,
-    };
-
-    if (options?.emitExitEvent !== false) {
-      const stamp = yield* makeEventStamp();
-      yield* offerRuntimeEvent({
-        type: "session.exited",
-        eventId: stamp.eventId,
-        provider: PROVIDER,
-        createdAt: stamp.createdAt,
-        threadId: context.session.threadId,
-        payload: {
-          reason: "Session stopped",
-          exitKind: "graceful",
-        },
-        providerRefs: {},
-      });
     }
 
     sessions.delete(context.session.threadId);

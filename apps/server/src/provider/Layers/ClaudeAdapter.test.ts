@@ -1239,6 +1239,84 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect(
+    "wipes resume cursor and tears down session when Claude rejects the resumed session id",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const context = yield* Effect.context<never>();
+        const runFork = Effect.runForkWith(context);
+
+        const adapter = yield* ClaudeAdapter;
+        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+
+        const runtimeEventsFiber = runFork(
+          Stream.runForEach(adapter.streamEvents, (event) =>
+            Effect.sync(() => {
+              runtimeEvents.push(event);
+            }),
+          ),
+        );
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: "claudeAgent",
+          runtimeMode: "full-access",
+          resumeCursor: {
+            threadId: THREAD_ID,
+            resume: "stale-server-session",
+            turnCount: 0,
+          },
+        });
+
+        const turn = yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "hello",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          errors: ["No conversation found with session ID: stale-server-session"],
+          session_id: "reassigned-session-id",
+          uuid: "result-rejection",
+        } as unknown as SDKMessage);
+
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        runtimeEventsFiber.interruptUnsafe();
+
+        const types = runtimeEvents.map((event) => event.type);
+        assert.isTrue(types.includes("runtime.warning"), `expected runtime.warning in ${types}`);
+        assert.isFalse(types.includes("runtime.error"), `did not expect runtime.error in ${types}`);
+        assert.isTrue(types.includes("session.exited"), `expected session.exited in ${types}`);
+
+        const turnCompleted = runtimeEvents.find((event) => event.type === "turn.completed");
+        assert.equal(turnCompleted?.type, "turn.completed");
+        if (turnCompleted?.type === "turn.completed") {
+          assert.equal(String(turnCompleted.turnId), String(turn.turnId));
+          assert.equal(turnCompleted.payload.state, "failed");
+          assert.isString(turnCompleted.payload.errorMessage);
+          assert.include(turnCompleted.payload.errorMessage ?? "", "rejected the resumed session");
+        }
+
+        const sessionExited = runtimeEvents.find((event) => event.type === "session.exited");
+        assert.equal(sessionExited?.type, "session.exited");
+        if (sessionExited?.type === "session.exited") {
+          assert.equal(sessionExited.payload.resumeCursor, null);
+        }
+
+        assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
   it.effect("closes the session when the Claude stream aborts after a turn starts", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
