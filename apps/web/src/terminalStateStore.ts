@@ -42,24 +42,38 @@ const TERMINAL_STATE_STORAGE_KEY = "t3code:terminal-state:v1";
 const EMPTY_TERMINAL_EVENT_ENTRIES: ReadonlyArray<TerminalEventEntry> = [];
 const MAX_TERMINAL_EVENT_BUFFER = 200;
 
+export type TerminalDockPosition = "bottom" | "right";
+export const DEFAULT_TERMINAL_DOCK_POSITION: TerminalDockPosition = "bottom";
+
 interface PersistedTerminalStateStoreState {
   terminalStateByThreadKey?: Record<string, ThreadTerminalState>;
+  terminalDockPosition?: TerminalDockPosition;
+}
+
+function normalizeDockPosition(value: unknown): TerminalDockPosition {
+  return value === "right" ? "right" : DEFAULT_TERMINAL_DOCK_POSITION;
 }
 
 export function migratePersistedTerminalStateStoreState(
   persistedState: unknown,
   version: number,
 ): PersistedTerminalStateStoreState {
-  if (version === 1 && persistedState && typeof persistedState === "object") {
+  if (version >= 1 && persistedState && typeof persistedState === "object") {
     const candidate = persistedState as PersistedTerminalStateStoreState;
     const nextTerminalStateByThreadKey = Object.fromEntries(
       Object.entries(candidate.terminalStateByThreadKey ?? {}).filter(([threadKey]) =>
         parseScopedThreadKey(threadKey),
       ),
     );
-    return { terminalStateByThreadKey: nextTerminalStateByThreadKey };
+    return {
+      terminalStateByThreadKey: nextTerminalStateByThreadKey,
+      terminalDockPosition: normalizeDockPosition(candidate.terminalDockPosition),
+    };
   }
-  return { terminalStateByThreadKey: {} };
+  return {
+    terminalStateByThreadKey: {},
+    terminalDockPosition: DEFAULT_TERMINAL_DOCK_POSITION,
+  };
 }
 
 function createTerminalStateStorage() {
@@ -568,6 +582,8 @@ interface TerminalStateStoreState {
   terminalLaunchContextByThreadKey: Record<string, ThreadTerminalLaunchContext>;
   terminalEventEntriesByKey: Record<string, ReadonlyArray<TerminalEventEntry>>;
   nextTerminalEventId: number;
+  terminalDockPosition: TerminalDockPosition;
+  setTerminalDockPosition: (dockPosition: TerminalDockPosition) => void;
   setTerminalOpen: (threadRef: ScopedThreadRef, open: boolean) => void;
   setTerminalHeight: (threadRef: ScopedThreadRef, height: number) => void;
   splitTerminal: (threadRef: ScopedThreadRef, terminalId: string) => void;
@@ -623,6 +639,13 @@ export const useTerminalStateStore = create<TerminalStateStoreState>()(
         terminalLaunchContextByThreadKey: {},
         terminalEventEntriesByKey: {},
         nextTerminalEventId: 1,
+        terminalDockPosition: DEFAULT_TERMINAL_DOCK_POSITION,
+        setTerminalDockPosition: (dockPosition) =>
+          set((state) =>
+            state.terminalDockPosition === dockPosition
+              ? state
+              : { terminalDockPosition: dockPosition },
+          ),
         setTerminalOpen: (threadRef, open) =>
           updateTerminal(threadRef, (state) => setThreadTerminalOpen(state, open)),
         setTerminalHeight: (threadRef, height) =>
@@ -841,6 +864,7 @@ export const useTerminalStateStore = create<TerminalStateStoreState>()(
       migrate: migratePersistedTerminalStateStoreState,
       partialize: (state) => ({
         terminalStateByThreadKey: state.terminalStateByThreadKey,
+        terminalDockPosition: state.terminalDockPosition,
       }),
     },
   ),

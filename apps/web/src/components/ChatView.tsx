@@ -31,6 +31,7 @@ import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/proje
 import { truncate } from "@t3tools/shared/String";
 import { Debouncer } from "@tanstack/react-pacer";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useShallow } from "zustand/react/shallow";
 import { useGitStatus } from "~/lib/gitStatusState";
@@ -407,6 +408,8 @@ function useLocalDispatchState(input: {
   };
 }
 
+export const RIGHT_DOCK_TERMINAL_SLOT_ID = "t3code-right-dock-terminal-slot";
+
 interface PersistentThreadTerminalDrawerProps {
   threadRef: { environmentId: EnvironmentId; threadId: ThreadId };
   threadId: ThreadId;
@@ -417,6 +420,8 @@ interface PersistentThreadTerminalDrawerProps {
   newShortcutLabel: string | undefined;
   closeShortcutLabel: string | undefined;
   keybindings: ResolvedKeybindingsConfig;
+  dockPosition: "bottom" | "right";
+  onToggleDockPosition: () => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
 }
 
@@ -430,6 +435,8 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
   newShortcutLabel,
   closeShortcutLabel,
   keybindings,
+  dockPosition,
+  onToggleDockPosition,
   onAddTerminalContext,
 }: PersistentThreadTerminalDrawerProps) {
   const serverThread = useStore(useMemo(() => createThreadSelectorByRef(threadRef), [threadRef]));
@@ -549,38 +556,70 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     [onAddTerminalContext, visible],
   );
 
+  const [rightDockSlot, setRightDockSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (dockPosition !== "right" || !visible) {
+      setRightDockSlot(null);
+      return;
+    }
+    const element = document.getElementById(RIGHT_DOCK_TERMINAL_SLOT_ID);
+    setRightDockSlot(element);
+    if (element) return;
+    const observer = new MutationObserver(() => {
+      const next = document.getElementById(RIGHT_DOCK_TERMINAL_SLOT_ID);
+      if (next) {
+        setRightDockSlot(next);
+        observer.disconnect();
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [dockPosition, visible]);
+
   if (!project || !terminalState.terminalOpen || !cwd) {
     return null;
   }
 
-  return (
-    <div className={visible ? undefined : "hidden"}>
-      <ThreadTerminalDrawer
-        threadRef={threadRef}
-        threadId={threadId}
-        cwd={cwd}
-        worktreePath={effectiveWorktreePath}
-        runtimeEnv={runtimeEnv}
-        visible={visible}
-        height={terminalState.terminalHeight}
-        terminalIds={terminalState.terminalIds}
-        activeTerminalId={terminalState.activeTerminalId}
-        terminalGroups={terminalState.terminalGroups}
-        activeTerminalGroupId={terminalState.activeTerminalGroupId}
-        focusRequestId={focusRequestId + localFocusRequestId + (visible ? 1 : 0)}
-        onSplitTerminal={splitTerminal}
-        onNewTerminal={createNewTerminal}
-        splitShortcutLabel={visible ? splitShortcutLabel : undefined}
-        newShortcutLabel={visible ? newShortcutLabel : undefined}
-        closeShortcutLabel={visible ? closeShortcutLabel : undefined}
-        keybindings={keybindings}
-        onActiveTerminalChange={activateTerminal}
-        onCloseTerminal={closeTerminal}
-        onHeightChange={setTerminalHeight}
-        onAddTerminalContext={handleAddTerminalContext}
-      />
-    </div>
+  const drawerElement = (
+    <ThreadTerminalDrawer
+      threadRef={threadRef}
+      threadId={threadId}
+      cwd={cwd}
+      worktreePath={effectiveWorktreePath}
+      runtimeEnv={runtimeEnv}
+      visible={visible}
+      height={terminalState.terminalHeight}
+      terminalIds={terminalState.terminalIds}
+      activeTerminalId={terminalState.activeTerminalId}
+      terminalGroups={terminalState.terminalGroups}
+      activeTerminalGroupId={terminalState.activeTerminalGroupId}
+      focusRequestId={focusRequestId + localFocusRequestId + (visible ? 1 : 0)}
+      dockPosition={dockPosition}
+      onToggleDockPosition={onToggleDockPosition}
+      onSplitTerminal={splitTerminal}
+      onNewTerminal={createNewTerminal}
+      splitShortcutLabel={visible ? splitShortcutLabel : undefined}
+      newShortcutLabel={visible ? newShortcutLabel : undefined}
+      closeShortcutLabel={visible ? closeShortcutLabel : undefined}
+      keybindings={keybindings}
+      onActiveTerminalChange={activateTerminal}
+      onCloseTerminal={closeTerminal}
+      onHeightChange={setTerminalHeight}
+      onAddTerminalContext={handleAddTerminalContext}
+    />
   );
+
+  if (dockPosition === "right") {
+    if (!rightDockSlot) return null;
+    return createPortal(
+      <div className={`flex min-h-0 flex-1 flex-col ${visible ? "" : "hidden"}`}>
+        {drawerElement}
+      </div>,
+      rightDockSlot,
+    );
+  }
+
+  return <div className={visible ? undefined : "hidden"}>{drawerElement}</div>;
 });
 
 export default function ChatView(props: ChatViewProps) {
@@ -727,6 +766,11 @@ export default function ChatView(props: ChatViewProps) {
   const storeNewTerminal = useTerminalStateStore((s) => s.newTerminal);
   const storeSetActiveTerminal = useTerminalStateStore((s) => s.setActiveTerminal);
   const storeCloseTerminal = useTerminalStateStore((s) => s.closeTerminal);
+  const terminalDockPosition = useTerminalStateStore((s) => s.terminalDockPosition);
+  const storeSetTerminalDockPosition = useTerminalStateStore((s) => s.setTerminalDockPosition);
+  const toggleTerminalDockPosition = useCallback(() => {
+    storeSetTerminalDockPosition(terminalDockPosition === "right" ? "bottom" : "right");
+  }, [storeSetTerminalDockPosition, terminalDockPosition]);
   const serverThreadKeys = useStore(
     useShallow((state) =>
       selectThreadsAcrossEnvironments(state).map((thread) =>
@@ -3445,6 +3489,8 @@ export default function ChatView(props: ChatViewProps) {
           newShortcutLabel={newTerminalShortcutLabel ?? undefined}
           closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
           keybindings={keybindings}
+          dockPosition={terminalDockPosition}
+          onToggleDockPosition={toggleTerminalDockPosition}
           onAddTerminalContext={addTerminalContextToDraft}
         />
       ))}
