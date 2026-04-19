@@ -4,6 +4,7 @@ import {
   EventId,
   type ModelSelection,
   type OrchestrationEvent,
+  type OrchestrationMessage,
   ProviderKind,
   type OrchestrationSession,
   ThreadId,
@@ -46,6 +47,103 @@ type ProviderIntentEvent = Extract<
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Conversation history injection for session recovery
+// ---------------------------------------------------------------------------
+// When a provider session is recovered (e.g. after a stream crash, server
+// restart, or session reaper GC), the Claude SDK's `resume` mechanism may
+// silently fail if the server-side session expired. In that case the model
+// starts a fresh conversation with no prior context — even though the user
+// sees the full conversation in the UI.
+//
+// As a defense-in-depth measure, we inject a condensed transcript of the
+// prior conversation into the first user message after recovery. If resume
+// DID work, the model harmlessly sees redundant context. If resume FAILED,
+// this transcript is the only source of conversation continuity.
+// ---------------------------------------------------------------------------
+
+/** Maximum character budget for the injected context transcript. */
+const CONTEXT_INJECTION_MAX_CHARS = 50_000;
+
+const CONTEXT_PREAMBLE =
+  "[SESSION RECOVERED — conversation transcript injected for continuity]\n" +
+  "The session was restarted. Below is a transcript of the previous conversation.\n" +
+  "If you already have this context from a successful session resume, you may\n" +
+  "disregard the transcript and focus on the latest request.\n";
+
+const TRANSCRIPT_HEADER = "--- Previous conversation ---";
+const LATEST_REQUEST_HEADER = "--- Latest request (answer this now) ---";
+const OMITTED_NOTICE = (count: number) =>
+  `[${count} earlier message(s) omitted to stay within context limits]`;
+
+function messageRoleLabel(role: OrchestrationMessage["role"]): "USER" | "ASSISTANT" {
+  return role === "assistant" ? "ASSISTANT" : "USER";
+}
+
+function buildMessageBlock(msg: OrchestrationMessage): string {
+  const label = messageRoleLabel(msg.role);
+  const text = msg.text?.trim();
+  return text ? `${label}:\n${text}` : `${label}:\n(empty message)`;
+}
+
+/**
+ * Build a user prompt that includes a transcript of previous messages
+ * followed by the current user message. Newest messages are prioritised
+ * when the transcript exceeds the character budget.
+ */
+function buildContextInjectedInput(
+  previousMessages: ReadonlyArray<OrchestrationMessage>,
+  latestPrompt: string,
+): string {
+  if (previousMessages.length === 0) {
+    return latestPrompt;
+  }
+
+  const budget = CONTEXT_INJECTION_MAX_CHARS;
+
+  // Build blocks newest-first so we can prioritise recent context.
+  const newestFirst: string[] = [];
+  for (let i = previousMessages.length - 1; i >= 0; i--) {
+    const msg = previousMessages[i];
+    if (msg) newestFirst.push(buildMessageBlock(msg));
+  }
+
+  // Greedily include as many recent messages as fit in the budget.
+  let includedNewestFirst: string[] = [];
+  for (const block of newestFirst) {
+    const candidate = [...includedNewestFirst, block];
+    const chronological = candidate.toReversed();
+    const omittedCount = newestFirst.length - chronological.length;
+    const transcriptBody =
+      omittedCount > 0
+        ? `${OMITTED_NOTICE(omittedCount)}\n\n${chronological.join("\n\n")}`
+        : chronological.join("\n\n");
+    const full = `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${transcriptBody}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
+    if (full.length > budget) break;
+    includedNewestFirst = candidate;
+  }
+
+  // Trim from the oldest end if we still exceed the budget.
+  let chronological = includedNewestFirst.toReversed();
+  while (chronological.length > 0) {
+    const omittedCount = newestFirst.length - chronological.length;
+    const transcriptBody =
+      omittedCount > 0
+        ? `${OMITTED_NOTICE(omittedCount)}\n\n${chronological.join("\n\n")}`
+        : chronological.join("\n\n");
+    const full = `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${transcriptBody}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
+    if (full.length <= budget) return full;
+    chronological = chronological.slice(1);
+  }
+
+  // Couldn't fit any history — just return the latest prompt with a notice.
+  if (previousMessages.length > 0) {
+    return `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${OMITTED_NOTICE(previousMessages.length)}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
+  }
+
+  return latestPrompt;
 }
 
 function mapProviderSessionStatusToOrchestrationStatus(
@@ -257,6 +355,17 @@ const make = Effect.gen(function* () {
     return readModel.threads.find((entry) => entry.id === threadId);
   });
 
+  interface EnsureSessionResult {
+    readonly threadId: ThreadId;
+    /**
+     * `true` when the session was freshly (re)started — either from scratch
+     * or via a resume cursor — rather than reusing an already-running session.
+     * Used to decide whether conversation history should be injected as a
+     * defense-in-depth measure against silent resume failures.
+     */
+    readonly sessionRecovered: boolean;
+  }
+
   const ensureSessionForThread = Effect.fn("ensureSessionForThread")(function* (
     threadId: ThreadId,
     createdAt: string,
@@ -342,7 +451,12 @@ const make = Effect.gen(function* () {
         requestedModelSelection !== undefined &&
         requestedModelSelection.model !== activeSession?.model;
       const shouldRestartForModelChange = modelChanged && sessionModelSwitch === "unsupported";
-      const previousModelSelection = threadModelSelections.get(threadId);
+      // Fall back to the thread's persisted model selection when the
+      // in-memory cache is empty (e.g. after a server restart). Without
+      // this, `previousModelSelection` would be undefined on the first
+      // turn after restart, causing an unnecessary session restart even
+      // when the model selection hasn't actually changed.
+      const previousModelSelection = threadModelSelections.get(threadId) ?? thread.modelSelection;
       const shouldRestartForModelSelectionChange =
         currentProvider === "claudeAgent" &&
         requestedModelSelection !== undefined &&
@@ -353,7 +467,7 @@ const make = Effect.gen(function* () {
         !shouldRestartForModelChange &&
         !shouldRestartForModelSelectionChange
       ) {
-        return existingSessionThreadId;
+        return { threadId: existingSessionThreadId, sessionRecovered: false };
       }
 
       const resumeCursor = shouldRestartForModelChange
@@ -383,12 +497,12 @@ const make = Effect.gen(function* () {
         runtimeMode: restartedSession.runtimeMode,
       });
       yield* bindSessionToThread(restartedSession);
-      return restartedSession.threadId;
+      return { threadId: restartedSession.threadId, sessionRecovered: true };
     }
 
     const startedSession = yield* startProviderSession(undefined);
     yield* bindSessionToThread(startedSession);
-    return startedSession.threadId;
+    return { threadId: startedSession.threadId, sessionRecovered: true };
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
@@ -405,7 +519,7 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(
+    const ensureResult = yield* ensureSessionForThread(
       input.threadId,
       input.createdAt,
       input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
@@ -413,7 +527,30 @@ const make = Effect.gen(function* () {
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
-    const normalizedInput = toNonEmptyProviderInput(input.messageText);
+
+    // When the session was just (re)started and the thread already has
+    // conversation history, inject a transcript of previous messages into
+    // the user prompt. This acts as a defense-in-depth against silent SDK
+    // resume failures — if the Claude server-side session expired, the
+    // model would otherwise lose all conversation context.
+    const previousMessages = thread.messages.filter(
+      (msg) => msg.role === "user" || msg.role === "assistant",
+    );
+    const shouldInjectHistory = ensureResult.sessionRecovered && previousMessages.length > 0;
+    const effectiveInput = shouldInjectHistory
+      ? buildContextInjectedInput(previousMessages, input.messageText)
+      : input.messageText;
+
+    if (shouldInjectHistory) {
+      yield* Effect.logInfo("provider command reactor injecting conversation context", {
+        threadId: input.threadId,
+        previousMessageCount: previousMessages.length,
+        originalInputLength: input.messageText.length,
+        effectiveInputLength: effectiveInput.length,
+      });
+    }
+
+    const normalizedInput = toNonEmptyProviderInput(effectiveInput);
     const normalizedAttachments = input.attachments ?? [];
     const activeSession = yield* providerService
       .listSessions()

@@ -193,7 +193,35 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     increment(providerRuntimeEventsTotal, {
       provider: event.provider,
       eventType: event.type,
-    }).pipe(Effect.andThen(publishRuntimeEvent(event)));
+    }).pipe(
+      Effect.andThen(publishRuntimeEvent(event)),
+      // When a session exits, persist the latest resume cursor to SQLite so
+      // that session recovery can pick it up — even after stream crashes or
+      // unexpected process exits where the normal sendTurn persistence path
+      // was never reached.
+      Effect.andThen(() => {
+        if (event.type !== "session.exited") return Effect.void;
+        const payload = event.payload as {
+          resumeCursor?: unknown;
+        };
+        if (payload.resumeCursor === undefined) return Effect.void;
+        return directory
+          .upsert({
+            threadId: event.threadId,
+            provider: event.provider,
+            resumeCursor: payload.resumeCursor,
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("provider.session.exited.persist-resume-cursor-failed", {
+                threadId: event.threadId,
+                provider: event.provider,
+                cause,
+              }),
+            ),
+          );
+      }),
+    );
 
   yield* Effect.forEach(adapters, (adapter) =>
     Stream.runForEach(adapter.streamEvents, processRuntimeEvent).pipe(Effect.forkScoped),
