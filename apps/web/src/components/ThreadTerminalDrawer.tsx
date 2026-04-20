@@ -579,6 +579,32 @@ export function TerminalViewport({
       attributeFilter: ["class", "style"],
     });
 
+    let containerResizeFrame: number | null = null;
+    const containerResizeObserver = new ResizeObserver(() => {
+      if (containerResizeFrame !== null) return;
+      containerResizeFrame = window.requestAnimationFrame(() => {
+        containerResizeFrame = null;
+        const activeTerminal = terminalRef.current;
+        const activeFitAddon = fitAddonRef.current;
+        if (!activeTerminal || !activeFitAddon) return;
+        const wasAtBottom =
+          activeTerminal.buffer.active.viewportY >= activeTerminal.buffer.active.baseY;
+        activeFitAddon.fit();
+        if (wasAtBottom) {
+          activeTerminal.scrollToBottom();
+        }
+        void api.terminal
+          .resize({
+            threadId,
+            terminalId,
+            cols: activeTerminal.cols,
+            rows: activeTerminal.rows,
+          })
+          .catch(() => undefined);
+      });
+    });
+    containerResizeObserver.observe(mount);
+
     const applyTerminalEvent = (event: TerminalEvent) => {
       const activeTerminal = terminalRef.current;
       if (!activeTerminal) {
@@ -757,6 +783,10 @@ export function TerminalViewport({
       window.removeEventListener("mouseup", handleMouseUp);
       mount.removeEventListener("pointerdown", handlePointerDown);
       themeObserver.disconnect();
+      containerResizeObserver.disconnect();
+      if (containerResizeFrame !== null) {
+        window.cancelAnimationFrame(containerResizeFrame);
+      }
       terminalRef.current = null;
       fitAddonRef.current = null;
       terminal.dispose();
