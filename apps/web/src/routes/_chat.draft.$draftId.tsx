@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import ChatView from "../components/ChatView";
 import { threadHasStarted } from "../components/ChatView.logic";
 import { useComposerDraftStore, DraftId } from "../composerDraftStore";
@@ -7,6 +7,13 @@ import { SidebarInset } from "../components/ui/sidebar";
 import { createThreadSelectorAcrossEnvironments } from "../storeSelectors";
 import { useStore } from "../store";
 import { buildThreadRouteParams } from "../threadRoutes";
+import { scopeThreadRef } from "@t3tools/client-runtime";
+import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
+import { DiffPanelInlineSidebar } from "../components/chat/DiffPanelInlineSidebar";
+import { useMediaQuery } from "../hooks/useMediaQuery";
+import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
+
+const noop = () => {};
 
 function DraftChatThreadRouteView() {
   const navigate = useNavigate();
@@ -34,6 +41,25 @@ function DraftChatThreadRouteView() {
           : null,
     [draftSession?.promotedTo, serverThread, serverThreadStarted],
   );
+
+  const draftThreadRef = useMemo(
+    () =>
+      draftSession
+        ? scopeThreadRef(draftSession.environmentId, draftSession.threadId)
+        : null,
+    [draftSession],
+  );
+  const terminalDockPosition = useTerminalStateStore((s) => s.terminalDockPosition);
+  const setTerminalDockPosition = useTerminalStateStore((s) => s.setTerminalDockPosition);
+  const terminalStateForRoute = useTerminalStateStore((s) =>
+    selectThreadTerminalState(s.terminalStateByThreadKey, draftThreadRef),
+  );
+  const terminalDockedRight =
+    terminalDockPosition === "right" && terminalStateForRoute.terminalOpen;
+  const onDockTerminalBottom = useCallback(() => {
+    setTerminalDockPosition("bottom");
+  }, [setTerminalDockPosition]);
+  const shouldUseDiffSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
 
   useEffect(() => {
     if (!canonicalThreadRef) {
@@ -70,14 +96,27 @@ function DraftChatThreadRouteView() {
   }
 
   return (
-    <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
-      <ChatView
-        draftId={draftId}
-        environmentId={draftSession.environmentId}
-        threadId={draftSession.threadId}
-        routeKind="draft"
-      />
-    </SidebarInset>
+    <>
+      <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground">
+        <ChatView
+          draftId={draftId}
+          environmentId={draftSession.environmentId}
+          threadId={draftSession.threadId}
+          routeKind="draft"
+        />
+      </SidebarInset>
+      {!shouldUseDiffSheet && (
+        <DiffPanelInlineSidebar
+          diffOpen={false}
+          onCloseDiff={noop}
+          onOpenDiff={noop}
+          renderDiffContent={false}
+          terminalDockedRight={terminalDockedRight}
+          terminalHeightPx={terminalStateForRoute.terminalHeight}
+          onDockTerminalBottom={onDockTerminalBottom}
+        />
+      )}
+    </>
   );
 }
 
