@@ -443,6 +443,7 @@ const make = Effect.gen(function* () {
       thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
     if (existingSessionThreadId) {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
+      const cwdChanged = effectiveCwd !== activeSession?.cwd;
       const sessionModelSwitch =
         currentProvider === undefined
           ? "in-session"
@@ -464,6 +465,7 @@ const make = Effect.gen(function* () {
 
       if (
         !runtimeModeChanged &&
+        !cwdChanged &&
         !shouldRestartForModelChange &&
         !shouldRestartForModelSelectionChange
       ) {
@@ -481,6 +483,9 @@ const make = Effect.gen(function* () {
         currentRuntimeMode: thread.session?.runtimeMode,
         desiredRuntimeMode: thread.runtimeMode,
         runtimeModeChanged,
+        previousCwd: activeSession?.cwd,
+        desiredCwd: effectiveCwd,
+        cwdChanged,
         modelChanged,
         shouldRestartForModelChange,
         shouldRestartForModelSelectionChange,
@@ -495,6 +500,7 @@ const make = Effect.gen(function* () {
         restartedSessionThreadId: restartedSession.threadId,
         provider: restartedSession.provider,
         runtimeMode: restartedSession.runtimeMode,
+        cwd: restartedSession.cwd,
       });
       yield* bindSessionToThread(restartedSession);
       return { threadId: restartedSession.threadId, sessionRecovered: true };
