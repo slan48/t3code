@@ -51,15 +51,19 @@ drop ours.
 
 ### 3. Composer cross-provider model leak fix
 - **Commit:** `36467784` (PR #2, merge `b8342cfb`)
-- **Files:** `apps/web/src/modelSelection.ts` (and related composer logic)
+- **Files:** `apps/web/src/composerDraftStore.ts`,
+  `apps/web/src/composerDraftStore.test.ts`
 - **What:** Prevents the composer from deriving a "base model" that belongs
-  to a different provider than the one currently selected.
-- **Pre-merge check:** Look at `modelSelection.ts` /
-  `ProviderModelPicker*.tsx` in upstream diff. Upstream has been heavily
-  refactoring the model picker; they may have rewritten this path entirely.
-  If so, verify the bug (switch providers in the composer and confirm the
-  previous provider's model isn't sticky) on upstream's version before
-  re-applying.
+  to a different provider than the one currently selected. The fix lives in
+  `deriveEffectiveComposerModelState` — the thread/project model is only
+  carried over when its `.provider` matches the active provider; otherwise
+  fall through to `getDefaultServerModel`.
+- **Pre-merge check:** Look at `composerDraftStore.{ts,test.ts}` in the
+  upstream diff. Upstream has been refactoring composer state and model
+  selection (e.g. #2246 "option arrays" rewrote the persistence layer
+  here). Confirm the `provider === selectedProvider` carry-over guard in
+  `deriveEffectiveComposerModelState` survived the refactor; if upstream
+  added an equivalent guard, drop ours.
 - **Post-merge test:** open composer, pick a Claude model, switch provider
   dropdown to Codex/OpenCode, confirm the selected model resets to a model
   from the new provider.
@@ -137,6 +141,48 @@ drop ours.
 - **Post-merge test:** open a brand-new chat (draft) with dock=right → toggle
   terminal → it should appear immediately (no need to send a message first).
 
+### 8. Sidebar toggle works in terminal + `terminal.dock.toggle` shortcut
+- **Commits:** `f3b236d0` (feat), `75c21d31` (gitignore housekeeping)
+- **Files:** `apps/server/src/keybindings.ts`,
+  `apps/web/src/components/AppSidebarLayout.tsx`,
+  `apps/web/src/components/ChatView.tsx`,
+  `apps/web/src/components/ThreadTerminalDrawer.tsx`,
+  `apps/web/src/keybindings.ts`,
+  `apps/web/src/keybindings.test.ts`,
+  `packages/contracts/src/keybindings.ts`,
+  `.gitignore`
+- **What:**
+  - Drops the `when: "!terminalFocus"` qualifier from the default
+    `sidebar.toggle` binding (so Cmd+B works whether focus is in the
+    composer, the terminal, or anywhere else).
+  - Registers the global Cmd+B handler in `AppSidebarLayout` on the
+    *capture* phase so Lexical (composer) and xterm (terminal) cannot
+    swallow the keystroke first.
+  - Updates xterm's `attachCustomKeyEventHandler` to forward
+    `sidebar.toggle` and the new `terminal.dock.toggle` keystrokes
+    instead of writing them as terminal input.
+  - Adds a new keybinding command `terminal.dock.toggle` (default
+    `mod+shift+j`) that flips the terminal panel between bottom-dock
+    and right-dock via the existing `toggleTerminalDockPosition`
+    callback in `ChatView`.
+  - Ignores `.claude/launch.json`, `.claude/settings.local.json`, and
+    `test-report.md` (transient/per-developer files).
+- **Pre-merge check:** Upstream may add its own dock-toggle command or
+  rework keybinding defaults. If upstream adds a `sidebar.toggle` rule
+  with a different `when` clause, prefer ours. Note: existing users'
+  `~/.t3/dev/keybindings.json` (and the `userdata` variant) override
+  defaults — `syncDefaultKeybindingsOnStartup` deduplicates by command
+  name, so changes to default `when` clauses won't propagate. New users
+  pick up the unrestricted `sidebar.toggle` and the new
+  `terminal.dock.toggle` automatically.
+- **Post-merge test:**
+  1. Cmd+B with terminal focused → sidebar toggles, no `b` written to
+     the terminal.
+  2. Cmd+B with composer focused → sidebar toggles, no bold formatting
+     applied.
+  3. Cmd+Shift+J → terminal panel flips between bottom and right
+     docking from any focus context.
+
 ## Merge workflow
 
 1. **Fetch upstream:**
@@ -164,7 +210,7 @@ drop ours.
    bun test                                  # root tests
    ```
 6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 1, 3, 5, 6, 7).
+   that have actual UI/runtime behavior (items 1, 3, 5, 6, 7, 8).
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased
