@@ -2320,6 +2320,13 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
 
+      if (command === "terminal.dock.toggle") {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleTerminalDockPosition();
+        return;
+      }
+
       if (command === "diff.toggle") {
         event.preventDefault();
         event.stopPropagation();
@@ -2357,6 +2364,7 @@ export default function ChatView(props: ChatViewProps) {
     keybindings,
     onToggleDiff,
     toggleTerminalVisibility,
+    toggleTerminalDockPosition,
   ]);
 
   const onRevertToTurnCount = useCallback(

@@ -2,11 +2,14 @@ import { useEffect, type ReactNode } from "react";
 import { useNavigate } from "@tanstack/react-router";
 
 import ThreadSidebar from "./Sidebar";
-import { Sidebar, SidebarProvider, SidebarRail } from "./ui/sidebar";
+import { Sidebar, SidebarProvider, SidebarRail, useSidebar } from "./ui/sidebar";
 import {
   clearShortcutModifierState,
   syncShortcutModifierStateFromKeyboardEvent,
 } from "../shortcutModifierState";
+import { resolveShortcutCommand } from "../keybindings";
+import { useServerKeybindings } from "../rpc/serverState";
+import { isTerminalFocused } from "../lib/terminalFocus";
 
 const THREAD_SIDEBAR_WIDTH_STORAGE_KEY = "chat_thread_sidebar_width";
 const THREAD_SIDEBAR_MIN_WIDTH = 13 * 16;
@@ -55,6 +58,7 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
 
   return (
     <SidebarProvider defaultOpen>
+      <SidebarShortcutHandler />
       <Sidebar
         side="left"
         collapsible="offcanvas"
@@ -72,4 +76,25 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
       {children}
     </SidebarProvider>
   );
+}
+
+function SidebarShortcutHandler() {
+  const { toggleSidebar } = useSidebar();
+  const keybindings = useServerKeybindings();
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const command = resolveShortcutCommand(event, keybindings, {
+        context: { terminalFocus: isTerminalFocused() },
+      });
+      if (command !== "sidebar.toggle") return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleSidebar();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [keybindings, toggleSidebar]);
+
+  return null;
 }
