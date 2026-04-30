@@ -4,8 +4,7 @@ import {
   EventId,
   type ModelSelection,
   type OrchestrationEvent,
-  type OrchestrationMessage,
-  ProviderKind,
+  ProviderDriverKind,
   type OrchestrationSession,
   ThreadId,
   type ProviderSession,
@@ -49,103 +48,6 @@ function toNonEmptyProviderInput(value: string | undefined): string | undefined 
   return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Conversation history injection for session recovery
-// ---------------------------------------------------------------------------
-// When a provider session is recovered (e.g. after a stream crash, server
-// restart, or session reaper GC), the Claude SDK's `resume` mechanism may
-// silently fail if the server-side session expired. In that case the model
-// starts a fresh conversation with no prior context — even though the user
-// sees the full conversation in the UI.
-//
-// As a defense-in-depth measure, we inject a condensed transcript of the
-// prior conversation into the first user message after recovery. If resume
-// DID work, the model harmlessly sees redundant context. If resume FAILED,
-// this transcript is the only source of conversation continuity.
-// ---------------------------------------------------------------------------
-
-/** Maximum character budget for the injected context transcript. */
-const CONTEXT_INJECTION_MAX_CHARS = 50_000;
-
-const CONTEXT_PREAMBLE =
-  "[SESSION RECOVERED — conversation transcript injected for continuity]\n" +
-  "The session was restarted. Below is a transcript of the previous conversation.\n" +
-  "If you already have this context from a successful session resume, you may\n" +
-  "disregard the transcript and focus on the latest request.\n";
-
-const TRANSCRIPT_HEADER = "--- Previous conversation ---";
-const LATEST_REQUEST_HEADER = "--- Latest request (answer this now) ---";
-const OMITTED_NOTICE = (count: number) =>
-  `[${count} earlier message(s) omitted to stay within context limits]`;
-
-function messageRoleLabel(role: OrchestrationMessage["role"]): "USER" | "ASSISTANT" {
-  return role === "assistant" ? "ASSISTANT" : "USER";
-}
-
-function buildMessageBlock(msg: OrchestrationMessage): string {
-  const label = messageRoleLabel(msg.role);
-  const text = msg.text?.trim();
-  return text ? `${label}:\n${text}` : `${label}:\n(empty message)`;
-}
-
-/**
- * Build a user prompt that includes a transcript of previous messages
- * followed by the current user message. Newest messages are prioritised
- * when the transcript exceeds the character budget.
- */
-function buildContextInjectedInput(
-  previousMessages: ReadonlyArray<OrchestrationMessage>,
-  latestPrompt: string,
-): string {
-  if (previousMessages.length === 0) {
-    return latestPrompt;
-  }
-
-  const budget = CONTEXT_INJECTION_MAX_CHARS;
-
-  // Build blocks newest-first so we can prioritise recent context.
-  const newestFirst: string[] = [];
-  for (let i = previousMessages.length - 1; i >= 0; i--) {
-    const msg = previousMessages[i];
-    if (msg) newestFirst.push(buildMessageBlock(msg));
-  }
-
-  // Greedily include as many recent messages as fit in the budget.
-  let includedNewestFirst: string[] = [];
-  for (const block of newestFirst) {
-    const candidate = [...includedNewestFirst, block];
-    const chronological = candidate.toReversed();
-    const omittedCount = newestFirst.length - chronological.length;
-    const transcriptBody =
-      omittedCount > 0
-        ? `${OMITTED_NOTICE(omittedCount)}\n\n${chronological.join("\n\n")}`
-        : chronological.join("\n\n");
-    const full = `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${transcriptBody}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
-    if (full.length > budget) break;
-    includedNewestFirst = candidate;
-  }
-
-  // Trim from the oldest end if we still exceed the budget.
-  let chronological = includedNewestFirst.toReversed();
-  while (chronological.length > 0) {
-    const omittedCount = newestFirst.length - chronological.length;
-    const transcriptBody =
-      omittedCount > 0
-        ? `${OMITTED_NOTICE(omittedCount)}\n\n${chronological.join("\n\n")}`
-        : chronological.join("\n\n");
-    const full = `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${transcriptBody}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
-    if (full.length <= budget) return full;
-    chronological = chronological.slice(1);
-  }
-
-  // Couldn't fit any history — just return the latest prompt with a notice.
-  if (previousMessages.length > 0) {
-    return `${CONTEXT_PREAMBLE}\n${TRANSCRIPT_HEADER}\n${OMITTED_NOTICE(previousMessages.length)}\n\n${LATEST_REQUEST_HEADER}\n${latestPrompt}`;
-  }
-
-  return latestPrompt;
-}
-
 function mapProviderSessionStatusToOrchestrationStatus(
   status: "connecting" | "ready" | "running" | "error" | "closed",
 ): OrchestrationSession["status"] {
@@ -174,6 +76,21 @@ const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
+
+export function providerErrorLabel(value: string | undefined): string {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : "unknown";
+}
+
+export function providerErrorLabelFromInstanceHint(input: {
+  readonly instanceId?: string | undefined;
+  readonly modelSelectionInstanceId?: string | undefined;
+  readonly sessionProvider?: string | undefined;
+}): string {
+  return providerErrorLabel(
+    input.instanceId ?? input.modelSelectionInstanceId ?? input.sessionProvider,
+  );
+}
 
 function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolean {
   const trimmedCurrentTitle = currentTitle.trim();
@@ -355,17 +272,6 @@ const make = Effect.gen(function* () {
     return readModel.threads.find((entry) => entry.id === threadId);
   });
 
-  interface EnsureSessionResult {
-    readonly threadId: ThreadId;
-    /**
-     * `true` when the session was freshly (re)started — either from scratch
-     * or via a resume cursor — rather than reusing an already-running session.
-     * Used to decide whether conversation history should be injected as a
-     * defense-in-depth measure against silent resume failures.
-     */
-    readonly sessionRecovered: boolean;
-  }
-
   const ensureSessionForThread = Effect.fn("ensureSessionForThread")(function* (
     threadId: ThreadId,
     createdAt: string,
@@ -380,42 +286,108 @@ const make = Effect.gen(function* () {
     }
 
     const desiredRuntimeMode = thread.runtimeMode;
-    const currentProvider: ProviderKind | undefined = Schema.is(ProviderKind)(
-      thread.session?.providerName,
-    )
-      ? thread.session.providerName
-      : undefined;
     const requestedModelSelection = options?.modelSelection;
-    const threadProvider: ProviderKind = currentProvider ?? thread.modelSelection.provider;
-    if (
-      requestedModelSelection !== undefined &&
-      requestedModelSelection.provider !== threadProvider
-    ) {
-      return yield* new ProviderAdapterRequestError({
-        provider: threadProvider,
-        method: "thread.turn.start",
-        detail: `Thread '${threadId}' is bound to provider '${threadProvider}' and cannot switch to '${requestedModelSelection.provider}'.`,
-      });
-    }
-    const preferredProvider: ProviderKind = threadProvider;
-    const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
-    const effectiveCwd = resolveThreadWorkspaceCwd({
-      thread,
-      projects: readModel.projects,
-    });
-
     const resolveActiveSession = (threadId: ThreadId) =>
       providerService
         .listSessions()
         .pipe(Effect.map((sessions) => sessions.find((session) => session.threadId === threadId)));
 
+    const activeSession = yield* resolveActiveSession(threadId);
+    const activeThreadSession =
+      thread.session !== null && thread.session.status !== "stopped" && activeSession
+        ? thread.session
+        : null;
+    if (
+      activeThreadSession !== null &&
+      activeSession !== undefined &&
+      (activeThreadSession.providerInstanceId === undefined ||
+        activeSession.providerInstanceId === undefined)
+    ) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabel(activeThreadSession.providerName ?? undefined),
+        method: "thread.turn.start",
+        detail: `Thread '${threadId}' has an active provider session without a provider instance id.`,
+      });
+    }
+    const currentInstanceId =
+      activeThreadSession !== null &&
+      activeSession !== undefined &&
+      activeSession.providerInstanceId !== undefined
+        ? activeSession.providerInstanceId
+        : thread.modelSelection.instanceId;
+    const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
+    const desiredInstanceId = desiredModelSelection.instanceId;
+    const currentInfo = yield* providerService.getInstanceInfo(currentInstanceId).pipe(
+      Effect.mapError(
+        () =>
+          new ProviderAdapterRequestError({
+            provider: providerErrorLabelFromInstanceHint({
+              instanceId: String(currentInstanceId),
+              modelSelectionInstanceId: String(thread.modelSelection.instanceId),
+              sessionProvider: thread.session?.providerName ?? undefined,
+            }),
+            method: "thread.turn.start",
+            detail: `Thread '${threadId}' references unknown provider instance '${currentInstanceId}'. The instance is not configured in this build.`,
+          }),
+      ),
+    );
+    const desiredInfo = yield* providerService.getInstanceInfo(desiredInstanceId).pipe(
+      Effect.mapError(
+        () =>
+          new ProviderAdapterRequestError({
+            provider: providerErrorLabelFromInstanceHint({
+              instanceId: String(desiredModelSelection.instanceId),
+            }),
+            method: "thread.turn.start",
+            detail: `Requested provider instance '${desiredInstanceId}' is not configured in this build.`,
+          }),
+      ),
+    );
+    const desiredDriverKind = desiredInfo.driverKind;
+    if (!Schema.is(ProviderDriverKind)(desiredDriverKind)) {
+      return yield* new ProviderAdapterRequestError({
+        provider: providerErrorLabel(String(desiredDriverKind)),
+        method: "thread.turn.start",
+        detail: `Requested provider instance '${desiredInstanceId}' uses unknown provider driver '${desiredDriverKind}'. The driver is not installed in this build.`,
+      });
+    }
+    const preferredProvider: ProviderDriverKind = desiredDriverKind;
+    if (
+      thread.session !== null &&
+      requestedModelSelection !== undefined &&
+      requestedModelSelection.instanceId !== currentInstanceId
+    ) {
+      if (currentInfo.driverKind !== desiredInfo.driverKind) {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Thread '${threadId}' is bound to driver '${currentInfo.driverKind}' and cannot switch to '${desiredInfo.driverKind}'.`,
+        });
+      }
+      if (
+        currentInfo.continuationIdentity.continuationKey !==
+        desiredInfo.continuationIdentity.continuationKey
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: preferredProvider,
+          method: "thread.turn.start",
+          detail: `Thread '${threadId}' cannot switch from instance '${currentInstanceId}' to '${desiredInstanceId}' because their provider resume state is incompatible.`,
+        });
+      }
+    }
+    const effectiveCwd = resolveThreadWorkspaceCwd({
+      thread,
+      projects: readModel.projects,
+    });
+
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
-      readonly provider?: ProviderKind;
+      readonly provider?: ProviderDriverKind;
     }) =>
       providerService.startSession(threadId, {
         threadId,
         ...(preferredProvider ? { provider: preferredProvider } : {}),
+        providerInstanceId: desiredInstanceId,
         ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
         modelSelection: desiredModelSelection,
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
@@ -423,53 +395,59 @@ const make = Effect.gen(function* () {
       });
 
     const bindSessionToThread = (session: ProviderSession) =>
-      setThreadSession({
-        threadId,
-        session: {
+      Effect.gen(function* () {
+        if (session.providerInstanceId === undefined) {
+          return yield* new ProviderAdapterRequestError({
+            provider: providerErrorLabel(session.provider),
+            method: "thread.turn.start",
+            detail: `Provider session '${session.threadId}' started without a provider instance id.`,
+          });
+        }
+        yield* setThreadSession({
           threadId,
-          status: mapProviderSessionStatusToOrchestrationStatus(session.status),
-          providerName: session.provider,
-          runtimeMode: desiredRuntimeMode,
-          // Provider turn ids are not orchestration turn ids.
-          activeTurnId: null,
-          lastError: session.lastError ?? null,
-          updatedAt: session.updatedAt,
-        },
-        createdAt,
+          session: {
+            threadId,
+            status: mapProviderSessionStatusToOrchestrationStatus(session.status),
+            providerName: session.provider,
+            providerInstanceId: session.providerInstanceId,
+            runtimeMode: desiredRuntimeMode,
+            // Provider turn ids are not orchestration turn ids.
+            activeTurnId: null,
+            lastError: session.lastError ?? null,
+            updatedAt: session.updatedAt,
+          },
+          createdAt,
+        });
       });
 
-    const activeSession = yield* resolveActiveSession(threadId);
     const existingSessionThreadId =
       thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
     if (existingSessionThreadId) {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
-      const sessionModelSwitch =
-        currentProvider === undefined
-          ? "in-session"
-          : (yield* providerService.getCapabilities(currentProvider)).sessionModelSwitch;
+      const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
+        .sessionModelSwitch;
       const modelChanged =
         requestedModelSelection !== undefined &&
         requestedModelSelection.model !== activeSession?.model;
+      const instanceChanged =
+        requestedModelSelection !== undefined &&
+        activeSession?.providerInstanceId !== requestedModelSelection.instanceId;
       const shouldRestartForModelChange = modelChanged && sessionModelSwitch === "unsupported";
-      // Fall back to the thread's persisted model selection when the
-      // in-memory cache is empty (e.g. after a server restart). Without
-      // this, `previousModelSelection` would be undefined on the first
-      // turn after restart, causing an unnecessary session restart even
-      // when the model selection hasn't actually changed.
-      const previousModelSelection = threadModelSelections.get(threadId) ?? thread.modelSelection;
+      const previousModelSelection = threadModelSelections.get(threadId);
       const shouldRestartForModelSelectionChange =
-        currentProvider === "claudeAgent" &&
+        preferredProvider === "claudeAgent" &&
         requestedModelSelection !== undefined &&
         !Equal.equals(previousModelSelection, requestedModelSelection);
 
       if (
         !runtimeModeChanged &&
         !cwdChanged &&
+        !instanceChanged &&
         !shouldRestartForModelChange &&
         !shouldRestartForModelSelectionChange
       ) {
-        return { threadId: existingSessionThreadId, sessionRecovered: false };
+        return existingSessionThreadId;
       }
 
       const resumeCursor = shouldRestartForModelChange
@@ -478,8 +456,10 @@ const make = Effect.gen(function* () {
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
-        currentProvider,
-        desiredProvider: desiredModelSelection.provider,
+        currentProvider: activeSession?.provider,
+        currentInstanceId,
+        desiredInstanceId,
+        desiredProvider: desiredModelSelection.instanceId,
         currentRuntimeMode: thread.session?.runtimeMode,
         desiredRuntimeMode: thread.runtimeMode,
         runtimeModeChanged,
@@ -487,6 +467,7 @@ const make = Effect.gen(function* () {
         desiredCwd: effectiveCwd,
         cwdChanged,
         modelChanged,
+        instanceChanged,
         shouldRestartForModelChange,
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
@@ -503,12 +484,12 @@ const make = Effect.gen(function* () {
         cwd: restartedSession.cwd,
       });
       yield* bindSessionToThread(restartedSession);
-      return { threadId: restartedSession.threadId, sessionRecovered: true };
+      return restartedSession.threadId;
     }
 
     const startedSession = yield* startProviderSession(undefined);
     yield* bindSessionToThread(startedSession);
-    return { threadId: startedSession.threadId, sessionRecovered: true };
+    return startedSession.threadId;
   });
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
@@ -525,7 +506,7 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    const ensureResult = yield* ensureSessionForThread(
+    yield* ensureSessionForThread(
       input.threadId,
       input.createdAt,
       input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
@@ -533,30 +514,7 @@ const make = Effect.gen(function* () {
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
-
-    // When the session was just (re)started and the thread already has
-    // conversation history, inject a transcript of previous messages into
-    // the user prompt. This acts as a defense-in-depth against silent SDK
-    // resume failures — if the Claude server-side session expired, the
-    // model would otherwise lose all conversation context.
-    const previousMessages = thread.messages.filter(
-      (msg) => msg.role === "user" || msg.role === "assistant",
-    );
-    const shouldInjectHistory = ensureResult.sessionRecovered && previousMessages.length > 0;
-    const effectiveInput = shouldInjectHistory
-      ? buildContextInjectedInput(previousMessages, input.messageText)
-      : input.messageText;
-
-    if (shouldInjectHistory) {
-      yield* Effect.logInfo("provider command reactor injecting conversation context", {
-        threadId: input.threadId,
-        previousMessageCount: previousMessages.length,
-        originalInputLength: input.messageText.length,
-        effectiveInputLength: effectiveInput.length,
-      });
-    }
-
-    const normalizedInput = toNonEmptyProviderInput(effectiveInput);
+    const normalizedInput = toNonEmptyProviderInput(input.messageText);
     const normalizedAttachments = input.attachments ?? [];
     const activeSession = yield* providerService
       .listSessions()
@@ -566,7 +524,14 @@ const make = Effect.gen(function* () {
     const sessionModelSwitch =
       activeSession === undefined
         ? "in-session"
-        : (yield* providerService.getCapabilities(activeSession.provider)).sessionModelSwitch;
+        : activeSession.providerInstanceId === undefined
+          ? yield* new ProviderAdapterRequestError({
+              provider: providerErrorLabel(activeSession.provider),
+              method: "thread.turn.start",
+              detail: `Active provider session '${activeSession.threadId}' is missing a provider instance id.`,
+            })
+          : (yield* providerService.getCapabilities(activeSession.providerInstanceId))
+              .sessionModelSwitch;
     const requestedModelSelection =
       input.modelSelection ?? threadModelSelections.get(input.threadId) ?? thread.modelSelection;
     const modelForTurn =
@@ -937,6 +902,9 @@ const make = Effect.gen(function* () {
         threadId: thread.id,
         status: "stopped",
         providerName: thread.session?.providerName ?? null,
+        ...(thread.session?.providerInstanceId !== undefined
+          ? { providerInstanceId: thread.session.providerInstanceId }
+          : {}),
         runtimeMode: thread.session?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
         activeTurnId: null,
         lastError: thread.session?.lastError ?? null,
