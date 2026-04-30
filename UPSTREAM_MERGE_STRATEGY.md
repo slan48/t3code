@@ -49,26 +49,7 @@ drop ours.
   Merge theirs, then re-apply our additions that aren't already covered.
 - **Post-merge test:** read-through only; no runtime impact.
 
-### 3. Composer cross-provider model leak fix
-- **Commit:** `36467784` (PR #2, merge `b8342cfb`)
-- **Files:** `apps/web/src/composerDraftStore.ts`,
-  `apps/web/src/composerDraftStore.test.ts`
-- **What:** Prevents the composer from deriving a "base model" that belongs
-  to a different provider than the one currently selected. The fix lives in
-  `deriveEffectiveComposerModelState` — the thread/project model is only
-  carried over when its `.provider` matches the active provider; otherwise
-  fall through to `getDefaultServerModel`.
-- **Pre-merge check:** Look at `composerDraftStore.{ts,test.ts}` in the
-  upstream diff. Upstream has been refactoring composer state and model
-  selection (e.g. #2246 "option arrays" rewrote the persistence layer
-  here). Confirm the `provider === selectedProvider` carry-over guard in
-  `deriveEffectiveComposerModelState` survived the refactor; if upstream
-  added an equivalent guard, drop ours.
-- **Post-merge test:** open composer, pick a Claude model, switch provider
-  dropdown to Codex/OpenCode, confirm the selected model resets to a model
-  from the new provider.
-
-### 4. Dev-only artifact .gitignore
+### 3. Dev-only artifact .gitignore
 - **Commit:** `f2647834`
 - **Files:** `.gitignore`
 - **What:** Ignore local screenshot + MCP snapshot files we generate while
@@ -77,7 +58,7 @@ drop ours.
   just re-add our lines near related patterns.
 - **Post-merge test:** `git status` clean after running the app locally.
 
-### 5. Terminal dock position toggle + desktop sidebar trigger
+### 4. Terminal dock position toggle + desktop sidebar trigger
 - **Commit:** `1219dc23` (PR #3, squashed)
 - **Files:** `apps/web/src/terminalStateStore.ts`,
   `apps/web/src/terminalStateStore.test.ts`,
@@ -111,7 +92,7 @@ drop ours.
   3. Reload the app → dock position survives.
   4. Left-sidebar trigger visible on desktop.
 
-### 6. Xterm refit on width changes in right-dock
+### 5. Xterm refit on width changes in right-dock
 - **Commit:** `8924ced5`
 - **Files:** `apps/web/src/components/ThreadTerminalDrawer.tsx`
 - **What:** Attaches a `ResizeObserver` to the terminal container so
@@ -125,7 +106,7 @@ drop ours.
   output, drag the sidebar rail wider → text should reflow to use the new
   width.
 
-### 7. Right-docked terminal visible on draft threads
+### 6. Right-docked terminal visible on draft threads
 - **Commit:** `56a00f18`
 - **Files:** `apps/web/src/routes/_chat.draft.$draftId.tsx`,
   `apps/web/src/routes/_chat.$environmentId.$threadId.tsx`,
@@ -141,7 +122,7 @@ drop ours.
 - **Post-merge test:** open a brand-new chat (draft) with dock=right → toggle
   terminal → it should appear immediately (no need to send a message first).
 
-### 8. Sidebar toggle works in terminal + `terminal.dock.toggle` shortcut
+### 7. Sidebar toggle works in terminal + `terminal.dock.toggle` shortcut
 - **Commits:** `f3b236d0` (feat), `75c21d31` (gitignore housekeeping)
 - **Files:** `apps/server/src/keybindings.ts`,
   `apps/web/src/components/AppSidebarLayout.tsx`,
@@ -206,11 +187,13 @@ drop ours.
    ```bash
    bun run lint
    cd apps/web && bun run typecheck
-   cd apps/web && bun test
-   bun test                                  # root tests
+   cd apps/web && bun run test
+   bun run test                              # root tests (turbo)
    ```
+   Note the `bun run test` form — plain `bun test` invokes Bun's own test
+   runner instead of vitest and produces spurious failures.
 6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 1, 3, 5, 6, 7, 8).
+   that have actual UI/runtime behavior (items 1, 4, 5, 6, 7).
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased
