@@ -127,7 +127,15 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           resolveClaudeApiModelId(modelSelection),
           ...(cliEffort ? ["--effort", cliEffort] : []),
           ...(Object.keys(settings).length > 0 ? ["--settings", JSON.stringify(settings)] : []),
-          "--dangerously-skip-permissions",
+          // The user's chat message is embedded in the prompt body, so the
+          // model is exposed to prompt injection. Restrict the helper session
+          // to the StructuredOutput tool (the one `--json-schema` needs) and
+          // do not bypass permissions, so an injected "edit this file" /
+          // "run this command" instruction has no executable surface.
+          "--permission-mode",
+          "default",
+          "--allowed-tools",
+          "StructuredOutput",
         ],
         {
           env: claudeEnvironment,
