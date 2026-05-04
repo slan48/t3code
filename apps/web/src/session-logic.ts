@@ -59,6 +59,7 @@ export interface WorkLogEntry {
   toolTitle?: string;
   itemType?: ToolLifecycleItemType;
   requestKind?: PendingApproval["requestKind"];
+  status?: "running" | "completed" | "error";
 }
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
@@ -487,7 +488,6 @@ export function deriveWorkLogEntries(
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
   const entries = ordered
     .filter((activity) => (latestTurnId ? activity.turnId === latestTurnId : true))
-    .filter((activity) => activity.kind !== "tool.started")
     .filter((activity) => activity.kind !== "task.started")
     .filter((activity) => activity.kind !== "context-window.updated")
     .filter((activity) => activity.summary !== "Checkpoint captured")
@@ -540,6 +540,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       : null
     : extractToolDetail(payload, title ?? activity.summary);
   const toolCallId = isTaskActivity ? null : extractToolCallId(payload);
+  const status = deriveWorkLogStatus(activity, payload);
   const entry: DerivedWorkLogEntry = {
     id: activity.id,
     createdAt: activity.createdAt,
@@ -551,6 +552,7 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
           ? "info"
           : activity.tone,
     activityKind: activity.kind,
+    ...(status ? { status } : {}),
   };
   const itemType = extractWorkLogItemType(payload);
   const requestKind = extractWorkLogRequestKind(payload);
@@ -600,14 +602,20 @@ function collapseDerivedWorkLogEntries(
   return collapsed;
 }
 
+function isToolLifecycleActivityKind(
+  kind: OrchestrationThreadActivity["kind"],
+): kind is "tool.started" | "tool.updated" | "tool.completed" {
+  return kind === "tool.started" || kind === "tool.updated" || kind === "tool.completed";
+}
+
 function shouldCollapseToolLifecycleEntries(
   previous: DerivedWorkLogEntry,
   next: DerivedWorkLogEntry,
 ): boolean {
-  if (previous.activityKind !== "tool.updated" && previous.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(previous.activityKind)) {
     return false;
   }
-  if (next.activityKind !== "tool.updated" && next.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(next.activityKind)) {
     return false;
   }
   if (previous.activityKind === "tool.completed") {
@@ -638,6 +646,7 @@ function mergeDerivedWorkLogEntries(
   const requestKind = next.requestKind ?? previous.requestKind;
   const collapseKey = next.collapseKey ?? previous.collapseKey;
   const toolCallId = next.toolCallId ?? previous.toolCallId;
+  const status = next.status ?? previous.status;
   return {
     ...previous,
     ...next,
@@ -650,6 +659,7 @@ function mergeDerivedWorkLogEntries(
     ...(requestKind ? { requestKind } : {}),
     ...(collapseKey ? { collapseKey } : {}),
     ...(toolCallId ? { toolCallId } : {}),
+    ...(status ? { status } : {}),
   };
 }
 
@@ -665,7 +675,7 @@ function mergeChangedFiles(
 }
 
 function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | undefined {
-  if (entry.activityKind !== "tool.updated" && entry.activityKind !== "tool.completed") {
+  if (!isToolLifecycleActivityKind(entry.activityKind)) {
     return undefined;
   }
   if (entry.toolCallId) {
@@ -898,6 +908,32 @@ function extractToolTitle(payload: Record<string, unknown> | null): string | nul
 function extractToolCallId(payload: Record<string, unknown> | null): string | null {
   const data = asRecord(payload?.data);
   return asTrimmedString(data?.toolCallId);
+}
+
+function deriveWorkLogStatus(
+  activity: OrchestrationThreadActivity,
+  payload: Record<string, unknown> | null,
+): WorkLogEntry["status"] | undefined {
+  if (activity.kind === "tool.started") {
+    return "running";
+  }
+  if (activity.kind === "tool.completed" || activity.kind === "task.completed") {
+    return activity.tone === "error" ? "error" : "completed";
+  }
+  if (activity.kind === "tool.updated") {
+    const status = asTrimmedString(payload?.status)?.toLowerCase();
+    if (status === "completed" || status === "success" || status === "succeeded") {
+      return "completed";
+    }
+    if (status === "error" || status === "failed" || activity.tone === "error") {
+      return "error";
+    }
+    return "running";
+  }
+  if (activity.kind === "task.progress") {
+    return "running";
+  }
+  return undefined;
 }
 
 function normalizeInlinePreview(value: string): string {

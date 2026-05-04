@@ -13,6 +13,7 @@ import {
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { deriveTimelineEntries, formatElapsed } from "../../session-logic";
 import { type TurnDiffSummary } from "../../types";
+import { type ContextWindowSnapshot, formatContextWindowTokens } from "../../lib/contextWindow";
 import { summarizeTurnDiffStats } from "../../lib/turnDiffTree";
 import ChatMarkdown from "../ChatMarkdown";
 import {
@@ -22,6 +23,7 @@ import {
   EyeIcon,
   GlobeIcon,
   HammerIcon,
+  Loader2Icon,
   type LucideIcon,
   SquarePenIcon,
   TerminalIcon,
@@ -97,6 +99,7 @@ interface MessagesTimelineProps {
   activeTurnInProgress: boolean;
   activeTurnId?: TurnId | null;
   activeTurnStartedAt: string | null;
+  activeContextWindow: ContextWindowSnapshot | null;
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   completionDividerBeforeEntryId: string | null;
@@ -125,6 +128,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnInProgress,
   activeTurnId,
   activeTurnStartedAt,
+  activeContextWindow,
   listRef,
   timelineEntries,
   completionDividerBeforeEntryId,
@@ -150,6 +154,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         completionDividerBeforeEntryId,
         isWorking,
         activeTurnStartedAt,
+        activeContextWindow,
         turnDiffSummaryByAssistantMessageId,
         revertTurnCountByUserMessageId,
       }),
@@ -158,6 +163,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       completionDividerBeforeEntryId,
       isWorking,
       activeTurnStartedAt,
+      activeContextWindow,
       turnDiffSummaryByAssistantMessageId,
       revertTurnCountByUserMessageId,
     ],
@@ -473,6 +479,11 @@ function TimelineRowContent({ row }: { row: TimelineRow }) {
                 "Working..."
               )}
             </span>
+            {formatWorkingTokens(row.contextWindow) && (
+              <span className="text-muted-foreground/55">
+                · {formatWorkingTokens(row.contextWindow)}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -798,6 +809,18 @@ function useStableRows(rows: MessagesTimelineRow[]): MessagesTimelineRow[] {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+function formatWorkingTokens(snapshot: ContextWindowSnapshot | null): string | null {
+  if (!snapshot) return null;
+  const output = snapshot.outputTokens;
+  if (typeof output === "number" && Number.isFinite(output) && output > 0) {
+    return `↓ ${formatContextWindowTokens(output)} tokens`;
+  }
+  if (snapshot.usedTokens > 0) {
+    return `${formatContextWindowTokens(snapshot.usedTokens)} ctx`;
+  }
+  return null;
+}
+
 function formatWorkingTimer(startIso: string, endIso: string): string | null {
   const startedAtMs = Date.parse(startIso);
   const endedAtMs = Date.parse(endIso);
@@ -937,6 +960,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   const { workEntry, workspaceRoot } = props;
   const iconConfig = workToneIcon(workEntry.tone);
   const EntryIcon = workEntryIcon(workEntry);
+  const isRunning = workEntry.status === "running";
   const heading = toolWorkEntryHeading(workEntry);
   const rawPreview = workEntryPreview(workEntry, workspaceRoot);
   const preview =
@@ -956,7 +980,11 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
         <span
           className={cn("flex size-5 shrink-0 items-center justify-center", iconConfig.className)}
         >
-          <EntryIcon className="size-3" />
+          {isRunning ? (
+            <Loader2Icon className="size-3 animate-spin text-muted-foreground/70" />
+          ) : (
+            <EntryIcon className="size-3" />
+          )}
         </span>
         <div className="min-w-0 flex-1 overflow-hidden">
           {rawCommand ? (

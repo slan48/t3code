@@ -1169,6 +1169,77 @@ describe("deriveWorkLogEntries", () => {
     });
   });
 
+  it("surfaces tool.started entries with status=running", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "tool-start",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.started",
+        summary: "Tool call started",
+        payload: {
+          itemType: "command_execution",
+          title: "Run command",
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      id: "tool-start",
+      status: "running",
+      itemType: "command_execution",
+      toolTitle: "Run command",
+    });
+  });
+
+  it("transitions status from running to completed when tool.completed arrives", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "tool-start",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.started",
+        summary: "Tool call started",
+        payload: {
+          itemType: "command_execution",
+          title: "Run command",
+          data: { toolCallId: "call-1" },
+        },
+      }),
+      makeActivity({
+        id: "tool-update",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.updated",
+        summary: "Tool call",
+        payload: {
+          itemType: "command_execution",
+          title: "Run command",
+          data: { toolCallId: "call-1", command: "bun test" },
+        },
+      }),
+      makeActivity({
+        id: "tool-complete",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Tool call completed",
+        payload: {
+          itemType: "command_execution",
+          title: "Run command",
+          data: { toolCallId: "call-1" },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      status: "completed",
+      command: "bun test",
+    });
+  });
+
   it("keeps separate tool entries when an identical call starts after the prior one completed", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
