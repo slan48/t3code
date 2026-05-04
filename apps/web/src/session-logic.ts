@@ -691,7 +691,7 @@ function deriveToolLifecycleCollapseKey(entry: DerivedWorkLogEntry): string | un
 }
 
 function normalizeCompactToolLabel(value: string): string {
-  return value.replace(/\s+(?:complete|completed)\s*$/i, "").trim();
+  return value.replace(/\s+(?:complete|completed|started|starting)\s*$/i, "").trim();
 }
 
 function toLatestProposedPlanState(proposedPlan: ProposedPlan): LatestProposedPlanState {
@@ -928,9 +928,6 @@ function deriveWorkLogStatus(
     if (status === "error" || status === "failed" || activity.tone === "error") {
       return "error";
     }
-    return "running";
-  }
-  if (activity.kind === "task.progress") {
     return "running";
   }
   return undefined;
