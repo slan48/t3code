@@ -213,7 +213,6 @@ describe("terminalStateStore actions", () => {
           activeTerminalGroupId: "group-default",
         },
       },
-      terminalDockPosition: "bottom",
     });
   });
 

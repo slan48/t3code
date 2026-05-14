@@ -28,3 +28,7 @@ test-report.md
 t3code-*.png
 .claude/launch.json
 .claude/settings.local.json
+.vercel
+.gstack/
+dist-electron/
+.electron-runtime/

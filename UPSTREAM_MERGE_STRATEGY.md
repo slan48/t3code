@@ -58,111 +58,97 @@ drop ours.
   just re-add our lines near related patterns.
 - **Post-merge test:** `git status` clean after running the app locally.
 
-### 4. Terminal dock position toggle + desktop sidebar trigger
-- **Commit:** `1219dc23` (PR #3, squashed)
-- **Files:** `apps/web/src/terminalStateStore.ts`,
-  `apps/web/src/terminalStateStore.test.ts`,
-  `apps/web/src/components/ThreadTerminalDrawer.tsx`,
-  `apps/web/src/components/ChatView.tsx`,
-  `apps/web/src/components/NoActiveThreadState.tsx`,
-  `apps/web/src/components/chat/ChatHeader.tsx`,
-  `apps/web/src/routes/_chat.$environmentId.$threadId.tsx`
-- **What:**
-  - Adds `terminalDockPosition` ("bottom" | "right") to the persisted terminal
-    store with a v1→v2 migration.
-  - Lets the user toggle the terminal between bottom-dock and right-dock;
-    right-dock uses a React portal into `RIGHT_DOCK_TERMINAL_SLOT_ID` inside
-    the inline diff sidebar (diff and terminal stack when both open).
-  - Shows the left-sidebar `SidebarTrigger` on desktop (previously `md:hidden`
-    in the chat header and empty-state header).
-- **Pre-merge check:**
-  - Upstream's `DiffPanel`/right-sidebar changes (e.g. #2224 "right panel
-    sheet to be below title bar") will almost certainly conflict with the
-    inline sidebar + terminal slot. Re-integrate our slot structure after
-    merging upstream's refactor.
-  - Check if upstream has added a terminal dock toggle — unlikely but
-    possible. If so, use theirs.
-  - The store migration version: if upstream bumps the persisted-store
-    version first, ours needs to chain properly (their v2 → our v3, etc.).
-- **Post-merge test:**
-  1. Open terminal → drag-dock to right → confirm it renders in the right
-     sidebar.
-  2. Open diff while terminal is right-docked → confirm they stack (diff on
-     top, terminal below).
-  3. Reload the app → dock position survives.
-  4. Left-sidebar trigger visible on desktop.
-
-### 5. Xterm refit on width changes in right-dock
-- **Commit:** `8924ced5`
-- **Files:** `apps/web/src/components/ThreadTerminalDrawer.tsx`
-- **What:** Attaches a `ResizeObserver` to the terminal container so
-  `FitAddon.fit()` runs whenever the container's width (not just drawer
-  height) changes. Without this, dragging the right sidebar rail wider leaves
-  xterm wrapping at the old narrow column count.
-- **Pre-merge check:** If upstream added any ResizeObserver in the same
-  component or changed the FitAddon wiring, our observer may become
-  redundant. Remove if so.
-- **Post-merge test:** dock terminal to right, run a command with long
-  output, drag the sidebar rail wider → text should reflow to use the new
-  width.
-
-### 6. Right-docked terminal visible on draft threads
-- **Commit:** `56a00f18`
-- **Files:** `apps/web/src/routes/_chat.draft.$draftId.tsx`,
-  `apps/web/src/routes/_chat.$environmentId.$threadId.tsx`,
-  `apps/web/src/components/chat/DiffPanelInlineSidebar.tsx` (new)
-- **What:** The draft (new-thread) route didn't render
-  `DiffPanelInlineSidebar`, so `RIGHT_DOCK_TERMINAL_SLOT_ID` didn't exist and
-  the portalled terminal was invisible. Extract the sidebar into a shared
-  component and render it on both routes (with diff disabled on the draft
-  route).
-- **Pre-merge check:** If upstream restructures the draft route or the diff
-  panel, re-apply the "draft route also renders the inline sidebar" logic
-  after merging.
-- **Post-merge test:** open a brand-new chat (draft) with dock=right → toggle
-  terminal → it should appear immediately (no need to send a message first).
-
-### 7. Sidebar toggle works in terminal + `terminal.dock.toggle` shortcut
-- **Commits:** `f3b236d0` (feat), `75c21d31` (gitignore housekeeping)
-- **Files:** `apps/server/src/keybindings.ts`,
+### 4. Cmd+B `sidebar.toggle` works from any focus + capture-phase handler
+- **Commits:** `f3b236d0` (feat — originally bundled `terminal.dock.toggle`
+  which was dropped in the v0.0.24 sync), `75c21d31` (gitignore housekeeping)
+- **Files:** `packages/shared/src/keybindings.ts` (where `DEFAULT_KEYBINDINGS`
+  lives since upstream's #2361),
   `apps/web/src/components/AppSidebarLayout.tsx`,
-  `apps/web/src/components/ChatView.tsx`,
-  `apps/web/src/components/ThreadTerminalDrawer.tsx`,
-  `apps/web/src/keybindings.ts`,
-  `apps/web/src/keybindings.test.ts`,
-  `packages/contracts/src/keybindings.ts`,
+  `apps/web/src/keybindings.ts`, `apps/web/src/keybindings.test.ts`,
   `.gitignore`
 - **What:**
-  - Drops the `when: "!terminalFocus"` qualifier from the default
-    `sidebar.toggle` binding (so Cmd+B works whether focus is in the
-    composer, the terminal, or anywhere else).
+  - Adds the `{ key: "mod+b", command: "sidebar.toggle" }` default in the
+    shared keybindings table (upstream ships no default for sidebar toggle).
+    No `when` clause, so Cmd+B works whether focus is in the composer,
+    terminal, or anywhere else.
   - Registers the global Cmd+B handler in `AppSidebarLayout` on the
     *capture* phase so Lexical (composer) and xterm (terminal) cannot
     swallow the keystroke first.
-  - Updates xterm's `attachCustomKeyEventHandler` to forward
-    `sidebar.toggle` and the new `terminal.dock.toggle` keystrokes
-    instead of writing them as terminal input.
-  - Adds a new keybinding command `terminal.dock.toggle` (default
-    `mod+shift+j`) that flips the terminal panel between bottom-dock
-    and right-dock via the existing `toggleTerminalDockPosition`
-    callback in `ChatView`.
+  - Exports `isSidebarToggleShortcut` from `apps/web/src/keybindings.ts` for
+    use by xterm's `attachCustomKeyEventHandler` (so it forwards Cmd+B
+    instead of writing `b` to the terminal).
   - Ignores `.claude/launch.json`, `.claude/settings.local.json`, and
     `test-report.md` (transient/per-developer files).
-- **Pre-merge check:** Upstream may add its own dock-toggle command or
-  rework keybinding defaults. If upstream adds a `sidebar.toggle` rule
-  with a different `when` clause, prefer ours. Note: existing users'
+- **Pre-merge check:** If upstream ever adds its own `sidebar.toggle`
+  default, prefer ours (no `when` clause). Note: existing users'
   `~/.t3/dev/keybindings.json` (and the `userdata` variant) override
   defaults — `syncDefaultKeybindingsOnStartup` deduplicates by command
   name, so changes to default `when` clauses won't propagate. New users
-  pick up the unrestricted `sidebar.toggle` and the new
-  `terminal.dock.toggle` automatically.
+  pick up the unrestricted `sidebar.toggle` automatically.
 - **Post-merge test:**
   1. Cmd+B with terminal focused → sidebar toggles, no `b` written to
      the terminal.
   2. Cmd+B with composer focused → sidebar toggles, no bold formatting
      applied.
-  3. Cmd+Shift+J → terminal panel flips between bottom and right
-     docking from any focus context.
+
+### 5. Sidecar Claude sessions isolated from prompt injection
+- **Commit:** `60479600`
+- **Files:** `apps/server/src/textGeneration/ClaudeTextGeneration.ts`,
+  `apps/server/src/textGeneration/ClaudeTextGeneration.test.ts`
+- **What:** The title / branch-name / commit-message / pr-content sidecars
+  embed user chat content in their prompts, so they are exposed to prompt
+  injection. We replace `--dangerously-skip-permissions` with
+  `--permission-mode default --allowed-tools StructuredOutput`, restricting
+  injected instructions to the one tool `--json-schema` actually needs.
+- **Pre-merge check:** If upstream restructures the sidecar invocation,
+  re-apply the flag swap. Tests in `ClaudeTextGeneration.test.ts` assert
+  `--allowed-tools StructuredOutput` is present and
+  `--dangerously-skip-permissions` is not — if upstream breaks those
+  assertions, the security fix has been reverted and must be re-applied.
+- **Post-merge test:** `bun run test` exercises this. No manual UI step.
+
+### 6. Live token usage + in-flight tool calls in the working row
+- **Commit:** `18e2f314`
+- **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`,
+  `apps/web/src/components/chat/MessagesTimeline.tsx`,
+  `apps/web/src/components/ChatView.tsx`,
+  `apps/web/src/lib/contextWindow.ts`
+- **What:** Derives `activeContextWindow` in `ChatView` from the latest
+  thread activities and threads it through `MessagesTimeline` into the
+  "working" row. The working row renders `formatWorkingTokens(...)` next to
+  the "Working for Xs" timer so the user sees live token usage as the model
+  streams.
+- **Pre-merge check:** Upstream's `MessagesTimeline` refactor (PRs #2498 /
+  #2580 / #2660 split rows into separate row components) makes this an
+  every-merge re-integration: ensure (a) `MessagesTimelineProps` still
+  declares `activeContextWindow` and the logic still propagates it onto
+  `WorkingRow`, (b) `WorkingTimelineRow` still renders
+  `formatWorkingTokens(row.contextWindow)`, (c) `ChatView` still imports
+  `deriveLatestContextWindowSnapshot` and passes `activeContextWindow={...}`
+  to `<MessagesTimeline>`.
+- **Post-merge test:** start a thread, send a message that triggers a long
+  response, and confirm the "Working for Xs · NNk / NNk tokens" line
+  updates live below the composer.
+
+### 7. Clear stuck spinners on subagent progress / `tool.started` rows
+- **Commit:** `de6728bb`
+- **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`
+  (`assistantCopyStreaming` derivation and `activeTurnInProgress` plumbing)
+- **What:** When a subagent emits `tool.started` events, the assistant
+  message can transition out of `streaming` while the turn is still in
+  flight, leaving the copy-button gated incorrectly. We compute
+  `assistantCopyStreaming = message.streaming || (activeTurnInProgress &&
+  message.turnId === activeTurnId)` so the spinner clears only when the
+  turn actually settles.
+- **Pre-merge check:** `MessagesTimeline.logic.ts` is touched on every
+  upstream refactor — confirm `assistantCopyStreaming` is still derived
+  using `activeTurnInProgress` (not just `message.streaming`), and that
+  `AssistantCopyButton` (or whatever upstream calls it) reads
+  `row.assistantCopyStreaming` rather than the raw `message.streaming`.
+- **Post-merge test:** trigger a tool-heavy response (e.g. spawn an Agent
+  subagent that runs tools). While the subagent is still working, the copy
+  button on the parent assistant message must stay hidden — and reveal
+  itself only when the whole turn is settled.
 
 ## Merge workflow
 
@@ -193,7 +179,8 @@ drop ours.
    Note the `bun run test` form — plain `bun test` invokes Bun's own test
    runner instead of vitest and produces spurious failures.
 6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 1, 4, 5, 6, 7).
+   that have actual UI/runtime behavior (items 1, 4, 6, 7). Item 5 is
+   covered by the automated test suite.
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased
