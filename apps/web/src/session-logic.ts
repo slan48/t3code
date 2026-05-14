@@ -943,6 +943,13 @@ function extractToolTitle(payload: Record<string, unknown> | null): string | nul
 }
 
 function extractToolCallId(payload: Record<string, unknown> | null): string | null {
+  // Server propagates the runtime event's `itemId` here as a stable id for
+  // tool-lifecycle activities; fall back to `data.toolCallId` for activities
+  // that pre-date that change.
+  const topLevel = asTrimmedString(payload?.toolCallId);
+  if (topLevel) {
+    return topLevel;
+  }
   const data = asRecord(payload?.data);
   return asTrimmedString(data?.toolCallId);
 }

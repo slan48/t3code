@@ -1351,6 +1351,74 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.every((entry) => entry.status === "completed")).toBe(true);
   });
 
+  it("collapses parallel Claude-shaped tool events where started has empty detail and toolCallId is top-level", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "read-a-start",
+        createdAt: "2026-02-24T00:00:01.000Z",
+        kind: "tool.started",
+        summary: "Read",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read",
+          toolCallId: "toolu_a",
+          data: { toolName: "Read", input: {} },
+        },
+      }),
+      makeActivity({
+        id: "read-b-start",
+        createdAt: "2026-02-24T00:00:02.000Z",
+        kind: "tool.started",
+        summary: "Read",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read",
+          toolCallId: "toolu_b",
+          data: { toolName: "Read", input: {} },
+        },
+      }),
+      makeActivity({
+        id: "read-a-complete",
+        createdAt: "2026-02-24T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Read",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read",
+          detail: 'Read: {"file_path":"/tmp/a.ts"}',
+          toolCallId: "toolu_a",
+          data: {
+            toolName: "Read",
+            input: { file_path: "/tmp/a.ts" },
+            result: "ok",
+          },
+        },
+      }),
+      makeActivity({
+        id: "read-b-complete",
+        createdAt: "2026-02-24T00:00:04.000Z",
+        kind: "tool.completed",
+        summary: "Read",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Read",
+          detail: 'Read: {"file_path":"/tmp/b.ts"}',
+          toolCallId: "toolu_b",
+          data: {
+            toolName: "Read",
+            input: { file_path: "/tmp/b.ts" },
+            result: "ok",
+          },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries.map((entry) => entry.id)).toEqual(["read-a-complete", "read-b-complete"]);
+    expect(entries.every((entry) => entry.status === "completed")).toBe(true);
+  });
+
   it("collapses same-timestamp lifecycle rows even when completed sorts before updated by id", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
