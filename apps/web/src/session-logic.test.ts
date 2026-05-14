@@ -1293,6 +1293,64 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["tool-1-complete", "tool-2-complete"]);
   });
 
+  it("collapses parallel tool calls whose start/complete events are not adjacent", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "a-start",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "tool.started",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'Read: {"file_path":"/tmp/a.ts"}',
+          data: { toolCallId: "call-a" },
+        },
+      }),
+      makeActivity({
+        id: "b-start",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "tool.started",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'Read: {"file_path":"/tmp/b.ts"}',
+          data: { toolCallId: "call-b" },
+        },
+      }),
+      makeActivity({
+        id: "a-complete",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "tool.completed",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'Read: {"file_path":"/tmp/a.ts"}',
+          data: { toolCallId: "call-a" },
+        },
+      }),
+      makeActivity({
+        id: "b-complete",
+        createdAt: "2026-02-23T00:00:04.000Z",
+        kind: "tool.completed",
+        summary: "Tool call",
+        payload: {
+          itemType: "dynamic_tool_call",
+          title: "Tool call",
+          detail: 'Read: {"file_path":"/tmp/b.ts"}',
+          data: { toolCallId: "call-b" },
+        },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, undefined);
+
+    expect(entries.map((entry) => entry.id)).toEqual(["a-complete", "b-complete"]);
+    expect(entries.every((entry) => entry.status === "completed")).toBe(true);
+  });
+
   it("collapses same-timestamp lifecycle rows even when completed sorts before updated by id", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({

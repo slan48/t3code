@@ -591,15 +591,52 @@ function collapseDerivedWorkLogEntries(
   entries: ReadonlyArray<DerivedWorkLogEntry>,
 ): DerivedWorkLogEntry[] {
   const collapsed: DerivedWorkLogEntry[] = [];
+  // Open (not-yet-completed) tool lifecycle entries indexed by collapseKey,
+  // so we can merge a completion event with its corresponding start even
+  // when other parallel tool calls land between them.
+  const openByCollapseKey = new Map<string, number>();
   for (const entry of entries) {
     const previous = collapsed.at(-1);
     if (previous && shouldCollapseToolLifecycleEntries(previous, entry)) {
-      collapsed[collapsed.length - 1] = mergeDerivedWorkLogEntries(previous, entry);
+      const mergedIndex = collapsed.length - 1;
+      const merged = mergeDerivedWorkLogEntries(previous, entry);
+      collapsed[mergedIndex] = merged;
+      updateOpenIndex(openByCollapseKey, merged, mergedIndex);
       continue;
     }
+    if (isToolLifecycleActivityKind(entry.activityKind) && entry.collapseKey !== undefined) {
+      const openIndex = openByCollapseKey.get(entry.collapseKey);
+      const openEntry = openIndex !== undefined ? collapsed[openIndex] : undefined;
+      if (
+        openIndex !== undefined &&
+        openEntry &&
+        shouldCollapseToolLifecycleEntries(openEntry, entry)
+      ) {
+        const merged = mergeDerivedWorkLogEntries(openEntry, entry);
+        collapsed[openIndex] = merged;
+        updateOpenIndex(openByCollapseKey, merged, openIndex);
+        continue;
+      }
+    }
     collapsed.push(entry);
+    updateOpenIndex(openByCollapseKey, entry, collapsed.length - 1);
   }
   return collapsed;
+}
+
+function updateOpenIndex(
+  openByCollapseKey: Map<string, number>,
+  entry: DerivedWorkLogEntry,
+  index: number,
+): void {
+  if (!isToolLifecycleActivityKind(entry.activityKind) || entry.collapseKey === undefined) {
+    return;
+  }
+  if (entry.activityKind === "tool.completed") {
+    openByCollapseKey.delete(entry.collapseKey);
+    return;
+  }
+  openByCollapseKey.set(entry.collapseKey, index);
 }
 
 function isToolLifecycleActivityKind(

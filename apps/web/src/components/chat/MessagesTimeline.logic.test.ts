@@ -307,6 +307,7 @@ describe("deriveMessagesTimelineRows", () => {
       activeTurnInProgress: true,
       activeTurnId: "turn-2" as never,
       activeTurnStartedAt: null,
+      activeContextWindow: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
       revertTurnCountByUserMessageId: new Map(),
     });
@@ -473,6 +474,7 @@ describe("computeStableMessagesTimelineRows", () => {
         completionDividerBeforeEntryId: null,
         isWorking: false,
         activeTurnStartedAt: null,
+        activeContextWindow: null,
         turnDiffSummaryByAssistantMessageId: new Map(),
         revertTurnCountByUserMessageId: new Map(),
       });

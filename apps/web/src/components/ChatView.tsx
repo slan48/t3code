@@ -64,6 +64,7 @@ import {
   isLatestTurnSettled,
   formatElapsed,
 } from "../session-logic";
+import { deriveLatestContextWindowSnapshot } from "../lib/contextWindow";
 import { type LegendListRef } from "@legendapp/list/react";
 import {
   buildPendingUserInputAnswers,
@@ -1271,6 +1272,10 @@ export default function ChatView(props: ChatViewProps) {
   const latestTurnHasToolActivity = useMemo(
     () => hasToolActivityForTurn(threadActivities, activeLatestTurn?.turnId),
     [activeLatestTurn?.turnId, threadActivities],
+  );
+  const activeContextWindow = useMemo(
+    () => deriveLatestContextWindowSnapshot(threadActivities),
+    [threadActivities],
   );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
@@ -3559,6 +3564,7 @@ export default function ChatView(props: ChatViewProps) {
               activeTurnInProgress={isWorking || !latestTurnSettled}
               activeTurnId={activeLatestTurn?.turnId ?? null}
               activeTurnStartedAt={activeWorkStartedAt}
+              activeContextWindow={activeContextWindow}
               listRef={legendListRef}
               timelineEntries={timelineEntries}
               completionDividerBeforeEntryId={completionDividerBeforeEntryId}
