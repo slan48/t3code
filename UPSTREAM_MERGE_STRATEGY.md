@@ -130,25 +130,12 @@ drop ours.
   response, and confirm the "Working for Xs · NNk / NNk tokens" line
   updates live below the composer.
 
-### 7. Clear stuck spinners on subagent progress / `tool.started` rows
-- **Commit:** `de6728bb`
-- **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`
-  (`assistantCopyStreaming` derivation and `activeTurnInProgress` plumbing)
-- **What:** When a subagent emits `tool.started` events, the assistant
-  message can transition out of `streaming` while the turn is still in
-  flight, leaving the copy-button gated incorrectly. We compute
-  `assistantCopyStreaming = message.streaming || (activeTurnInProgress &&
-  message.turnId === activeTurnId)` so the spinner clears only when the
-  turn actually settles.
-- **Pre-merge check:** `MessagesTimeline.logic.ts` is touched on every
-  upstream refactor — confirm `assistantCopyStreaming` is still derived
-  using `activeTurnInProgress` (not just `message.streaming`), and that
-  `AssistantCopyButton` (or whatever upstream calls it) reads
-  `row.assistantCopyStreaming` rather than the raw `message.streaming`.
-- **Post-merge test:** trigger a tool-heavy response (e.g. spawn an Agent
-  subagent that runs tools). While the subagent is still working, the copy
-  button on the parent assistant message must stay hidden — and reveal
-  itself only when the whole turn is settled.
+> **Item 7 (clear stuck spinners) was superseded upstream** in the
+> v0.0.24 / Effect-beta.73 sync (merge `bb9264d2`). Upstream now derives
+> `assistantCopyStreaming = message.streaming || assistantTurnStillInProgress`
+> with an `assistantTurnStillInProgress` guard byte-for-byte identical to our
+> fork fix (`de6728bb`), so the entry was removed. The commit remains in git
+> history for reference.
 
 ## Merge workflow
 
@@ -173,13 +160,20 @@ drop ours.
    ```bash
    bun run lint
    cd apps/web && bun run typecheck
+   cd apps/server && bun run typecheck       # fork code (items 1, 5) lives here
    cd apps/web && bun run test
    bun run test                              # root tests (turbo)
    ```
    Note the `bun run test` form — plain `bun test` invokes Bun's own test
-   runner instead of vitest and produces spurious failures.
+   runner instead of vitest and produces spurious failures. Also typecheck
+   `apps/server`: an Effect API bump upstream may break fork-only server code
+   that upstream never migrated (e.g. the v0.0.24/beta.73 sync required
+   wrapping a raw provider string with `ProviderDriverKind.make(...)` in
+   `ClaudeAdapter.test.ts`). Under turbo the web `MessagesTimeline.test.tsx`
+   render test can flaky-timeout at 5s under concurrent load — re-run that
+   file in isolation to confirm it's green before treating it as a failure.
 6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 1, 4, 6, 7). Item 5 is
+   that have actual UI/runtime behavior (items 1, 4, 6). Item 5 is
    covered by the automated test suite.
 7. **Push + rebuild DMG:**
    ```bash
