@@ -112,7 +112,8 @@ drop ours.
 - **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`,
   `apps/web/src/components/chat/MessagesTimeline.tsx`,
   `apps/web/src/components/ChatView.tsx`,
-  `apps/web/src/lib/contextWindow.ts`
+  `apps/web/src/lib/contextWindow.ts`,
+  `apps/web/src/session-logic.ts` (+ `session-logic.test.ts`)
 - **What:** Derives `activeContextWindow` in `ChatView` from the latest
   thread activities and threads it through `MessagesTimeline` into the
   "working" row. The working row renders `formatWorkingTokens(...)` next to
@@ -125,7 +126,13 @@ drop ours.
   `WorkingRow`, (b) `WorkingTimelineRow` still renders
   `formatWorkingTokens(row.contextWindow)`, (c) `ChatView` still imports
   `deriveLatestContextWindowSnapshot` and passes `activeContextWindow={...}`
-  to `<MessagesTimeline>`.
+  to `<MessagesTimeline>`, and (d) `deriveWorkLogEntries` in `session-logic.ts`
+  still **surfaces** `tool.started` entries (does not `continue`/skip them).
+  Upstream's v0.0.25 sync refactored that function into a loop that *adds* a
+  `tool.started` skip — taking upstream wholesale silently drops the in-flight
+  tool-call rows and fails `session-logic.test.ts`'s "surfaces tool.started
+  entries with status=running". Keep ours: adopt upstream's loop form but omit
+  the `tool.started` skip.
 - **Post-merge test:** start a thread, send a message that triggers a long
   response, and confirm the "Working for Xs · NNk / NNk tokens" line
   updates live below the composer.

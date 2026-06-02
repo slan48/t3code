@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) and other coding agents when working with code in this repository. `CLAUDE.md` is a symlink to this file — edit this file to update both.
 
+## Task Completion Requirements
+
+- All of `bun fmt`, `bun lint`, and `bun typecheck` must pass before considering tasks completed.
+  - If changing native mobile code, `bun lint:mobile` must also pass.
+- NEVER run `bun test`. Always use `bun run test` (runs Vitest).
+
 ## Project Snapshot
 
 T3 Code is a minimal web GUI for coding agents (Codex, Claude, Cursor via ACP, opencode). The repo is a **very early WIP** — proposing sweeping changes that improve long-term maintainability is encouraged.
@@ -13,11 +19,6 @@ T3 Code is a minimal web GUI for coding agents (Codex, Claude, Cursor via ACP, o
 3. Keep behavior predictable under load and during failures (session restarts, reconnects, partial streams).
 
 If a tradeoff is required, choose correctness and robustness over short-term convenience. Long-term maintainability is a core priority — if you add functionality, first check for shared logic that can be extracted. Duplicated logic across multiple files is a code smell. Don't be afraid to change existing code; don't take shortcuts by adding local logic to solve a shared problem.
-
-## Task Completion Requirements
-
-- `bun fmt`, `bun lint`, and `bun typecheck` must all pass before a task is considered complete.
-- **NEVER run `bun test`** (that invokes Bun's built-in test runner). Always use `bun run test`, which routes through Turbo to Vitest.
 
 ## Common Commands
 
@@ -140,6 +141,23 @@ Global toggle in the chat toolbar:
 
 - Codex (OSS): https://github.com/openai/codex
 - CodexMonitor (Tauri, feature-complete reference for protocol + UX flows): https://github.com/Dimillian/CodexMonitor
+
+Use these as implementation references when designing protocol handling, UX flows, and operational safeguards.
+
+## Vendored Repositories
+
+This project vendors external repositories under `.repos/` as read-only reference material for coding
+agents.
+
+- Prefer examples and patterns from the vendored source code over generated guesses or web search results.
+- Do not edit files under `.repos/` unless explicitly asked.
+- Do not import from `.repos/`; application code must continue importing from normal package dependencies.
+- Manage vendored subtrees with `bun run sync:repos`; use `bun run sync:repos --repo <id>` to sync one
+  configured repository.
+- When updating a dependency with a configured vendored subtree, sync that subtree in the same change so
+  `.repos/` matches the installed dependency version.
+- When writing Effect code, read `.repos/effect-smol/LLMS.md` first and inspect `.repos/effect-smol/` for
+  examples of idiomatic usage, tests, module structure, and API design.
 
 ## Further Reading (in-repo)
 
