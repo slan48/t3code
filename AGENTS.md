@@ -22,58 +22,58 @@ If a tradeoff is required, choose correctness and robustness over short-term con
 
 ## Common Commands
 
-Package manager is **bun 1.3.11** (Node 24.13.1). `.mise.toml` pins versions if you use mise.
+Package manager is **pnpm 10.24.0** (Node 24.13.1), pinned via `packageManager` in `package.json` — invoke through `corepack pnpm@10.24.0 …` if pnpm isn't on PATH. The build/test runner is **`vp` (vite-plus)**, which replaced Turbo.
 
-Top-level (all routed through Turbo unless noted):
+Top-level (all routed through `vp`/vite-plus unless noted):
 
-- `bun run dev` — contracts + server + web in watch mode with a TUI.
-- `bun run dev:server` / `bun run dev:web` / `bun run dev:desktop` — individual stacks.
-- `bun run build` — full workspace build.
-- `bun run typecheck` — `tsc --noEmit` across all packages.
-- `bun run lint` — `oxlint --report-unused-disable-directives` at the repo root.
-- `bun run fmt` / `bun run fmt:check` — `oxfmt` formatter.
-- `bun run test` — Vitest across all workspaces.
-- `bun run start` — production server (serves the built web app as static files).
-- `bun run build:contracts` — rebuild only `@t3tools/contracts` (needed before server/web typecheck after contract changes).
-- `bun run clean` — nukes `node_modules`, all `dist`, `dist-electron`, and `.turbo` caches.
+- `pnpm run dev` — contracts + server + web in watch mode with a TUI.
+- `pnpm run dev:server` / `pnpm run dev:web` / `pnpm run dev:desktop` — individual stacks.
+- `pnpm run build` — full workspace build.
+- `pnpm run typecheck` — `vp run -r typecheck` (tsgo `--noEmit`) across all packages.
+- `pnpm run lint` — `vp lint --report-unused-disable-directives` (oxlint) at the repo root.
+- `pnpm run fmt` / `pnpm run fmt:check` — `oxfmt` formatter.
+- `pnpm run test` — vite-plus test (`vp run -r test`) across all workspaces.
+- `pnpm run start` — production server (serves the built web app as static files).
+- `pnpm run build:contracts` — rebuild only `@t3tools/contracts` (needed before server/web typecheck after contract changes).
+- `pnpm run clean` — nukes `node_modules`, all `dist`, `dist-electron`, and `.vite-plus` caches.
 
 Running a single test file / name filter (run inside the owning package):
 
 ```bash
-cd apps/server && bun x vitest run src/orchestration/decider.ts
-cd apps/server && bun x vitest run -t "turn start"
+cd apps/server && pnpm exec vp test run src/orchestration/decider.ts
+cd apps/server && pnpm exec vp test run -t "turn start"
 ```
 
 Web browser tests use Playwright and a separate config:
 
 ```bash
-cd apps/web && bun run test:browser:install   # one-time
-cd apps/web && bun run test:browser
+cd apps/web && pnpm run test:browser:install   # one-time
+cd apps/web && pnpm run test:browser
 ```
 
 Server-only focused suites:
 
-- `cd apps/server && bun run test:process-reaper` — targeted process-lifecycle suite used when touching provider adapters / session reapers.
+- `cd apps/server && pnpm run test:process-reaper` — targeted process-lifecycle suite used when touching provider adapters / session reapers.
 
 Desktop packaging:
 
-- `bun run dist:desktop:dmg` (arm64 default), `:dmg:x64`, `:linux`, `:win`, `:win:arm64`, `:win:x64`.
-- `bun run test:desktop-smoke` for the packaged smoke test.
+- `pnpm run dist:desktop:dmg` (arm64 default), `:dmg:x64`, `:linux`, `:win`, `:win:arm64`, `:win:x64`.
+- `pnpm run test:desktop-smoke` for the packaged smoke test.
 
 Multiple dev instances on the same machine: set `T3CODE_DEV_INSTANCE=<name>` (hashes to a port offset) or `T3CODE_PORT_OFFSET=<n>` (explicit). Defaults: server `3773`, web `5733`. Dev commands default `T3CODE_STATE_DIR` to `~/.t3/dev` to keep dev state isolated.
 
-Pass flags through to the server from the root dev command with `--`, e.g. `bun run dev -- --base-dir ~/.t3-2`.
+Pass flags through to the server from the root dev command with `--`, e.g. `pnpm run dev -- --base-dir ~/.t3-2`.
 
 ## Package Roles
 
 - `apps/server` (`t3` on npm) — Node WebSocket server. Spawns provider runtimes (Codex `app-server` via JSON-RPC over stdio, Claude, Cursor via ACP, opencode), serves the React web app, owns orchestration state, persistence (sqlite), git, terminals, and auth/pairing.
-- `apps/web` (`@t3tools/web`) — React 19 + Vite 8 UI. Tanstack Router, Tailwind 4, Effect `@effect/atom-react` + Zustand for state, Lexical editor, xterm.js terminal. React Compiler is enabled.
+- `apps/web` (`@t3tools/web`) — React 19 + Vite (vite-plus) UI. Tanstack Router, Tailwind 4, Effect `@effect/atom-react` + Zustand for state, Lexical editor, xterm.js terminal. React Compiler is enabled.
 - `apps/desktop` (`@t3tools/desktop`) — Electron shell that spawns a desktop-scoped `t3` backend on loopback (auth-token protected) and loads the bundled UI from `t3://app/index.html`.
 - `apps/marketing` — Separate site build; not part of the main dev loop.
 - `packages/contracts` (`@t3tools/contracts`) — Effect `Schema` schemas + TypeScript contracts for provider events, the WebSocket protocol, orchestration domain, and settings. **Schema only — no runtime logic.**
 - `packages/shared` (`@t3tools/shared`) — Shared runtime utilities consumed by both server and web. **Explicit subpath exports only** (e.g. `@t3tools/shared/git`, `@t3tools/shared/DrainableWorker`) — no barrel index.
 - `packages/client-runtime` — Small runtime bits shared with the client.
-- `packages/effect-acp` — Effect-flavored Agent Client Protocol (ACP) client/agent/schema. Generated from upstream schema via `bun run generate`.
+- `packages/effect-acp` — Effect-flavored Agent Client Protocol (ACP) client/agent/schema. Generated from upstream schema via `pnpm run generate`.
 
 ## Architecture At A Glance
 
@@ -132,10 +132,10 @@ Global toggle in the chat toolbar:
 - **Spans are load-bearing for debugging.** The server writes completed spans to `~/.t3/userdata/logs/server.trace.ndjson` (configurable) and optionally OTLP-exports to Grafana LGTM. Use `Effect.annotateCurrentSpan({...})` for high-cardinality context (ids, paths). Keep metric labels low-cardinality. Full guide in `docs/observability.md`.
 - **Contracts are schema-only.** Runtime logic in `@t3tools/contracts` is disallowed. Keep it to `effect/Schema` definitions and types.
 - **`@t3tools/shared` has no barrel.** Import from the subpath: `import { gitRunCommand } from "@t3tools/shared/git"`. Don't add an `index.ts`.
-- **Contracts imports resolve to source in tests.** `vitest.config.ts` aliases `@t3tools/contracts` to `packages/contracts/src/index.ts`, so you don't need to rebuild contracts to run tests.
-- **`bun run dev` depends on a contracts build.** Turbo wires `dev → @t3tools/contracts#build`. If web/server typecheck fails with missing exports after you change contracts, run `bun run build:contracts`.
+- **Contracts imports resolve to source in tests.** `vite.config.ts` aliases `@t3tools/contracts` to `packages/contracts/src/index.ts`, so you don't need to rebuild contracts to run tests.
+- **`pnpm run dev` depends on a contracts build.** `vp` wires `dev → @t3tools/contracts#build`. If web/server typecheck fails with missing exports after you change contracts, run `pnpm run build:contracts`.
 - **Lint config** (`.oxlintrc.json`): `correctness`, `suspicious`, and `perf` categories are warnings. `no-shadow` and `no-await-in-loop` are disabled intentionally.
-- **No Node-test / no `bun test`.** Vitest only. Tests co-located with source (`*.test.ts`).
+- **No Node-test.** vite-plus test only (`vp test`); import test APIs from `vite-plus/test`, not `vitest`. Tests co-located with source (`*.test.ts`).
 
 ## Reference Repos
 
@@ -152,7 +152,7 @@ agents.
 - Prefer examples and patterns from the vendored source code over generated guesses or web search results.
 - Do not edit files under `.repos/` unless explicitly asked.
 - Do not import from `.repos/`; application code must continue importing from normal package dependencies.
-- Manage vendored subtrees with `bun run sync:repos`; use `bun run sync:repos --repo <id>` to sync one
+- Manage vendored subtrees with `pnpm run sync:repos`; use `pnpm run sync:repos --repo <id>` to sync one
   configured repository.
 - When updating a dependency with a configured vendored subtree, sync that subtree in the same change so
   `.repos/` matches the installed dependency version.

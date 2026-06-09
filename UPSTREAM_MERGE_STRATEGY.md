@@ -35,7 +35,11 @@ drop ours.
   error to the user.
 - **Pre-merge check:** Look for upstream changes in `ClaudeAdapter`,
   `ProviderCommandReactor`, or `ProviderService`. If upstream added its own
-  retry/recovery logic for expired sessions, drop our version.
+  retry/recovery logic for expired sessions, drop our version. Note: the
+  v0.0.26 test-tooling migration added the `no-manual-effect-runtime-in-tests`
+  oxlint rule, which forbids `Effect.runForkWith` in tests. Our session-recovery
+  test ("stopSession does not throw into the SDK prompt consumer") used it and
+  now forks via `Effect.forkChild` + `Fiber.interrupt` instead — keep that form.
 - **Post-merge test:** trigger an expired session (leave the app idle long
   enough, or manually invalidate). Sending a message should succeed without a
   visible error toast.
@@ -163,29 +167,32 @@ drop ours.
 4. **Resolve conflicts** using the per-item guidance above. When a
    customization is already handled upstream, take upstream's version and
    remove the note from this doc (the git history still has the old commit).
-5. **Verify:**
+5. **Verify:** (tooling migrated bun/turbo → pnpm + `vp`/vite-plus in v0.0.26,
+   PR #2899 — `turbo.json`/`vitest.config.ts` are gone, replaced by
+   `vite.config.ts`; test imports moved `vitest` → `vite-plus/test`)
    ```bash
-   bun run lint
-   cd apps/web && bun run typecheck
-   cd apps/server && bun run typecheck       # fork code (items 1, 5) lives here
-   cd apps/web && bun run test
-   bun run test                              # root tests (turbo)
+   corepack pnpm@10.24.0 install --frozen-lockfile   # rebuild node_modules under pnpm
+   pnpm run lint                              # vp lint (oxlint), whole workspace
+   pnpm run typecheck                         # vp run -r typecheck — all packages incl. apps/server
+   pnpm run test                              # vp run -r test — whole workspace
    ```
-   Note the `bun run test` form — plain `bun test` invokes Bun's own test
-   runner instead of vitest and produces spurious failures. Also typecheck
-   `apps/server`: an Effect API bump upstream may break fork-only server code
-   that upstream never migrated (e.g. the v0.0.24/beta.73 sync required
-   wrapping a raw provider string with `ProviderDriverKind.make(...)` in
-   `ClaudeAdapter.test.ts`). Under turbo the web `MessagesTimeline.test.tsx`
-   render test can flaky-timeout at 5s under concurrent load — re-run that
-   file in isolation to confirm it's green before treating it as a failure.
+   `pnpm` isn't installed globally on the dev box — invoke it through
+   `corepack pnpm@10.24.0 ...` (the repo pins `packageManager: pnpm@10.24.0`).
+   The first `pnpm install` after the migration replaces the bun-managed
+   `node_modules` wholesale. `pnpm run typecheck` already covers `apps/server`,
+   so fork-only server code (items 1, 5) is checked — an Effect API bump
+   upstream may still break it. The web `MessagesTimeline.test.tsx` render test
+   ("renders collapse controls for long user messages") flaky-timeouts under
+   `vp`'s concurrent load (15s) — re-run it in isolation with
+   `cd apps/web && corepack pnpm@10.24.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
+   to confirm it's green before treating it as a failure.
 6. **Manual smoke test** — run every post-merge test listed above for items
    that have actual UI/runtime behavior (items 1, 4, 6). Item 5 is
    covered by the automated test suite.
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased
-   bun run dist:desktop:dmg
+   pnpm run dist:desktop:dmg
    ```
 
 ## Updating this doc
