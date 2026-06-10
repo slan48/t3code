@@ -24,25 +24,19 @@ whether any item has been addressed upstream (rendering our change redundant
 or in conflict). If upstream solved it differently, prefer their version and
 drop ours.
 
-### 1. Silent recovery from expired Claude sessions
-- **Commit:** `9ea1254f` (PR #1, merge `27fa0b9c`)
-- **Files:** `apps/server/src/orchestration/Layers/ProviderCommandReactor.ts`,
-  `apps/server/src/provider/Layers/ClaudeAdapter.{ts,test.ts}`,
-  `apps/server/src/provider/Layers/ProviderService.ts`,
-  `packages/contracts/src/providerRuntime.ts`
-- **What:** When the Claude SDK raises a session-expired error, the adapter
-  recovers silently (retries with a fresh session) instead of surfacing the
-  error to the user.
-- **Pre-merge check:** Look for upstream changes in `ClaudeAdapter`,
-  `ProviderCommandReactor`, or `ProviderService`. If upstream added its own
-  retry/recovery logic for expired sessions, drop our version. Note: the
-  v0.0.26 test-tooling migration added the `no-manual-effect-runtime-in-tests`
-  oxlint rule, which forbids `Effect.runForkWith` in tests. Our session-recovery
-  test ("stopSession does not throw into the SDK prompt consumer") used it and
-  now forks via `Effect.forkChild` + `Fiber.interrupt` instead — keep that form.
-- **Post-merge test:** trigger an expired session (leave the app idle long
-  enough, or manually invalidate). Sending a message should succeed without a
-  visible error toast.
+> **Item 1 (silent recovery from expired Claude sessions) was removed** in the
+> v0.0.26 sync (original commit `9ea1254f`, PR #1). When a resumed Claude
+> session expired server-side, the adapter silently wiped the cursor and started
+> a fresh session — which re-ingested the *entire* transcript with a cold prompt
+> cache, producing a large token spike every time a big conversation was resumed
+> after idle (e.g. 0% → 42% context on the first message of the day). We reverted
+> `apps/server/src/provider/Layers/ClaudeAdapter.{ts,test.ts}` and the
+> `SessionExitedPayload.resumeCursor` field in
+> `packages/contracts/src/providerRuntime.ts` back to upstream, restoring the
+> default behavior (an expired session surfaces as a failed turn instead of
+> silently re-ingesting). The commit remains in git history for reference.
+> `ProviderCommandReactor.ts` / `ProviderService.ts` had already converged to
+> upstream in earlier syncs, so they needed no revert.
 
 ### 2. AGENTS.md expansion
 - **Commit:** `03be0dfd`
@@ -180,14 +174,14 @@ drop ours.
    `corepack pnpm@10.24.0 ...` (the repo pins `packageManager: pnpm@10.24.0`).
    The first `pnpm install` after the migration replaces the bun-managed
    `node_modules` wholesale. `pnpm run typecheck` already covers `apps/server`,
-   so fork-only server code (items 1, 5) is checked — an Effect API bump
+   so fork-only server code (item 5) is checked — an Effect API bump
    upstream may still break it. The web `MessagesTimeline.test.tsx` render test
    ("renders collapse controls for long user messages") flaky-timeouts under
    `vp`'s concurrent load (15s) — re-run it in isolation with
    `cd apps/web && corepack pnpm@10.24.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
    to confirm it's green before treating it as a failure.
 6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 1, 4, 6). Item 5 is
+   that have actual UI/runtime behavior (items 4, 6). Item 5 is
    covered by the automated test suite.
 7. **Push + rebuild DMG:**
    ```bash
