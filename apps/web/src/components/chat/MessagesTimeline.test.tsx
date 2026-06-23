@@ -94,12 +94,10 @@ function buildProps() {
   return {
     isWorking: false,
     activeTurnInProgress: false,
-    activeTurnId: null,
     activeTurnStartedAt: null,
     activeContextWindow: null,
     listRef: createRef<LegendListRef | null>(),
-    completionDividerBeforeEntryId: null,
-    completionSummary: null,
+    latestTurn: null,
     turnDiffSummaryByAssistantMessageId: new Map(),
     routeThreadKey: "environment-local:thread-1",
     onOpenTurnDiff: () => {},
@@ -131,7 +129,9 @@ function buildUserTimelineEntry(text: string) {
       id: MessageId.make("message-1"),
       role: "user" as const,
       text,
+      turnId: null,
       createdAt: MESSAGE_CREATED_AT,
+      updatedAt: MESSAGE_CREATED_AT,
       streaming: false,
     },
   };
@@ -189,9 +189,37 @@ describe("MessagesTimeline", () => {
 
     expect(markup).toContain("Terminal 1 lines 1-5");
     expect(markup).toContain("lucide-terminal");
-    expect(markup).toContain("yoo what&#x27;s ");
+    expect(markup).toContain("yoo what&#x27;s</p>");
+    expect(markup).toContain('<span aria-hidden="true"> </span>');
     expect(markup).toContain("Show full message");
   }, 20_000);
+
+  it("renders chips for standalone element-pick context messages", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          buildUserTimelineEntry(
+            [
+              "<element_context>",
+              "- <SubmitButton> (Button.tsx:12):",
+              "  url: https://example.com/dashboard",
+              "  selector: button.submit",
+              "  source: /repo/src/Button.tsx:12:5",
+              "  html:",
+              '  <button class="submit">Save</button>',
+              "</element_context>",
+            ].join("\n"),
+          ),
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("SubmitButton");
+    expect(markup).not.toContain("&lt;element_context");
+    expect(markup).not.toContain("<element_context");
+  });
 
   it("keeps the copy button for collapsed long user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
@@ -229,7 +257,7 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toContain("Context compacted");
-    expect(markup).toContain("Work log");
+    expect(markup).toContain("Work Log");
   });
 
   it("formats changed file paths from the workspace root", async () => {
@@ -282,7 +310,9 @@ describe("MessagesTimeline", () => {
                 "```",
                 "</review_comment>",
               ].join("\n"),
+              turnId: null,
               createdAt: "2026-03-17T19:12:28.000Z",
+              updatedAt: "2026-03-17T19:12:28.000Z",
               streaming: false,
             },
           },
@@ -296,5 +326,70 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain(">Review comment<");
     expect(markup).not.toContain("&lt;review_comment");
     expect(markup).not.toContain("&lt;/review_comment&gt;");
+  });
+
+  it("renders file review comments as source code instead of diffs", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            id: "entry-1",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:28.000Z",
+            message: {
+              id: MessageId.make("message-source-comment"),
+              role: "user",
+              text: [
+                '<review_comment sectionId="file:docs/plan.md" sectionTitle="File comment" filePath="docs/plan.md" startIndex="0" endIndex="1" rangeLabel="L1 to L2">',
+                "Clarify this.",
+                "```md",
+                "# Plan",
+                "- Step one",
+                "```",
+                "</review_comment>",
+              ].join("\n"),
+              turnId: null,
+              createdAt: "2026-03-17T19:12:28.000Z",
+              updatedAt: "2026-03-17T19:12:28.000Z",
+              streaming: false,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("plan.md");
+    expect(markup).toContain("Clarify this.");
+    expect(markup).toContain("# Plan");
+    expect(markup).not.toContain('data-testid="file-diff"');
+  });
+
+  it("renders a failure marker for failed tool lifecycle entries", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            id: "entry-1",
+            kind: "work",
+            createdAt: "2026-03-17T19:12:28.000Z",
+            entry: {
+              id: "work-1",
+              createdAt: "2026-03-17T19:12:28.000Z",
+              label: "Glob",
+              tone: "tool",
+              toolLifecycleStatus: "failed",
+              detail: "No files found",
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("lucide-x");
+    expect(markup).toContain('aria-label="Tool call failed"');
   });
 });
