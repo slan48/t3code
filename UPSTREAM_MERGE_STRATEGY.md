@@ -56,38 +56,27 @@ drop ours.
   just re-add our lines near related patterns.
 - **Post-merge test:** `git status` clean after running the app locally.
 
-### 4. Cmd+B `sidebar.toggle` works from any focus + capture-phase handler
-- **Commits:** `f3b236d0` (feat — originally bundled `terminal.dock.toggle`
-  which was dropped in the v0.0.24 sync), `75c21d31` (gitignore housekeeping)
-- **Files:** `packages/shared/src/keybindings.ts` (where `DEFAULT_KEYBINDINGS`
-  lives since upstream's #2361),
-  `apps/web/src/components/AppSidebarLayout.tsx`,
-  `apps/web/src/keybindings.ts`, `apps/web/src/keybindings.test.ts`,
-  `.gitignore`
-- **What:**
-  - Adds the `{ key: "mod+b", command: "sidebar.toggle" }` default in the
-    shared keybindings table (upstream ships no default for sidebar toggle).
-    No `when` clause, so Cmd+B works whether focus is in the composer,
-    terminal, or anywhere else.
-  - Registers the global Cmd+B handler in `AppSidebarLayout` on the
-    *capture* phase so Lexical (composer) and xterm (terminal) cannot
-    swallow the keystroke first.
-  - Exports `isSidebarToggleShortcut` from `apps/web/src/keybindings.ts` for
-    use by xterm's `attachCustomKeyEventHandler` (so it forwards Cmd+B
-    instead of writing `b` to the terminal).
-  - Ignores `.claude/launch.json`, `.claude/settings.local.json`, and
-    `test-report.md` (transient/per-developer files).
-- **Pre-merge check:** If upstream ever adds its own `sidebar.toggle`
-  default, prefer ours (no `when` clause). Note: existing users'
-  `~/.t3/dev/keybindings.json` (and the `userdata` variant) override
-  defaults — `syncDefaultKeybindingsOnStartup` deduplicates by command
-  name, so changes to default `when` clauses won't propagate. New users
-  pick up the unrestricted `sidebar.toggle` automatically.
-- **Post-merge test:**
-  1. Cmd+B with terminal focused → sidebar toggles, no `b` written to
-     the terminal.
-  2. Cmd+B with composer focused → sidebar toggles, no bold formatting
-     applied.
+> **Item 4 (Cmd+B `sidebar.toggle` capture-phase handler) was superseded
+> upstream** in the v0.0.27 / v0.0.28-nightly sync (merge `927abf17`).
+> Upstream's #3497 ("Add main sidebar toggle") now ships the byte-for-byte
+> identical default binding `{ key: "mod+b", command: "sidebar.toggle" }`
+> (no `when` clause) in `packages/shared/src/keybindings.ts`, plus a new
+> `SidebarControl` component in `apps/web/src/components/AppSidebarLayout.tsx`
+> with a global `window` keydown handler, a trigger button, tooltip, and
+> macOS titlebar insets. We adopted upstream's implementation wholesale and
+> dropped our fork-only `SidebarShortcutHandler` (capture-phase) and the
+> orphaned `isSidebarToggleShortcut` helper in `apps/web/src/keybindings.ts`.
+> The original commits (`f3b236d0`, `75c21d31`) remain in git history.
+>
+> **Caveat — verify on every UI smoke test:** upstream's handler runs on the
+> *bubble* phase with an `if (event.defaultPrevented) return;` guard, whereas
+> our fork used the *capture* phase specifically so Lexical (composer) and
+> xterm (terminal) could not swallow Cmd+B first. If a future sync shows Cmd+B
+> failing to toggle when the composer or terminal is focused, the bubble-phase
+> guard is the cause — re-introduce a capture-phase handler then. The
+> `.gitignore` dev-artifact lines from `75c21d31` (`.claude/launch.json`,
+> `.claude/settings.local.json`, `test-report.md`) are unrelated and stay
+> (see item 3).
 
 ### 5. Sidecar Claude sessions isolated from prompt injection
 - **Commit:** `60479600`
@@ -105,35 +94,43 @@ drop ours.
   assertions, the security fix has been reverted and must be re-applied.
 - **Post-merge test:** `bun run test` exercises this. No manual UI step.
 
-### 6. Live token usage + in-flight tool calls in the working row
-- **Commit:** `18e2f314`
+### 6. Live token usage in the working row
+- **Commit:** `18e2f314` (in-flight tool-call rows half dropped in the
+  v0.0.27 / v0.0.28-nightly sync, merge `927abf17`)
 - **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`,
   `apps/web/src/components/chat/MessagesTimeline.tsx`,
   `apps/web/src/components/ChatView.tsx`,
-  `apps/web/src/lib/contextWindow.ts`,
-  `apps/web/src/session-logic.ts` (+ `session-logic.test.ts`)
+  `apps/web/src/lib/contextWindow.ts`
 - **What:** Derives `activeContextWindow` in `ChatView` from the latest
-  thread activities and threads it through `MessagesTimeline` into the
-  "working" row. The working row renders `formatWorkingTokens(...)` next to
-  the "Working for Xs" timer so the user sees live token usage as the model
-  streams.
-- **Pre-merge check:** Upstream's `MessagesTimeline` refactor (PRs #2498 /
-  #2580 / #2660 split rows into separate row components) makes this an
-  every-merge re-integration: ensure (a) `MessagesTimelineProps` still
-  declares `activeContextWindow` and the logic still propagates it onto
-  `WorkingRow`, (b) `WorkingTimelineRow` still renders
-  `formatWorkingTokens(row.contextWindow)`, (c) `ChatView` still imports
+  thread activities via `deriveLatestContextWindowSnapshot` and threads it
+  through `MessagesTimeline` into the "working" row. `WorkingTimelineRow`
+  renders `formatWorkingTokens(row.contextWindow)` next to the "Working for
+  Xs" timer so the user sees live token usage as the model streams.
+- **Pre-merge check:** Upstream keeps reworking `MessagesTimeline` (rows split
+  into separate components; #3022 reworked the work log), making this an
+  every-merge re-integration. Ensure: (a) the `deriveMessagesTimelineRows`
+  props still declare `activeContextWindow` — keep it **optional**
+  (`activeContextWindow?: ... | null`) so upstream's prop-less test fixtures
+  and any non-web caller still typecheck, and default it to `null` at the
+  working-row push site; (b) `WorkingTimelineRow` still renders
+  `formatWorkingTokens(row.contextWindow)`; (c) `ChatView` still imports
   `deriveLatestContextWindowSnapshot` and passes `activeContextWindow={...}`
-  to `<MessagesTimeline>`, and (d) `deriveWorkLogEntries` in `session-logic.ts`
-  still **surfaces** `tool.started` entries (does not `continue`/skip them).
-  Upstream's v0.0.25 sync refactored that function into a loop that *adds* a
-  `tool.started` skip — taking upstream wholesale silently drops the in-flight
-  tool-call rows and fails `session-logic.test.ts`'s "surfaces tool.started
-  entries with status=running". Keep ours: adopt upstream's loop form but omit
-  the `tool.started` skip.
+  to `<MessagesTimeline>`.
 - **Post-merge test:** start a thread, send a message that triggers a long
-  response, and confirm the "Working for Xs · NNk / NNk tokens" line
-  updates live below the composer.
+  response, and confirm the "Working for Xs · NNk / NNk tokens" line updates
+  live below the composer.
+
+> **Item 6's "in-flight tool calls" half was superseded upstream** in the
+> v0.0.27 / v0.0.28-nightly sync (merge `927abf17`). It surfaced `tool.started`
+> entries with a `status: "running"` field and a `Loader2Icon` spinner row.
+> Upstream #3022 ("Rework message metadata, timestamps, and tool work log
+> rows") deliberately skips `tool.started`, tracks tool state via its own
+> `toolLifecycleStatus` field, and rewrote row rendering onto a name-based
+> `WorkEntryIconSvg` system — shipping a test that asserts `tool.started` is
+> omitted. We dropped our `status` field, `deriveWorkLogStatus`, the
+> `isRunning`/`Loader2Icon` row code, and our contradicting test by taking
+> upstream's `session-logic.{ts,test.ts}` wholesale. Only the live-token half
+> (above) remains. The original commit stays in git history.
 
 > **Item 7 (clear stuck spinners) was superseded upstream** in the
 > v0.0.24 / Effect-beta.73 sync (merge `bb9264d2`). Upstream now derives
@@ -180,9 +177,11 @@ drop ours.
    `vp`'s concurrent load (15s) — re-run it in isolation with
    `cd apps/web && corepack pnpm@10.24.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
    to confirm it's green before treating it as a failure.
-6. **Manual smoke test** — run every post-merge test listed above for items
-   that have actual UI/runtime behavior (items 4, 6). Item 5 is
-   covered by the automated test suite.
+6. **Manual smoke test** — run the post-merge tests for items with actual
+   UI/runtime behavior: item 6 (live token line updates while working) and
+   the item-4 caveat (Cmd+B toggles the sidebar with the composer focused —
+   no bold formatting — and with the terminal focused — no `b` written).
+   Item 5 is covered by the automated test suite.
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased
