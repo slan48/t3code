@@ -21,8 +21,12 @@ function SidebarControl() {
   const shortcutLabel = shortcutLabelForCommand(keybindings, "sidebar.toggle");
 
   useEffect(() => {
+    // Capture phase (fork customization): Lexical in the composer preventDefaults
+    // Cmd+B for bold formatting, and xterm can consume it in the terminal. Running
+    // on capture lets us claim the shortcut before either handler sees it — without
+    // it, upstream's bubble-phase handler bails on `defaultPrevented` when the
+    // composer is focused. See UPSTREAM_MERGE_STRATEGY.md item 4.
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented) return;
       if (resolveShortcutCommand(event, keybindings) !== "sidebar.toggle") return;
 
       event.preventDefault();
@@ -30,8 +34,8 @@ function SidebarControl() {
       toggleSidebar();
     };
 
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [keybindings, toggleSidebar]);
 
   return (

@@ -56,27 +56,30 @@ drop ours.
   just re-add our lines near related patterns.
 - **Post-merge test:** `git status` clean after running the app locally.
 
-> **Item 4 (Cmd+B `sidebar.toggle` capture-phase handler) was superseded
-> upstream** in the v0.0.27 / v0.0.28-nightly sync (merge `927abf17`).
-> Upstream's #3497 ("Add main sidebar toggle") now ships the byte-for-byte
-> identical default binding `{ key: "mod+b", command: "sidebar.toggle" }`
-> (no `when` clause) in `packages/shared/src/keybindings.ts`, plus a new
-> `SidebarControl` component in `apps/web/src/components/AppSidebarLayout.tsx`
-> with a global `window` keydown handler, a trigger button, tooltip, and
-> macOS titlebar insets. We adopted upstream's implementation wholesale and
-> dropped our fork-only `SidebarShortcutHandler` (capture-phase) and the
-> orphaned `isSidebarToggleShortcut` helper in `apps/web/src/keybindings.ts`.
-> The original commits (`f3b236d0`, `75c21d31`) remain in git history.
->
-> **Caveat — verify on every UI smoke test:** upstream's handler runs on the
-> *bubble* phase with an `if (event.defaultPrevented) return;` guard, whereas
-> our fork used the *capture* phase specifically so Lexical (composer) and
-> xterm (terminal) could not swallow Cmd+B first. If a future sync shows Cmd+B
-> failing to toggle when the composer or terminal is focused, the bubble-phase
-> guard is the cause — re-introduce a capture-phase handler then. The
-> `.gitignore` dev-artifact lines from `75c21d31` (`.claude/launch.json`,
-> `.claude/settings.local.json`, `test-report.md`) are unrelated and stay
-> (see item 3).
+### 4. Cmd+B `sidebar.toggle` fires on the capture phase
+- **Original commits:** `f3b236d0`, `75c21d31` (largely superseded by upstream
+  #3497 in the v0.0.27 / v0.0.28-nightly sync, merge `927abf17`)
+- **Files:** `apps/web/src/components/AppSidebarLayout.tsx`, `.gitignore`
+- **What:** Upstream's #3497 ("Add main sidebar toggle") now ships the
+  byte-for-byte identical default binding `{ key: "mod+b", command:
+  "sidebar.toggle" }` (no `when` clause) in `packages/shared/src/keybindings.ts`,
+  plus a `SidebarControl` component in `AppSidebarLayout.tsx` (trigger button,
+  tooltip, macOS titlebar insets). We adopted all of that wholesale and dropped
+  our old `SidebarShortcutHandler` + the orphaned `isSidebarToggleShortcut`
+  helper. **The one fork-only tweak that remains:** `SidebarControl`'s `window`
+  keydown handler runs on the **capture** phase (`addEventListener("keydown",
+  fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
+  Lexical (composer) and xterm (terminal) cannot swallow Cmd+B first. The
+  `.gitignore` dev-artifact lines from `75c21d31` are unrelated and stay (item 3).
+- **Pre-merge check:** Upstream ships its handler on the **bubble** phase with a
+  `defaultPrevented` guard, so every sync that touches `AppSidebarLayout.tsx`
+  will revert our tweak. Re-apply the two changes in `SidebarControl`'s
+  `useEffect`: pass `true` (capture) to `addEventListener`/`removeEventListener`,
+  and drop the `if (event.defaultPrevented) return;` line. Without it, Cmd+B
+  applies bold in the composer instead of toggling the sidebar.
+- **Post-merge test:**
+  1. Cmd+B with composer focused → sidebar toggles, no bold formatting.
+  2. Cmd+B with terminal focused → sidebar toggles, no `b` written.
 
 ### 5. Sidecar Claude sessions isolated from prompt injection
 - **Commit:** `60479600`
