@@ -13,6 +13,7 @@ upstream  https://github.com/pingdotgg/t3code.git  (source project, main-only fe
 
 The `upstream` fetch refspec is restricted to `main` to avoid pulling hundreds
 of `codething/*` agent branches:
+
 ```bash
 git config remote.upstream.fetch +refs/heads/main:refs/remotes/upstream/main
 ```
@@ -27,7 +28,7 @@ drop ours.
 > **Item 1 (silent recovery from expired Claude sessions) was removed** in the
 > v0.0.26 sync (original commit `9ea1254f`, PR #1). When a resumed Claude
 > session expired server-side, the adapter silently wiped the cursor and started
-> a fresh session — which re-ingested the *entire* transcript with a cold prompt
+> a fresh session — which re-ingested the _entire_ transcript with a cold prompt
 > cache, producing a large token spike every time a big conversation was resumed
 > after idle (e.g. 0% → 42% context on the first message of the day). We reverted
 > `apps/server/src/provider/Layers/ClaudeAdapter.{ts,test.ts}` and the
@@ -39,6 +40,7 @@ drop ours.
 > upstream in earlier syncs, so they needed no revert.
 
 ### 2. AGENTS.md expansion
+
 - **Commit:** `03be0dfd`
 - **Files:** `AGENTS.md`
 - **What:** Expanded architecture notes, commands, and conventions doc for
@@ -48,6 +50,7 @@ drop ours.
 - **Post-merge test:** read-through only; no runtime impact.
 
 ### 3. Dev-only artifact .gitignore
+
 - **Commit:** `f2647834`
 - **Files:** `.gitignore`
 - **What:** Ignore local screenshot + MCP snapshot files we generate while
@@ -57,18 +60,19 @@ drop ours.
 - **Post-merge test:** `git status` clean after running the app locally.
 
 ### 4. Cmd+B `sidebar.toggle` fires on the capture phase
+
 - **Original commits:** `f3b236d0`, `75c21d31` (largely superseded by upstream
   #3497 in the v0.0.27 / v0.0.28-nightly sync, merge `927abf17`)
 - **Files:** `apps/web/src/components/AppSidebarLayout.tsx`, `.gitignore`
 - **What:** Upstream's #3497 ("Add main sidebar toggle") now ships the
   byte-for-byte identical default binding `{ key: "mod+b", command:
-  "sidebar.toggle" }` (no `when` clause) in `packages/shared/src/keybindings.ts`,
+"sidebar.toggle" }` (no `when` clause) in `packages/shared/src/keybindings.ts`,
   plus a `SidebarControl` component in `AppSidebarLayout.tsx` (trigger button,
   tooltip, macOS titlebar insets). We adopted all of that wholesale and dropped
   our old `SidebarShortcutHandler` + the orphaned `isSidebarToggleShortcut`
   helper. **The one fork-only tweak that remains:** `SidebarControl`'s `window`
   keydown handler runs on the **capture** phase (`addEventListener("keydown",
-  fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
+fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
   Lexical (composer) and xterm (terminal) cannot swallow Cmd+B first. The
   `.gitignore` dev-artifact lines from `75c21d31` are unrelated and stay (item 3).
 - **Pre-merge check:** Upstream ships its handler on the **bubble** phase with a
@@ -82,6 +86,7 @@ drop ours.
   2. Cmd+B with terminal focused → sidebar toggles, no `b` written.
 
 ### 5. Sidecar Claude sessions isolated from prompt injection
+
 - **Commit:** `60479600`
 - **Files:** `apps/server/src/textGeneration/ClaudeTextGeneration.ts`,
   `apps/server/src/textGeneration/ClaudeTextGeneration.test.ts`
@@ -98,6 +103,7 @@ drop ours.
 - **Post-merge test:** `bun run test` exercises this. No manual UI step.
 
 ### 6. Live token usage in the working row
+
 - **Commit:** `18e2f314` (in-flight tool-call rows half dropped in the
   v0.0.27 / v0.0.28-nightly sync, merge `927abf17`)
 - **Files:** `apps/web/src/components/chat/MessagesTimeline.logic.ts`,
@@ -165,21 +171,25 @@ drop ours.
    PR #2899 — `turbo.json`/`vitest.config.ts` are gone, replaced by
    `vite.config.ts`; test imports moved `vitest` → `vite-plus/test`)
    ```bash
-   corepack pnpm@10.24.0 install --frozen-lockfile   # rebuild node_modules under pnpm
+   CI=true corepack pnpm@11.10.0 install --frozen-lockfile   # rebuild node_modules under pnpm
    pnpm run lint                              # vp lint (oxlint), whole workspace
    pnpm run typecheck                         # vp run -r typecheck — all packages incl. apps/server
    pnpm run test                              # vp run -r test — whole workspace
    ```
    `pnpm` isn't installed globally on the dev box — invoke it through
-   `corepack pnpm@10.24.0 ...` (the repo pins `packageManager: pnpm@10.24.0`).
-   The first `pnpm install` after the migration replaces the bun-managed
-   `node_modules` wholesale. `pnpm run typecheck` already covers `apps/server`,
+   `corepack pnpm@11.10.0 ...` (the repo pins `packageManager: pnpm@11.10.0` as
+   of the v0.0.29-nightly sync; it was `pnpm@10.24.0` through v0.0.28). When the
+   pin bumps a major, the first install must purge the previous major's
+   `node_modules`, which pnpm refuses to do without a TTY — prefix the install
+   with `CI=true` (or set `confirmModulesPurge=false`) to auto-confirm the purge,
+   otherwise it aborts with `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`.
+   `pnpm run typecheck` already covers `apps/server`,
    so fork-only server code (item 5) is checked — an Effect API bump
-   upstream may still break it. The web `MessagesTimeline.test.tsx` render test
-   ("renders collapse controls for long user messages") flaky-timeouts under
-   `vp`'s concurrent load (15s) — re-run it in isolation with
-   `cd apps/web && corepack pnpm@10.24.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
-   to confirm it's green before treating it as a failure.
+   upstream may still break it. The web `MessagesTimeline.test.tsx` render tests
+   (collapse-control / attachment-anchor render tests) flaky-timeout under
+   `vp`'s concurrent load (observed ~52s) — re-run them in isolation with
+   `cd apps/web && corepack pnpm@11.10.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
+   (all 12 pass in ~2s) before treating it as a failure.
 6. **Manual smoke test** — run the post-merge tests for items with actual
    UI/runtime behavior: item 6 (live token line updates while working) and
    the item-4 caveat (Cmd+B toggles the sidebar with the composer focused —
