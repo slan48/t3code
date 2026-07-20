@@ -59,31 +59,19 @@ drop ours.
   just re-add our lines near related patterns.
 - **Post-merge test:** `git status` clean after running the app locally.
 
-### 4. Cmd+B `sidebar.toggle` fires on the capture phase
-
-- **Original commits:** `f3b236d0`, `75c21d31` (largely superseded by upstream
-  #3497 in the v0.0.27 / v0.0.28-nightly sync, merge `927abf17`)
-- **Files:** `apps/web/src/components/AppSidebarLayout.tsx`, `.gitignore`
-- **What:** Upstream's #3497 ("Add main sidebar toggle") now ships the
-  byte-for-byte identical default binding `{ key: "mod+b", command:
-"sidebar.toggle" }` (no `when` clause) in `packages/shared/src/keybindings.ts`,
-  plus a `SidebarControl` component in `AppSidebarLayout.tsx` (trigger button,
-  tooltip, macOS titlebar insets). We adopted all of that wholesale and dropped
-  our old `SidebarShortcutHandler` + the orphaned `isSidebarToggleShortcut`
-  helper. **The one fork-only tweak that remains:** `SidebarControl`'s `window`
-  keydown handler runs on the **capture** phase (`addEventListener("keydown",
-fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
-  Lexical (composer) and xterm (terminal) cannot swallow Cmd+B first. The
-  `.gitignore` dev-artifact lines from `75c21d31` are unrelated and stay (item 3).
-- **Pre-merge check:** Upstream ships its handler on the **bubble** phase with a
-  `defaultPrevented` guard, so every sync that touches `AppSidebarLayout.tsx`
-  will revert our tweak. Re-apply the two changes in `SidebarControl`'s
-  `useEffect`: pass `true` (capture) to `addEventListener`/`removeEventListener`,
-  and drop the `if (event.defaultPrevented) return;` line. Without it, Cmd+B
-  applies bold in the composer instead of toggling the sidebar.
-- **Post-merge test:**
-  1. Cmd+B with composer focused → sidebar toggles, no bold formatting.
-  2. Cmd+B with terminal focused → sidebar toggles, no `b` written.
+> **Item 4 (Cmd+B `sidebar.toggle` on the capture phase) was superseded
+> upstream** in the v0.0.29-nightly sync (original commits `f3b236d0`,
+> `75c21d31`). Upstream #3921 ("fix(web): handle sidebar shortcut before
+> editors") moved `SidebarControl`'s keydown handler to the **capture** phase —
+> `window.addEventListener("keydown", onKeyDown, true)` — which is exactly the
+> fix our fork carried. Their version is strictly better than ours: it _keeps_
+> the `if (event.defaultPrevented) return;` guard (harmless on capture, since
+> nothing downstream has run yet) and adds a `[data-keybinding-capture]` escape
+> hatch so the Settings keybinding recorder can still record Cmd+B — our
+> guard-less variant silently broke that recorder. We took upstream's
+> `AppSidebarLayout.tsx` wholesale. The commits remain in git history for
+> reference. The `.gitignore` dev-artifact lines from `75c21d31` are unrelated
+> and stay (item 3).
 
 ### 5. Sidecar Claude sessions isolated from prompt injection
 
@@ -100,7 +88,9 @@ fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
   `--allowed-tools StructuredOutput` is present and
   `--dangerously-skip-permissions` is not — if upstream breaks those
   assertions, the security fix has been reverted and must be re-applied.
-- **Post-merge test:** `bun run test` exercises this. No manual UI step.
+- **Post-merge test:** `pnpm run test` exercises this (focused:
+  `cd apps/server && corepack pnpm@11.10.0 exec vp test run src/textGeneration/ClaudeTextGeneration.test.ts`).
+  No manual UI step.
 
 ### 6. Live token usage in the working row
 
@@ -148,6 +138,24 @@ fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
 > fork fix (`de6728bb`), so the entry was removed. The commit remains in git
 > history for reference.
 
+### 8. Fork-only skills live under `.agents/skills/`
+
+- **Files:** `.agents/skills/upstream-sync/SKILL.md`, `.claude/skills` (symlink)
+- **What:** Upstream #4162 ("Make test-t3-app skill discoverable by Claude
+  Code") replaced the `.claude/skills` _directory_ with a **symlink** to
+  `../.agents/skills`. Our fork-only `upstream-sync` skill used to live at
+  `.claude/skills/upstream-sync/SKILL.md`, which collided with that symlink
+  (git reports `CONFLICT (file/directory): directory in the way of
+.claude/skills`). We moved the skill to `.agents/skills/upstream-sync/SKILL.md`
+  and adopted upstream's symlink, so Claude Code discovers our skill _and_
+  upstream's four (`test-t3-app`, `test-t3-mobile`, `ios-debugger-agent`,
+  `ios-simulator-browser`).
+- **Pre-merge check:** Keep new fork-only skills in `.agents/skills/`, never in
+  `.claude/skills/` — the latter is a symlink and a real directory there will
+  re-trigger the file/directory conflict on every sync.
+- **Post-merge test:** `ls .claude/skills/` lists `upstream-sync` alongside the
+  upstream skills; `git ls-files -s .claude/skills` reports mode `120000`.
+
 ## Merge workflow
 
 1. **Fetch upstream:**
@@ -170,12 +178,14 @@ fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
 5. **Verify:** (tooling migrated bun/turbo → pnpm + `vp`/vite-plus in v0.0.26,
    PR #2899 — `turbo.json`/`vitest.config.ts` are gone, replaced by
    `vite.config.ts`; test imports moved `vitest` → `vite-plus/test`)
+
    ```bash
    CI=true corepack pnpm@11.10.0 install --frozen-lockfile   # rebuild node_modules under pnpm
    pnpm run lint                              # vp lint (oxlint), whole workspace
    pnpm run typecheck                         # vp run -r typecheck — all packages incl. apps/server
    pnpm run test                              # vp run -r test — whole workspace
    ```
+
    `pnpm` isn't installed globally on the dev box — invoke it through
    `corepack pnpm@11.10.0 ...` (the repo pins `packageManager: pnpm@11.10.0` as
    of the v0.0.29-nightly sync; it was `pnpm@10.24.0` through v0.0.28). When the
@@ -185,16 +195,27 @@ fn, true)`) with the `if (event.defaultPrevented) return;` guard removed, so
    otherwise it aborts with `ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`.
    `pnpm run typecheck` already covers `apps/server`,
    so fork-only server code (item 5) is checked — an Effect API bump
-   upstream may still break it. The web `MessagesTimeline.test.tsx` render tests
-   (collapse-control / attachment-anchor render tests) flaky-timeout under
-   `vp`'s concurrent load (observed ~52s) — re-run them in isolation with
-   `cd apps/web && corepack pnpm@11.10.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx`
-   (all 12 pass in ~2s) before treating it as a failure.
+   upstream may still break it.
+
+   **Known load-flaky suites — re-run in isolation before treating as a
+   failure.** Both are pure-upstream files with no fork commits; they only fail
+   under `vp`'s concurrent whole-workspace load:
+
+   ```bash
+   # web: collapse-control / attachment-anchor render tests (observed ~52s under load)
+   cd apps/web && corepack pnpm@11.10.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx
+   # mobile: "keeps grammar state across inline comment rows" (observed 4.4s under load, 0.4s alone)
+   cd apps/mobile && corepack pnpm@11.10.0 exec vp test run src/features/diffs/nativeReviewDiffHighlighter.test.ts
+   ```
+
 6. **Manual smoke test** — run the post-merge tests for items with actual
    UI/runtime behavior: item 6 (live token line updates while working) and
-   the item-4 caveat (Cmd+B toggles the sidebar with the composer focused —
-   no bold formatting — and with the terminal focused — no `b` written).
-   Item 5 is covered by the automated test suite.
+   item 8 (`ls .claude/skills/` lists `upstream-sync`). Item 5 is covered by
+   the automated test suite. Cmd+B is now upstream's behavior (item 4 was
+   superseded), but it's still worth a regression check after any sync that
+   touches `AppSidebarLayout.tsx`: Cmd+B with the composer focused should
+   toggle the sidebar without applying bold, and with the terminal focused
+   without writing `b`.
 7. **Push + rebuild DMG:**
    ```bash
    git push origin main                      # add --force-with-lease if rebased

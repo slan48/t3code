@@ -4,9 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) and other coding age
 
 ## Task Completion Requirements
 
-- `vp check` and `vp run typecheck` must pass before considering tasks completed.
+- Keep local verification focused on the files and packages changed. Run the smallest relevant test set; do not run the full workspace test suite as a routine completion step.
+  - Use `vp test run <test-files>` for focused built-in Vite+ tests. Use `vp run test` only when the affected package specifically requires its `test` script.
+  - Backend changes must include and run focused tests for the changed behavior.
+  - Run targeted formatting, lint, and type checks for the affected scope when available.
   - If changing native mobile code, `vp run lint:mobile` must also pass.
-- Use `vp test` for the built-in Vite+ test command and `vp run test` when you specifically need the `test` package script.
+- Do not run repo-wide `vp check`, `vp run typecheck`, `vp run test`, or equivalent full-suite commands locally unless the user explicitly requests them. CI is responsible for the full verification suite.
+- After frontend feature development or any user-visible frontend behavior change, the primary agent must run one integrated verification pass for each affected client surface after integrating the work:
+  - Web: use the `test-t3-app` skill. Launch one isolated environment, authenticate through the printed pairing URL, and verify the affected flow in the controlled browser.
+  - Mobile: use the `test-t3-mobile` skill. Connect one representative iOS Simulator or Android Emulator available on the host to one isolated environment and verify the affected flow. On compatible macOS hosts, prefer iOS for cross-platform changes and stream it through serve-sim in the T3 Code in-app browser or another available agent browser; use Android when it is the affected or viable platform.
+  - Subagents must not independently launch dev servers or repeat integrated client verification unless their delegated task explicitly requires it.
+  - Stop dev servers, watchers, and other long-running verification processes when the focused verification is complete.
 
 ## Project Snapshot
 
@@ -22,7 +30,7 @@ If a tradeoff is required, choose correctness and robustness over short-term con
 
 ## Common Commands
 
-Package manager is **pnpm 10.24.0** (Node 24.13.1), pinned via `packageManager` in `package.json` — invoke through `corepack pnpm@10.24.0 …` if pnpm isn't on PATH. The build/test runner is **`vp` (vite-plus)**, which replaced Turbo.
+Package manager is **pnpm 11.10.0** (Node 24.13.1), pinned via `packageManager` in `package.json` — invoke through `corepack pnpm@11.10.0 …` if pnpm isn't on PATH. The build/test runner is **`vp` (vite-plus)**, which replaced Turbo.
 
 Top-level (all routed through `vp`/vite-plus unless noted):
 
@@ -152,8 +160,7 @@ agents.
 - Prefer examples and patterns from the vendored source code over generated guesses or web search results.
 - Do not edit files under `.repos/` unless explicitly asked.
 - Do not import from `.repos/`; application code must continue importing from normal package dependencies.
-- Manage vendored subtrees with `pnpm run sync:repos`; use `pnpm run sync:repos --repo <id>` to sync one
-  configured repository.
+- Manage vendored subtrees with `vpr sync:repos`; use `vpr sync:repos --repo <id>` to sync one configured repository.
 - When updating a dependency with a configured vendored subtree, sync that subtree in the same change so
   `.repos/` matches the installed dependency version.
 - When writing Effect code, read `.repos/effect-smol/LLMS.md` first and inspect `.repos/effect-smol/` for

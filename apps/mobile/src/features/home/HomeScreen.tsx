@@ -24,6 +24,7 @@ import { EmptyState } from "../../components/EmptyState";
 import type { WorkspaceState } from "../../state/workspaceModel";
 import type { SavedRemoteConnection } from "../../lib/connection";
 import { scopedProjectKey } from "../../lib/scopedEntities";
+import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import type { PendingNewTask } from "../../state/use-pending-new-tasks";
 import {
@@ -81,8 +82,12 @@ interface HomeScreenProps {
 /* ─── Layout constants ───────────────────────────────────────────────── */
 
 const ESTIMATED_THREAD_ROW_HEIGHT = 72;
-/** Height of the floating custom header on non-iOS platforms. */
-const CUSTOM_HEADER_HEIGHT = 78;
+/**
+ * Top spacing between the list and the Android custom header. The Android
+ * header (AndroidHomeHeader) is rendered in-flow above this screen and
+ * already consumes the top safe-area inset, so the list only needs breathing
+ * room here.
+ */
 
 function deriveEmptyState(props: {
   readonly catalogState: WorkspaceState;
@@ -147,8 +152,8 @@ function deriveEmptyState(props: {
   };
 }
 
-function HomeTopContentSpacer(props: { readonly topInset: number }) {
-  return <View style={{ height: props.topInset + CUSTOM_HEADER_HEIGHT }} />;
+function HomeTopContentSpacer() {
+  return <View className="h-4" />;
 }
 
 /* ─── Main screen ────────────────────────────────────────────────────── */
@@ -163,7 +168,6 @@ export function HomeScreen(props: HomeScreenProps) {
   const listRef = useRef<LegendListRef | null>(null);
   const insets = useSafeAreaInsets();
   const accentColor = useThemeColor("--color-icon-muted");
-
   const effectiveGroupDisplayStates = useMemo(() => {
     const next = new Map(groupDisplayStates);
     if (!AsyncResult.isSuccess(preferencesResult)) {
@@ -385,7 +389,7 @@ export function HomeScreen(props: HomeScreenProps) {
         className="flex-1 items-center justify-center bg-screen px-8"
         style={{
           paddingBottom: Math.max(insets.bottom, 24),
-          paddingTop: Platform.OS === "ios" ? insets.top + 72 : insets.top,
+          paddingTop: NATIVE_LIQUID_GLASS_SUPPORTED ? insets.top + 72 : 0,
         }}
       >
         <View className="w-full max-w-[430px]">
@@ -396,9 +400,18 @@ export function HomeScreen(props: HomeScreenProps) {
             onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
             variant="plain"
           />
-          {emptyState.loading ? (
+          {emptyState.loading && !shouldShowConnectionStatus ? (
             <View className="mt-4 items-center">
               <ActivityIndicator color={accentColor} />
+            </View>
+          ) : null}
+          {shouldShowConnectionStatus && Platform.OS === "ios" ? (
+            <View className="mt-4">
+              <WorkspaceConnectionStatus
+                state={props.catalogState}
+                onPress={props.onOpenEnvironments}
+                variant="sidebar"
+              />
             </View>
           ) : null}
         </View>
@@ -409,7 +422,7 @@ export function HomeScreen(props: HomeScreenProps) {
 
   const listHeader = (
     <>
-      {Platform.OS === "ios" ? null : <HomeTopContentSpacer topInset={insets.top} />}
+      {Platform.OS === "ios" ? null : <HomeTopContentSpacer />}
 
       {shouldShowConnectionStatus && Platform.OS === "ios" ? (
         <View className="pb-4">
@@ -457,8 +470,8 @@ export function HomeScreen(props: HomeScreenProps) {
           ListHeaderComponent={listHeader}
           ListEmptyComponent={listEmpty}
           style={{ flex: 1 }}
-          automaticallyAdjustsScrollIndicatorInsets={Platform.OS === "ios"}
-          contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}
+          automaticallyAdjustsScrollIndicatorInsets={NATIVE_LIQUID_GLASS_SUPPORTED}
+          contentInsetAdjustmentBehavior={NATIVE_LIQUID_GLASS_SUPPORTED ? "automatic" : "never"}
           showsVerticalScrollIndicator={false}
           keyboardDismissMode="on-drag"
           keyboardShouldPersistTaps="handled"
@@ -466,7 +479,12 @@ export function HomeScreen(props: HomeScreenProps) {
           recycleItems
           scrollEventThrottle={16}
           contentContainerStyle={{
-            paddingBottom: Platform.OS === "ios" ? Math.max(insets.bottom, 24) + 24 : 24,
+            // Android reserves room for the floating new-task FAB
+            // (56 button + 16 gap + bottom inset).
+            paddingBottom:
+              Platform.OS === "ios"
+                ? Math.max(insets.bottom, 24) + 24
+                : Math.max(insets.bottom, 16) + 88,
           }}
           scrollIndicatorInsets={
             Platform.OS === "ios"
