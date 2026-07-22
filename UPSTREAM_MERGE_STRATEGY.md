@@ -131,6 +131,19 @@ drop ours.
 > upstream's `session-logic.{ts,test.ts}` wholesale. Only the live-token half
 > (above) remains. The original commit stays in git history.
 
+> **Item 4's leftover `sidebar.toggle` keybinding registration was removed** in
+> the v0.0.29-nightly.871 sync. When item 4 was declared superseded, only
+> `AppSidebarLayout.tsx` was reverted to upstream — the fork's _registration_ of
+> the command survived as a **duplicate** of upstream's own entry in three
+> places: a second `{ key: "mod+b", command: "sidebar.toggle" }` in
+> `packages/shared/src/keybindings.ts`, a second `"sidebar.toggle"` in
+> `STATIC_KEYBINDING_COMMANDS` in `packages/contracts/src/keybindings.ts`, and a
+> matching duplicate in the `DEFAULT_BINDINGS` fixture in
+> `apps/web/src/keybindings.test.ts`. Upstream has carried both the command and
+> the `mod+b` default since before that sync, so all three fork copies were
+> deleted. **Lesson:** when an item is marked superseded, grep for _every_ file
+> it touched, not just the one named in the entry.
+
 > **Item 7 (clear stuck spinners) was superseded upstream** in the
 > v0.0.24 / Effect-beta.73 sync (merge `bb9264d2`). Upstream now derives
 > `assistantCopyStreaming = message.streaming || assistantTurnStillInProgress`
@@ -155,6 +168,38 @@ drop ours.
   re-trigger the file/directory conflict on every sync.
 - **Post-merge test:** `ls .claude/skills/` lists `upstream-sync` alongside the
   upstream skills; `git ls-files -s .claude/skills` reports mode `120000`.
+
+### 9. Tool `itemId` propagated onto tool activities
+
+- **Commit:** `260b44e6` ("fix: propagate tool itemId so parallel tool calls
+  collapse reliably")
+- **Files:** `apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts`
+- **What:** In `runtimeEventToActivities`, threads `event.itemId` through as
+  `toolCallId` on the `tool.*` activity payloads so parallel tool calls collapse
+  onto the right row instead of merging. Also gives `tool.started` a real
+  `title` (and `data`) instead of the `"<title> started"` summary string.
+- **Pre-merge check:** Upstream edits this file often, but in the
+  `make`/lifecycle half (~line 1300+), not in `runtimeEventToActivities`
+  (~line 620–690). Verify our three `toolCallId` spreads and the `tool.started`
+  `summary`/`title` lines survive. If upstream introduces its own tool-call
+  correlation id, prefer theirs and drop this entry.
+- **Post-merge test:** covered indirectly by `apps/server` tests; visually,
+  trigger two parallel tool calls in one turn and confirm they render as two
+  distinct rows.
+
+### 10. Claude Opus 4.8 provider test
+
+- **Commit:** `b9796fa6` ("feat(provider): add Claude Opus 4.8 model")
+- **Files:** `apps/server/src/provider/Layers/ProviderRegistry.test.ts`
+- **What:** The production half of this commit (`ClaudeProvider.ts`,
+  `packages/contracts/src/model.ts`) has since **converged with upstream** —
+  only the fork's regression test remains, asserting that Opus 4.8 is offered on
+  Claude Code v2.1.154 with `high` as the default effort.
+- **Pre-merge check:** Upstream keeps tuning Claude model defaults (#4240
+  made `1m` the default _contextWindow_ for Opus). If upstream changes the
+  default _effort_, this test fails and should be updated to match upstream
+  rather than reverted.
+- **Post-merge test:** covered by the `apps/server` suite.
 
 ## Merge workflow
 
@@ -196,6 +241,28 @@ drop ours.
    `pnpm run typecheck` already covers `apps/server`,
    so fork-only server code (item 5) is checked — an Effect API bump
    upstream may still break it.
+
+   **`pnpm run test` does NOT run the `apps/server` suite.** Confirmed in the
+   v0.0.29-nightly.871 sync: `vp run -r test` scheduled only 13 tasks and
+   `@t3tools/server#test` was not among them, even though `apps/server` has a
+   `"test": "vp test run"` script and pnpm reports 16 workspace projects. The
+   server suite is where items 5, 9, and 10 are actually verified, so it must be
+   run explicitly:
+
+   ```bash
+   cd apps/server && corepack pnpm@11.10.0 exec vp test run   # ~1560 tests
+   ```
+
+   **Exit code 137 is an OOM kill, not a test failure.** In the same sync,
+   `@t3tools/web#test` and `t3code-relay#test` were both SIGKILLed under
+   whole-workspace concurrency; both pass cleanly when run per-package. Check
+   `vp run --last-details` for exit codes before believing a red run — 137 means
+   re-run that package alone:
+
+   ```bash
+   cd apps/web && corepack pnpm@11.10.0 exec vp test run --passWithNoTests --project unit
+   cd infra/relay && corepack pnpm@11.10.0 exec vp test run
+   ```
 
    **Known load-flaky suites — re-run in isolation before treating as a
    failure.** Both are pure-upstream files with no fork commits; they only fail
