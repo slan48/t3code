@@ -63,7 +63,6 @@ const STATIC_KEYBINDING_COMMANDS = [
   "preview.zoomOut",
   "preview.resetZoom",
   "commandPalette.toggle",
-  "sidebar.toggle",
   "chat.new",
   "chat.newLocal",
   "editor.openFavorite",
