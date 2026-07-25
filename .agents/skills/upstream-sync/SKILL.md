@@ -74,22 +74,28 @@ customizations", do this **before** running `git merge`:
 
 ### 5. Verify
 
-Run the verification block from the strategy doc:
+Run the verification block from the strategy doc — read it there rather than
+from here, it carries the current tooling and the known-flaky list:
 
 ```bash
-bun run lint
-cd apps/web && bun run typecheck
-cd apps/web && bun test
-bun test
+CI=true corepack pnpm@11.10.0 install --frozen-lockfile
+corepack pnpm@11.10.0 run lint
+corepack pnpm@11.10.0 run typecheck
+corepack pnpm@11.10.0 run test
+cd apps/server && corepack pnpm@11.10.0 exec vp test run   # NOT covered by the line above
 ```
 
-If any fails, stop and report — do not push.
+If any fails, stop and report — do not push. Two caveats from the doc: exit
+code 137 is an OOM kill under whole-workspace concurrency, not a test failure,
+and a small set of suites only fail under that load — re-run those per-package
+before treating them as red.
 
 ### 6. Manual smoke tests
 
 List the post-merge test steps from the strategy doc for every item that
-still has runtime behavior (today: items 1, 3, 5, 6, 7 — but re-derive
-from the doc each run, the list drifts). Ask the user to run them, or
+still has runtime behavior (today: items 6 and 8, plus the Cmd+B
+regression check — but re-derive from the doc each run, the list
+drifts; items 1, 4 and 7 no longer exist). Ask the user to run them, or
 offer to drive them with the browser-tester agent.
 
 ### 7. Update the strategy doc
@@ -103,7 +109,7 @@ offer to drive them with the browser-tester agent.
 
 ### 8. Hand off
 
-Do **not** push or run `bun run dist:desktop:dmg` automatically. Report
+Do **not** push or run `pnpm run dist:desktop:dmg` automatically. Report
 the merge commit SHA, the verification results, the list of manual
 smoke tests still pending, and wait for the user to say "push" before
 running `git push origin main`.

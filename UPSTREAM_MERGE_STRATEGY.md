@@ -114,7 +114,13 @@ drop ours.
   working-row push site; (b) `WorkingTimelineRow` still renders
   `formatWorkingTokens(row.contextWindow)`; (c) `ChatView` still imports
   `deriveLatestContextWindowSnapshot` and passes `activeContextWindow={...}`
-  to `<MessagesTimeline>`.
+  to `<MessagesTimeline>`. The recurring conflict site is the **import block**
+  at the top of `MessagesTimeline.tsx`, not the row code: our
+  `lib/contextWindow` import sits adjacent to imports upstream keeps deleting
+  (v0.0.29-nightly.899 removed `summarizeTurnDiffStats` there when it rewrote
+  `AssistantChangedFilesSection`). Keep ours, drop whatever upstream dropped,
+  and confirm with `grep` that the removed symbol really has no remaining
+  callers before deleting its import.
 - **Post-merge test:** start a thread, send a message that triggers a long
   response, and confirm the "Working for Xs · NNk / NNk tokens" line updates
   live below the composer.
@@ -196,9 +202,16 @@ drop ours.
   only the fork's regression test remains, asserting that Opus 4.8 is offered on
   Claude Code v2.1.154 with `high` as the default effort.
 - **Pre-merge check:** Upstream keeps tuning Claude model defaults (#4240
-  made `1m` the default _contextWindow_ for Opus). If upstream changes the
-  default _effort_, this test fails and should be updated to match upstream
-  rather than reverted.
+  made `1m` the default _contextWindow_ for Opus; #4472 added Claude Opus 5,
+  minimum CLI v2.1.219, and re-ordered the version-upgrade message chain
+  ahead of the Opus 4.8 branch). If upstream changes the default _effort_,
+  or makes v2.1.153 report a message other than the Opus 4.8 upgrade string,
+  this test fails and should be updated to match upstream rather than
+  reverted. Both assertions still held as of
+  v0.0.29-nightly.20260725.899 — the 2.1.153 branch still falls through to
+  `formatClaudeOpus48UpgradeMessage`. Our two tests are inserted into a file
+  upstream rewrites heavily (+424 lines that sync), so expect to re-place
+  them by hand.
 - **Post-merge test:** covered by the `apps/server` suite.
 
 ## Merge workflow
@@ -269,7 +282,11 @@ drop ours.
    under `vp`'s concurrent whole-workspace load:
 
    ```bash
-   # web: collapse-control / attachment-anchor render tests (observed ~52s under load)
+   # web: collapse-control / attachment-anchor render tests. Flaked again in the
+   # v0.0.29-nightly.899 sync — this time as `Hook timed out in 30000ms` in the
+   # `beforeAll` at MessagesTimeline.test.tsx:135, not a slow assertion. Alone:
+   # 14/14 pass in 1.8s. Treat any failure in this file's setup hook as load, and
+   # re-run before investigating.
    cd apps/web && corepack pnpm@11.10.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx
    # mobile: "keeps grammar state across inline comment rows" (observed 4.4s under load, 0.4s alone)
    cd apps/mobile && corepack pnpm@11.10.0 exec vp test run src/features/diffs/nativeReviewDiffHighlighter.test.ts
