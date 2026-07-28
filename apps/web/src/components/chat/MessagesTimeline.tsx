@@ -1040,8 +1040,13 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           resolvedTheme={ctx.resolvedTheme}
           onOpenTurnDiff={ctx.onOpenTurnDiff}
         />
+        {/*
+          Touch devices never fire hover, so the copy action would stay stuck at
+          opacity-0 on mobile web. Coarse pointers pin the meta row visible; fine
+          pointers keep the hover-reveal behaviour.
+        */}
         {row.showAssistantMeta ? (
-          <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
+          <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100 pointer-coarse:opacity-100">
             <AssistantCopyButton row={row} />
             {!row.message.streaming && (
               <Tooltip>

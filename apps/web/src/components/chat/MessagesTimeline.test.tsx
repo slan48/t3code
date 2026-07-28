@@ -504,6 +504,47 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain('data-user-message-footer="true"');
   });
 
+  it("keeps the assistant copy action reachable on coarse pointers", () => {
+    const assistantMessageId = MessageId.make("message-assistant-copy");
+    const turnId = TurnId.make("turn-assistant-copy");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        latestTurn={{
+          turnId,
+          state: "completed",
+          startedAt: MESSAGE_CREATED_AT,
+          completedAt: MESSAGE_CREATED_AT,
+        }}
+        timelineEntries={[
+          {
+            id: "entry-assistant-copy",
+            kind: "message",
+            createdAt: MESSAGE_CREATED_AT,
+            message: {
+              id: assistantMessageId,
+              role: "assistant",
+              text: "Final answer.",
+              turnId,
+              createdAt: MESSAGE_CREATED_AT,
+              updatedAt: MESSAGE_CREATED_AT,
+              streaming: false,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="Copy link"');
+
+    const assistantMetaClass = markup.match(/class="(mt-1\.5 flex items-center gap-2[^"]*)"/)?.[1];
+    expect(assistantMetaClass).toBeDefined();
+    // Fine pointers keep the hover reveal, coarse pointers (touch) always show it.
+    expect(assistantMetaClass).toContain("opacity-0");
+    expect(assistantMetaClass).toContain("group-hover/assistant:opacity-100");
+    expect(assistantMetaClass).toContain("pointer-coarse:opacity-100");
+  });
+
   it("renders context compaction entries in the normal work log", () => {
     const markup = renderToStaticMarkup(
       <MessagesTimeline
