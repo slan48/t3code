@@ -7,6 +7,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
+  AgentRunsNotFoundError,
   AuthTokenExchangeGrantType,
   CommandId,
   DEFAULT_SERVER_SETTINGS,
@@ -89,6 +90,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
+import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
@@ -673,6 +675,15 @@ const buildAppUnderTest = (options?: {
             subscribeEvents: Effect.flatMap(PubSub.unbounded<PreviewEvent>(), (pubsub) =>
               PubSub.subscribe(pubsub),
             ),
+          }),
+          // Observation of an external orchestrator, stubbed as unconfigured:
+          // the WS surface must build and answer on a machine that has never
+          // run one, which is every machine except the operator's.
+          Layer.mock(AgentRunsService.AgentRunsService)({
+            isConfigured: Effect.succeed(false),
+            home: Effect.succeed(null),
+            list: Effect.succeed({ runs: [], unreadable: [] }),
+            get: (runId) => Effect.fail(new AgentRunsNotFoundError({ runId })),
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),

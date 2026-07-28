@@ -58,6 +58,14 @@ import {
   OrchestrationReplayEventsInput,
   OrchestrationRpcSchemas,
 } from "./orchestration.ts";
+import {
+  AGENT_RUNS_WS_METHODS,
+  AgentRunDetail,
+  AgentRunsError,
+  AgentRunsGetInput,
+  AgentRunsListInput,
+  AgentRunsListResult,
+} from "./agentRuns.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -202,6 +210,10 @@ export const WS_METHODS = {
   previewAutomationConnect: "previewAutomation.connect",
   previewAutomationRespond: "previewAutomation.respond",
   previewAutomationFocusHost: "previewAutomation.focusHost",
+
+  // Agent run observability (read-only view of an external orchestrator)
+  agentRunsList: AGENT_RUNS_WS_METHODS.list,
+  agentRunsGet: AGENT_RUNS_WS_METHODS.get,
 
   // Server meta
   serverProbe: "server.probe",
@@ -691,6 +703,18 @@ export const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServer
   stream: true,
 });
 
+export const WsAgentRunsListRpc = Rpc.make(WS_METHODS.agentRunsList, {
+  payload: AgentRunsListInput,
+  success: AgentRunsListResult,
+  error: Schema.Union([AgentRunsError, EnvironmentAuthorizationError]),
+});
+
+export const WsAgentRunsGetRpc = Rpc.make(WS_METHODS.agentRunsGet, {
+  payload: AgentRunsGetInput,
+  success: AgentRunDetail,
+  error: Schema.Union([AgentRunsError, EnvironmentAuthorizationError]),
+});
+
 export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -762,6 +786,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsAgentRunsListRpc,
+  WsAgentRunsGetRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

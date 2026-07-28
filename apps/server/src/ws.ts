@@ -88,6 +88,7 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
+import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import { issueAssetUrl } from "./assets/AssetAccess.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -369,6 +370,10 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
+  // Observation only. There is deliberately no operate-scoped agent-run
+  // method: T3Code cannot resume, recover, or kill a run.
+  [WS_METHODS.agentRunsList, AuthOrchestrationReadScope],
+  [WS_METHODS.agentRunsGet, AuthOrchestrationReadScope],
 ]);
 
 function toAuthAccessStreamEvent(
@@ -430,6 +435,7 @@ const makeWsRpcLayer = (
       const vcsStatusBroadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
       const terminalManager = yield* TerminalManager.TerminalManager;
       const previewManager = yield* PreviewManager.PreviewManager;
+      const agentRuns = yield* AgentRunsService.AgentRunsService;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -1947,6 +1953,32 @@ const makeWsRpcLayer = (
         [WS_METHODS.previewClose]: (input) =>
           observeRpcEffect(WS_METHODS.previewClose, previewManager.close(input), {
             "rpc.aggregate": "preview",
+          }),
+        /**
+         * Agent-run observation.
+         *
+         * Read-only by construction: the service cannot write, and no
+         * corresponding mutation RPC exists. An operator can look at a run
+         * from a phone; resuming or abandoning one still requires the
+         * orchestrator's own CLI, which is where that authority belongs.
+         */
+        [WS_METHODS.agentRunsList]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.agentRunsList,
+            Effect.gen(function* () {
+              const configured = yield* agentRuns.isConfigured;
+              if (!configured) {
+                return { configured: false, home: null, runs: [], unreadable: [] };
+              }
+              const home = yield* agentRuns.home;
+              const { runs, unreadable } = yield* agentRuns.list;
+              return { configured: true, home, runs, unreadable };
+            }),
+            { "rpc.aggregate": "agent-runs" },
+          ),
+        [WS_METHODS.agentRunsGet]: (input) =>
+          observeRpcEffect(WS_METHODS.agentRunsGet, agentRuns.get(input.runId), {
+            "rpc.aggregate": "agent-runs",
           }),
         [WS_METHODS.previewList]: (input) =>
           observeRpcEffect(WS_METHODS.previewList, previewManager.list(input), {
