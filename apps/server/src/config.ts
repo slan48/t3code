@@ -43,6 +43,12 @@ export interface ServerDerivedPaths {
   readonly environmentIdPath: string;
   readonly serverRuntimeStatePath: string;
   readonly secretsDir: string;
+  /**
+   * Machine-local configuration, hand-edited on the machine that runs the
+   * server. Read-only from the server's point of view and never reachable
+   * through an RPC — see `localConfig.ts`.
+   */
+  readonly localConfigPath: string;
 }
 
 export interface DeriveServerPathsOptions {
@@ -126,6 +132,7 @@ export const deriveServerPaths = Effect.fn(function* (
     environmentIdPath: join(stateDir, "environment-id"),
     serverRuntimeStatePath: join(stateDir, "server-runtime.json"),
     secretsDir: join(stateDir, "secrets"),
+    localConfigPath: join(stateDir, "local.json"),
   };
 });
 

@@ -16,6 +16,7 @@ import {
   evaluateLiveness,
   layerWith,
   resolveOrchestratorHome,
+  resolveOrchestratorHomeFromEnv,
   type LivenessProbe,
 } from "./Service.ts";
 
@@ -242,9 +243,91 @@ const staleRun: FixtureRun = {
 it.layer(BaseLayer)("AgentRunsService", (it) => {
   describe("configuration", () => {
     it("reads the home from the environment", () => {
-      expect(resolveOrchestratorHome({})).toBeNull();
-      expect(resolveOrchestratorHome({ T3_ORCHESTRATOR_HOME: "  " })).toBeNull();
-      expect(resolveOrchestratorHome({ T3_ORCHESTRATOR_HOME: " /tmp/home " })).toBe("/tmp/home");
+      expect(resolveOrchestratorHomeFromEnv({})).toBeNull();
+      expect(resolveOrchestratorHomeFromEnv({ T3_ORCHESTRATOR_HOME: "  " })).toBeNull();
+      expect(resolveOrchestratorHomeFromEnv({ T3_ORCHESTRATOR_HOME: " /tmp/home " })).toBe(
+        "/tmp/home",
+      );
+    });
+
+    /**
+     * The precedence that makes the packaged app work.
+     *
+     * An app opened from Finder inherits the launch services environment, not
+     * a login shell, so the variable is simply absent there and the file is
+     * what answers. A dev shell that sets it explicitly still wins.
+     */
+    describe("precedence", () => {
+      const writeLocalConfig = Effect.fn("writeLocalConfig")(function* (contents: string) {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-local-config-" });
+        const filePath = path.join(dir, "local.json");
+        yield* fileSystem.writeFileString(filePath, contents).pipe(Effect.orDie);
+        return filePath;
+      });
+
+      it.effect("uses the machine-local file when no variable is set", () =>
+        Effect.gen(function* () {
+          const filePath = yield* writeLocalConfig(
+            toJson({ orchestratorHome: "/opt/orchestrator/.orchestrator" }),
+          );
+          const resolved = yield* resolveOrchestratorHome(filePath, {});
+          expect(resolved).toEqual({
+            home: "/opt/orchestrator/.orchestrator",
+            source: "local-config",
+          });
+        }).pipe(Effect.scoped),
+      );
+
+      it.effect("lets an explicit variable override the file", () =>
+        Effect.gen(function* () {
+          const filePath = yield* writeLocalConfig(toJson({ orchestratorHome: "/from/file" }));
+          const resolved = yield* resolveOrchestratorHome(filePath, {
+            T3_ORCHESTRATOR_HOME: "/from/env",
+          });
+          expect(resolved).toEqual({ home: "/from/env", source: "env" });
+        }).pipe(Effect.scoped),
+      );
+
+      it.effect("stays off when neither source answers", () =>
+        Effect.gen(function* () {
+          const filePath = yield* writeLocalConfig(toJson({}));
+          expect(yield* resolveOrchestratorHome(filePath, {})).toEqual({
+            home: null,
+            source: "none",
+          });
+          // A missing file is the normal case, not an error.
+          expect(yield* resolveOrchestratorHome("/nonexistent/local.json", {})).toEqual({
+            home: null,
+            source: "none",
+          });
+        }).pipe(Effect.scoped),
+      );
+
+      it.effect("treats a malformed file as absent rather than failing to boot", () =>
+        Effect.gen(function* () {
+          const filePath = yield* writeLocalConfig("{ not json");
+          expect(yield* resolveOrchestratorHome(filePath, {})).toEqual({
+            home: null,
+            source: "none",
+          });
+        }).pipe(Effect.scoped),
+      );
+
+      it.effect("treats a blank configured path as unset", () =>
+        Effect.gen(function* () {
+          const filePath = yield* writeLocalConfig(toJson({ orchestratorHome: "   " }));
+          expect(yield* resolveOrchestratorHome(filePath, {})).toEqual({
+            home: null,
+            source: "none",
+          });
+          expect(yield* resolveOrchestratorHome(filePath, { T3_ORCHESTRATOR_HOME: "  " })).toEqual({
+            home: null,
+            source: "none",
+          });
+        }).pipe(Effect.scoped),
+      );
     });
 
     it.effect("reports itself unconfigured and refuses to read", () =>

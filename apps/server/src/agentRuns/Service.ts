@@ -39,6 +39,8 @@ import * as Schema from "effect/Schema";
 import * as Ref from "effect/Ref";
 import * as NodeOS from "node:os";
 
+import * as ServerConfig from "../config.ts";
+import { loadLocalConfig, readConfiguredPath } from "../localConfig.ts";
 import * as ProcessRunner from "../processRunner.ts";
 
 import {
@@ -76,19 +78,42 @@ import {
 /**
  * Where the orchestrator keeps its home.
  *
- * An environment variable rather than a setting, deliberately: this points at
- * another tool's private state directory on this machine, it is not something
- * a remote client should be able to repoint, and leaving it unset is how an
- * ordinary T3Code install opts out of the whole feature.
+ * Never a setting: this names another tool's private state directory on this
+ * machine, and `settings.json` is writable by any authorized client, including
+ * a browser on a phone across Tailscale. Both sources below are local to the
+ * machine running the server, and neither is reachable through an RPC.
  */
 export const ORCHESTRATOR_HOME_ENV = "T3_ORCHESTRATOR_HOME";
 
-export function resolveOrchestratorHome(
+export function resolveOrchestratorHomeFromEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string | null {
-  const raw = env[ORCHESTRATOR_HOME_ENV]?.trim();
-  return raw === undefined || raw.length === 0 ? null : raw;
+  return readConfiguredPath(env[ORCHESTRATOR_HOME_ENV]);
 }
+
+/**
+ * The configured home, in precedence order.
+ *
+ * The environment variable wins when explicitly present, so a developer can
+ * aim one shell at a different home without editing the installed app's
+ * config. It is not available to an app launched from Finder, which inherits
+ * the launch services environment rather than a login shell — hence the file,
+ * which is what makes the packaged app work at all. Neither present means the
+ * integration is simply off.
+ */
+export const resolveOrchestratorHome = Effect.fn("agentRuns.resolveHome")(function* (
+  localConfigPath: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+) {
+  const fromEnv = resolveOrchestratorHomeFromEnv(env);
+  if (fromEnv !== null) return { home: fromEnv, source: "env" as const };
+
+  const local = yield* loadLocalConfig(localConfigPath);
+  const fromFile = readConfiguredPath(local.orchestratorHome);
+  return fromFile === null
+    ? { home: null, source: "none" as const }
+    : { home: fromFile, source: "local-config" as const };
+});
 
 /** How long a workspace `git status` probe is reused before being re-run. */
 export const WORKSPACE_PROBE_TTL_MS = 15_000;
@@ -243,7 +268,7 @@ export const make = (options: MakeOptions = {}) =>
     const path = yield* Path.Path;
     const processRunner = yield* ProcessRunner.ProcessRunner;
 
-    const configuredHome = options.home === undefined ? resolveOrchestratorHome() : options.home;
+    const configuredHome = options.home ?? null;
     const probe = options.probe ?? systemLivenessProbe(yield* Clock.currentTimeMillis);
     const gitStatus = options.gitStatus ?? makeGitStatus(processRunner);
 
@@ -655,6 +680,25 @@ function isoAt(millis: number): string {
   return DateTime.formatIso(DateTime.makeUnsafe(millis));
 }
 
-export const layer = Layer.effect(AgentRunsService, make());
+/**
+ * The live service, configured from this machine only.
+ *
+ * Resolution happens once, here, rather than inside `make`: it is a startup
+ * decision about the install, not a per-request one, and keeping it out of the
+ * service body leaves `make` trivially testable with an explicit home.
+ */
+export const layer = Layer.effect(
+  AgentRunsService,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const { home, source } = yield* resolveOrchestratorHome(config.localConfigPath);
+    if (home !== null) {
+      yield* Effect.logInfo("Observing an agent-orchestrator home.").pipe(
+        Effect.annotateLogs({ source, localConfigPath: config.localConfigPath }),
+      );
+    }
+    return yield* make({ home });
+  }),
+);
 
 export const layerWith = (options: MakeOptions) => Layer.effect(AgentRunsService, make(options));
