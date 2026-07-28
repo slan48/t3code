@@ -4,7 +4,8 @@ import type {
   AgentRunDetail,
   AgentRunReview,
 } from "@t3tools/contracts";
-import { memo, useState } from "react";
+import { CheckIcon, CopyIcon } from "lucide-react";
+import { memo, useCallback, useState } from "react";
 
 import {
   describeActivity,
@@ -15,10 +16,13 @@ import {
   quietMillis,
   toneToBadgeVariant,
 } from "~/agentRunFormat";
+import { buildAgentRunMarkdown } from "~/agentRunReport";
 import { useNowMs } from "~/hooks/useNowMs";
+import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { cn } from "~/lib/utils";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
   AgentRunPhaseRow,
   AgentRunProcessLine,
@@ -51,7 +55,12 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
           <h1 className="min-w-0 text-base font-semibold text-foreground">{summary.title}</h1>
           <AgentRunStatePill state={summary.state} />
         </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        {/*
+          The copy action sits on the metadata row rather than beside the
+          title. A run title is a full sentence, and on a phone a button
+          sharing that line squeezes it into a one-word-per-line column.
+        */}
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
           <span className="truncate">{summary.project}</span>
           <span>
             Cycle {summary.currentCycle} / {summary.maxCycles}
@@ -60,6 +69,7 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
             {summary.terminal ? "Ran" : "Running"}{" "}
             {formatDuration(elapsedMillis(summary.startedAt, summary.finishedAt, nowMs))}
           </span>
+          <CopyReportButton detail={detail} />
         </div>
       </header>
 
@@ -96,6 +106,61 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
 
       <TechnicalDetails detail={detail} />
     </div>
+  );
+});
+
+/* ------------------------------------------------------------ copy report */
+
+/**
+ * One click from "this run" to "a message I can paste".
+ *
+ * The Markdown is built from the normalized run model, not from the page, so
+ * what the reader gets does not depend on which panels happened to be expanded
+ * when the button was pressed — and the whole run travels, including the parts
+ * below the fold that previously needed a second screenshot.
+ */
+const CopyReportButton = memo(function CopyReportButton({ detail }: { detail: AgentRunDetail }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    const markdown = buildAgentRunMarkdown(detail, { nowMs: Date.now() });
+    void writeTextToClipboard(markdown, "run report").then(
+      (didCopy) => {
+        if (!didCopy) return;
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 2_000);
+        toastManager.add({
+          type: "success",
+          title: "Report copied",
+          description: `${detail.summary.id} · Markdown`,
+          timeout: 4_000,
+        });
+      },
+      (error: unknown) => {
+        // A denied clipboard permission or an insecure origin is the common
+        // case here, and it is silent unless we say so.
+        toastManager.add(
+          stackedThreadToast({
+            type: "error",
+            title: "Could not copy the report",
+            description: error instanceof Error ? error.message : "The clipboard is unavailable.",
+          }),
+        );
+      },
+    );
+  }, [detail]);
+
+  return (
+    <Button
+      size="xs"
+      variant="outline"
+      onClick={handleCopy}
+      aria-label="Copy run report as Markdown"
+      className="shrink-0"
+    >
+      {copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+      {copied ? "Copied" : "Copy report"}
+    </Button>
   );
 });
 
