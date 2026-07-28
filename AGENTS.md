@@ -72,6 +72,14 @@ Multiple dev instances on the same machine: set `T3CODE_DEV_INSTANCE=<name>` (ha
 
 Pass flags through to the server from the root dev command with `--`, e.g. `pnpm run dev -- --base-dir ~/.t3-2`.
 
+## Dev Servers
+
+- In a linked git worktree, dev state defaults to that worktree's gitignored `.t3`. This deliberately outranks an ambient `T3CODE_HOME`, which could otherwise select the installed app's live `~/.t3/userdata` database. An explicit `--home-dir` still wins.
+- Start the web stack with `vp run dev`. Add `--share` when someone needs to open it from another device on the tailnet.
+- Browser dev is single-origin: Vite proxies `/api`, `/ws`, `/oauth`, and `/.well-known` to the backend. Do not set `VITE_HTTP_URL` or `VITE_WS_URL` for `dev`/`dev:web`.
+- Worktree paths supply stable preferred port offsets. Read the actual server and web ports from the `[dev-runner]` line because occupied ports can still shift them.
+- Before handing off a `--share` URL, open its origin in a controlled browser and confirm the app loads. A successful curl is insufficient because browsers reject some otherwise reachable ports.
+
 ## Package Roles
 
 - `apps/server` (`t3` on npm) — Node WebSocket server. Spawns provider runtimes (Codex `app-server` via JSON-RPC over stdio, Claude, Cursor via ACP, opencode), serves the React web app, owns orchestration state, persistence (sqlite), git, terminals, and auth/pairing.
