@@ -47,6 +47,14 @@ drop ours.
   agent-driven edits.
 - **Pre-merge check:** Upstream may refresh AGENTS.md with new guidance.
   Merge theirs, then re-apply our additions that aren't already covered.
+  This conflicts on nearly every sync because our expansion occupies the whole
+  region between "Task Completion Requirements" and "Package Roles", which is
+  exactly where upstream inserts new sections. Resolve by keeping both — take
+  our block, then append theirs ahead of "Package Roles". The v0.0.29 sync
+  added their `## Dev Servers` section that way; it overlaps our "Multiple dev
+  instances" paragraph in subject but not in content (theirs covers worktree
+  `.t3` precedence and `vp run dev --share`, ours covers
+  `T3CODE_DEV_INSTANCE`/`T3CODE_PORT_OFFSET`), so both were kept.
 - **Post-merge test:** read-through only; no runtime impact.
 
 ### 3. Dev-only artifact .gitignore
@@ -214,6 +222,47 @@ drop ours.
   them by hand.
 - **Post-merge test:** covered by the `apps/server` suite.
 
+### 11. Assistant copy action reachable on touch devices
+
+- **Commit:** `cacc11980` ("fix(web): show the assistant copy action on touch
+  devices")
+- **Files:** `apps/web/src/components/chat/MessagesTimeline.tsx`,
+  `apps/web/src/components/chat/MessagesTimeline.test.tsx`
+- **What:** The assistant metadata row (copy button + timestamp) was revealed
+  only through `group-hover/assistant:opacity-100`. Tailwind compiles
+  `group-hover:` inside `@media (hover: hover)`, and iOS Safari reports
+  `hover: none`, so on mobile web the row stayed at `opacity-0` forever — the
+  copy button was in the layout and tappable but invisible. We add
+  `pointer-coarse:opacity-100` to that row, which pins it visible on touch
+  while leaving the fine-pointer hover reveal untouched. No copy logic was
+  duplicated; `MessageCopyButton` / `useCopyToClipboard` are unchanged, and the
+  shared `Button` base already supplies a 44pt `pointer-coarse:after:*` hit
+  area.
+- **Pre-merge check:** This lands in the same file as item 6, which upstream
+  reworks constantly — expect to re-place it. Confirm the assistant meta row
+  in `AssistantTimelineRow` still carries `pointer-coarse:opacity-100`
+  alongside `opacity-0` and `group-hover/assistant:opacity-100`. Ordering is
+  safe by construction (the only rule setting `opacity: 0` is the
+  variant-less base, which Tailwind always emits first), so the class can go
+  anywhere in the string. If upstream switches the meta row away from
+  opacity-based hover reveal, re-derive the fix against their approach rather
+  than forcing this class back in. The test
+  `keeps the assistant copy action reachable on coarse pointers` in
+  `MessagesTimeline.test.tsx` fails loudly if the class is dropped.
+- **Note:** The _user_-message meta row
+  (`UserTimelineRow`, same file) still has the un-gated hover reveal, so copy
+  and revert on your own messages remain invisible on touch. Deliberately left
+  alone — extend the same class there if we ever want parity.
+- **Post-merge test:** run the focused suite, then check a real phone —
+
+  ```bash
+  cd apps/web && corepack pnpm@11.10.0 exec vp test run --project unit src/components/chat/MessagesTimeline.test.tsx
+  ```
+
+  Open a thread from a phone browser and confirm the copy icon is visible
+  under every assistant response without needing a tap-to-hover, and that it
+  copies the full response.
+
 ## Merge workflow
 
 1. **Fetch upstream:**
@@ -233,6 +282,26 @@ drop ours.
 4. **Resolve conflicts** using the per-item guidance above. When a
    customization is already handled upstream, take upstream's version and
    remove the note from this doc (the git history still has the old commit).
+
+   **The pre-commit hook can choke on large `.repos/` imports.** `vite.config.ts`
+   declares `staged: { "*": "vp fmt" }`, and the runner splits staged files into
+   ~10 chunks. `.repos/**` is in `fmt.ignorePatterns`, so when upstream vendors a
+   big reference-repo update, whole chunks contain nothing formattable and fail
+   with `Expected at least one target file`, while sibling chunks get SIGKILLed
+   under the load.
+   Seen in the v0.0.29 sync, where #4643 ("Upgrade Effect and Alchemy betas")
+   added **9,707** files under `.repos/alchemy-effect/`. This is a hook
+   limitation, not a formatting problem — confirm by running the formatter
+   directly on the real changed files, then ask the user before bypassing:
+
+   ```bash
+   git diff --cached --name-only --no-renames HEAD | grep -v '^\.repos/' > /tmp/changed.txt
+   ./node_modules/.bin/vp fmt --check $(tr '\n' ' ' < /tmp/changed.txt)
+   git commit --no-verify --no-edit   # only after the user approves
+   ```
+
+   `--no-verify` stays user-approved per run; do not reach for it by default.
+
 5. **Verify:** (tooling migrated bun/turbo → pnpm + `vp`/vite-plus in v0.0.26,
    PR #2899 — `turbo.json`/`vitest.config.ts` are gone, replaced by
    `vite.config.ts`; test imports moved `vitest` → `vite-plus/test`)
