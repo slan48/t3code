@@ -67,6 +67,8 @@ export interface ValidationEvidence {
   readonly report: OrchestratorValidationReport;
   /** File mtime, used when the report itself carries no timestamp. */
   readonly writtenAt: string | null;
+  /** Artifact file name, e.g. `validation.post-worker.rerun-2.json`. */
+  readonly artifact: string;
 }
 
 /** What a liveness probe was able to establish about the lock's owner. */
@@ -620,6 +622,7 @@ function projectValidationReport(evidence: ValidationEvidence): AgentRunValidati
   return {
     stage: evidence.stage,
     cycle: evidence.cycle,
+    artifact: evidence.artifact,
     ranAt: evidence.report.checks?.[0]?.startedAt ?? evidence.writtenAt,
     passed: checks.length === 0 ? null : checks.every((check) => check.passed === true),
     checks,
@@ -893,6 +896,16 @@ export function projectDetail(evidence: RunEvidence, state: AgentRunState): Agen
     },
     interruptions: evidence.run.interruptions ?? 0,
     resumes: evidence.run.resumes ?? 0,
+    evidenceRecoveries: (evidence.run.evidenceRecoveries ?? []).map((recovery) => ({
+      at: recovery.at ?? null,
+      authorizedBy: recovery.authorizedBy ?? null,
+      note: recovery.note ?? null,
+      supersededReason: recovery.supersededOutcome?.reason ?? null,
+      additionalReviewerExecutions: Math.max(
+        0,
+        Math.trunc(recovery.additionalReviewerExecutions ?? 0),
+      ),
+    })),
     degraded: [...evidence.degraded],
   };
 }

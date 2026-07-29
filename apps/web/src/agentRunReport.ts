@@ -7,7 +7,18 @@ import type {
 } from "@t3tools/contracts";
 import { agentRunStateLabel } from "@t3tools/contracts";
 
+import {
+  describeAgentsRunning,
+  describeGuidance,
+  formatExecutionBudget,
+} from "./agentRunAttention";
 import { describeProcess, elapsedMillis, formatDuration, phaseStatusLabel } from "./agentRunFormat";
+import {
+  describeReportOutcome,
+  groupValidationByPhase,
+  notableValidationFailures,
+  VALIDATION_STAGE_LABELS,
+} from "./agentRunValidation";
 
 /**
  * A run, rendered as Markdown for a human to paste somewhere else.
@@ -102,13 +113,31 @@ function renderCheck(check: AgentRunCheck): readonly string[] {
 }
 
 function renderValidation(cycle: AgentRunCycle): readonly string[] {
-  const reports = cycle.validation.filter((report) => report.stage !== "final");
-  if (reports.length === 0) return [];
+  const phases = groupValidationByPhase(cycle).filter((phase) => phase.stage !== "final");
+  if (phases.length === 0) return [];
 
   const lines: string[] = ["#### Validation", ""];
-  for (const report of reports) {
-    lines.push(`Stage: \`${report.stage}\` — ${describePassed(report.passed)}`, "");
-    for (const check of report.checks) lines.push(...renderCheck(check));
+  for (const phase of phases) {
+    lines.push(
+      `**${VALIDATION_STAGE_LABELS[phase.stage]}** — ${describePassed(phase.latest.passed)} (${describeReportOutcome(phase.latest)})`,
+      "",
+    );
+    for (const check of phase.latest.checks) lines.push(...renderCheck(check));
+
+    // The history is counted, not reprinted. An evidence recovery reran this
+    // phase seven times in the real run; three identical copies of the same
+    // nine green checks is not information, it is padding that pushes the
+    // reviewer's actual verdict off the reader's first screen.
+    if (phase.previous.length > 0) {
+      lines.push(
+        "",
+        `_${phase.previous.length} earlier run${phase.previous.length === 1 ? "" : "s"} of this phase${
+          phase.hasEarlierFailure
+            ? ", including a failure — see Notable earlier events"
+            : ", all superseded"
+        }._`,
+      );
+    }
     lines.push("");
   }
   return lines;
@@ -258,20 +287,16 @@ function renderTechnical(detail: AgentRunDetail): readonly string[] {
     ...field("Branch", workspace.branch),
     ...field("Worktree", workspace.worktreePath),
     ...field("Repository", workspace.repositoryPath),
+    ...field("Worker attempts", `${summary.executions.worker.attempts}`),
+    ...field("Worker provider executions", formatExecutionBudget(summary.executions.worker)),
+    ...field("Reviewer attempts", `${summary.executions.reviewer.attempts}`),
+    ...field("Reviewer provider executions", formatExecutionBudget(summary.executions.reviewer)),
     ...field(
-      "Worker executions",
-      `${summary.workerExecutionCount}${
-        detail.limits.maxWorkerExecutions === null ? "" : ` / ${detail.limits.maxWorkerExecutions}`
-      }`,
+      "Base authorization",
+      `worker ${detail.limits.maxWorkerExecutions ?? "—"}, reviewer ${detail.limits.maxReviewerExecutions ?? "—"}`,
     ),
-    ...field(
-      "Reviewer executions",
-      `${summary.reviewerExecutionCount}${
-        detail.limits.maxReviewerExecutions === null
-          ? ""
-          : ` / ${detail.limits.maxReviewerExecutions}`
-      }`,
-    ),
+    ...field("Attention kind", summary.attention.kind),
+    ...field("Last durable event seq", `${summary.lastEventSeq}`),
     ...field("Interruptions", `${detail.interruptions} (resumed ${detail.resumes}×)`),
     ...field(
       "Run lock",
@@ -284,6 +309,128 @@ function renderTechnical(detail: AgentRunDetail): readonly string[] {
     ...(detail.degraded.length > 0 ? ["", ...bulletList("Evidence gaps", detail.degraded)] : []),
     "",
   ];
+}
+
+/* ------------------------------------------------------------- at a glance */
+
+/**
+ * The answer, before the evidence.
+ *
+ * A reader pasting this into a chat wants the verdict in the first screen:
+ * did it finish, how much authorization did it spend, did the gates pass. Each
+ * line is the canonical projection, not a recount — in particular the
+ * executions are provider executions against the effective limit, never
+ * allocated attempts against the base one.
+ */
+function renderAtAGlance(detail: AgentRunDetail): readonly string[] {
+  const { summary } = detail;
+  const guidance = describeGuidance(summary);
+
+  const latest = (stage: "post_worker" | "pre_review") => {
+    for (let index = detail.cycles.length - 1; index >= 0; index -= 1) {
+      const cycle = detail.cycles[index];
+      if (cycle === undefined) continue;
+      const phase = groupValidationByPhase(cycle).find((entry) => entry.stage === stage);
+      if (phase !== undefined) {
+        return `${describePassed(phase.latest.passed).toUpperCase()} (${describeReportOutcome(phase.latest)}, cycle ${cycle.number})`;
+      }
+    }
+    return null;
+  };
+
+  const lastReview = detail.cycles.toReversed().find((cycle) => cycle.review !== null)?.review;
+  const lastGate = detail.cycles.toReversed().find((cycle) => cycle.finalGate !== null)?.finalGate;
+
+  return [
+    "## At a glance",
+    "",
+    ...field("Worker provider executions", formatExecutionBudget(summary.executions.worker)),
+    ...field("Reviewer provider executions", formatExecutionBudget(summary.executions.reviewer)),
+    ...field("Latest post-worker validation", latest("post_worker")),
+    ...field("Latest pre-review evidence", latest("pre_review")),
+    ...field("Reviewer final verdict", lastReview?.verdict ?? null),
+    ...field(
+      "Final validation",
+      lastGate === undefined || lastGate === null
+        ? null
+        : `${lastGate.passed ? "PASS" : "FAIL"}, ${
+            lastGate.checksRun.length - lastGate.failures.length
+          } / ${lastGate.checksRun.length}`,
+    ),
+    ...field("Attention", `${summary.attention.kind} — ${guidance.headline}`),
+    ...field("Agents", describeAgentsRunning(detail)),
+    "",
+  ];
+}
+
+/* --------------------------------------------------- notable earlier events */
+
+/**
+ * The story behind a run that did not go straight through.
+ *
+ * Without this, a report of the accepted run reads as though everything passed
+ * first time — the escalation, the unusable review, the refused attempt and the
+ * recovery all vanish into a green summary. Each line is derived from a durable
+ * fact: a recorded verdict, a failed validation report, or an attempt that was
+ * allocated and never spent.
+ */
+function renderNotableEvents(detail: AgentRunDetail): readonly string[] {
+  const notes: string[] = [];
+
+  for (const cycle of detail.cycles) {
+    if (cycle.review !== null && cycle.review.verdict !== "OBJECTIVE_DONE") {
+      notes.push(
+        `Cycle ${cycle.number}: reviewer returned ${cycle.review.verdict}${
+          cycle.review.blockingReason === null ? "" : ` — ${collapse(cycle.review.blockingReason)}`
+        }`,
+      );
+    }
+  }
+
+  for (const failure of notableValidationFailures(detail)) {
+    notes.push(
+      `Cycle ${failure.cycle}: ${VALIDATION_STAGE_LABELS[failure.stage]} failed${
+        failure.failedCheckIds.length === 0 ? "" : ` (${failure.failedCheckIds.join(", ")})`
+      }${failure.supersededByPass ? ", later rerun and passed" : ""}`,
+    );
+  }
+
+  const reviewerGap =
+    detail.summary.executions.reviewer.attempts -
+    detail.summary.executions.reviewer.providerExecutions;
+  if (reviewerGap > 0) {
+    notes.push(
+      `${reviewerGap} reviewer attempt${reviewerGap === 1 ? "" : "s"} refused before any process started (no provider execution spent)`,
+    );
+  }
+
+  // Orchestrator-side recoveries, in the engine's own words. These are why a
+  // finished run can hold a wider reviewer authorization than its Work Order
+  // asked for, and a reader who does not see them will question the accounting.
+  for (const recovery of detail.evidenceRecoveries) {
+    const parts = ["Orchestrator recovery"];
+    if (recovery.supersededReason !== null) parts.push(`superseded ${recovery.supersededReason}`);
+    if (recovery.authorizedBy !== null) parts.push(`authorized by ${recovery.authorizedBy}`);
+    if (recovery.additionalReviewerExecutions > 0) {
+      parts.push(`+${recovery.additionalReviewerExecutions} reviewer execution`);
+    }
+    notes.push(
+      `${parts.join(" · ")}${recovery.note === null ? "" : ` — ${collapse(recovery.note)}`}`,
+    );
+  }
+
+  const base = detail.limits.maxReviewerExecutions;
+  const effective = detail.summary.executions.reviewer.effectiveLimit;
+  if (base !== null && effective !== null && effective > base) {
+    notes.push(`Reviewer authorization widened from ${base} to ${effective} by durable grant`);
+  }
+
+  if (detail.interruptions > 0 || detail.resumes > 0) {
+    notes.push(`Run was interrupted ${detail.interruptions}× and resumed ${detail.resumes}×`);
+  }
+
+  if (notes.length === 0) return [];
+  return ["## Notable earlier events", "", ...notes.map((note) => `- ${note}`), ""];
 }
 
 /* ----------------------------------------------------------------- entry */
@@ -324,8 +471,10 @@ export function buildAgentRunMarkdown(
     ...field("Terminal reason", summary.terminalReason),
     ...field("Agents active", describeAgentsActive(detail)),
     "",
+    ...renderAtAGlance(detail),
     ...section("Objective", detail.objective),
     ...renderHumanRequired(detail),
+    ...renderNotableEvents(detail),
   ];
 
   if (detail.cycles.length > 0) {

@@ -393,6 +393,15 @@ export type AgentRunValidationStage = typeof AgentRunValidationStage.Type;
 export const AgentRunValidationReport = Schema.Struct({
   stage: AgentRunValidationStage,
   cycle: PositiveInt,
+  /**
+   * The artifact this report came from.
+   *
+   * One semantic phase can be validated more than once — an evidence recovery
+   * legitimately reruns the checks — so a stage alone does not identify a
+   * report. Carried so the surface can show the latest authoritative result
+   * and still let an operator find the earlier ones.
+   */
+  artifact: Schema.String,
   ranAt: Schema.NullOr(IsoDateTime),
   passed: Schema.NullOr(Schema.Boolean),
   checks: Schema.Array(AgentRunCheck),
@@ -491,6 +500,24 @@ export type AgentRunTimelineEntry = typeof AgentRunTimelineEntry.Type;
 
 /* ---------------------------------------------------------------- detail */
 
+/**
+ * A human-authorized recovery from an orchestrator-side failure.
+ *
+ * Distinct from a product decision: the engine, not the work, was what went
+ * wrong. Recorded so a finished run can still explain why its reviewer
+ * authorization is wider than the Work Order asked for, and why a verdict was
+ * set aside and retaken.
+ */
+export const AgentRunEvidenceRecovery = Schema.Struct({
+  at: Schema.NullOr(IsoDateTime),
+  authorizedBy: Schema.NullOr(Schema.String),
+  note: Schema.NullOr(Schema.String),
+  /** Reason of the outcome this recovery superseded, e.g. `REVIEW_UNUSABLE`. */
+  supersededReason: Schema.NullOr(Schema.String),
+  additionalReviewerExecutions: NonNegativeInt,
+});
+export type AgentRunEvidenceRecovery = typeof AgentRunEvidenceRecovery.Type;
+
 export const AgentRunDetail = Schema.Struct({
   summary: AgentRunSummary,
   /** The work order's objective in full, unabridged. Null when unreadable. */
@@ -506,6 +533,8 @@ export const AgentRunDetail = Schema.Struct({
   }),
   interruptions: NonNegativeInt,
   resumes: NonNegativeInt,
+  /** Orchestrator-side recoveries a human authorized. Empty for most runs. */
+  evidenceRecoveries: Schema.Array(AgentRunEvidenceRecovery),
   /**
    * Non-fatal problems reading this run's evidence, e.g. one unreadable
    * validation artifact. Surfaced rather than swallowed: a gap in the evidence

@@ -57,9 +57,30 @@ export function cycleDirName(cycleNumber: number): string {
  * Validation artifacts are named after their stage, with `_` becoming `-`, and
  * a retried stage gets an `attempt-N` infix so history is never overwritten.
  */
-export function validationArtifactNames(stage: string): readonly string[] {
-  const base = `validation.${stage.replace(/_/g, "-")}`;
-  return [`${base}.json`, `${base}.attempt-2.json`, `${base}.attempt-3.json`];
+export function validationArtifactPrefix(stage: string): string {
+  return `validation.${stage.replace(/_/g, "-")}`;
+}
+
+/**
+ * Does this file name hold a validation report for `stage`?
+ *
+ * Matched by prefix against a directory listing rather than probed from a list
+ * of names we guessed in advance. The real run made the difference concrete:
+ * the orchestrator writes `.attempt-N` *and* `.rerun-N` suffixes, and a fixed
+ * candidate list silently missed four of one cycle's seven post-worker reports
+ * — which is the worst possible failure here, because the operator sees a
+ * plausible answer with no sign that anything is absent.
+ *
+ * The stage guard matters: `validation.pre-worker.json` must not be read as a
+ * `pre_review` report just because one name is a prefix of nothing in
+ * particular. Only `.json` directly under the stage prefix qualifies.
+ */
+export function isValidationArtifactFor(stage: string, fileName: string): boolean {
+  const prefix = validationArtifactPrefix(stage);
+  if (!fileName.startsWith(`${prefix}.`) || !fileName.endsWith(".json")) return false;
+  const middle = fileName.slice(prefix.length + 1, -".json".length);
+  // `validation.<stage>.json` (empty middle) or `validation.<stage>.<suffix>.json`.
+  return middle.length === 0 || /^[a-z0-9-]+$/.test(middle);
 }
 
 /* --------------------------------------------------------------- helpers */
@@ -211,6 +232,15 @@ export const OrchestratorRunRecord = Schema.Struct({
         at: Schema.optional(Str),
         authorizedBy: Schema.optional(Str),
         additionalReviewerExecutions: Schema.optional(Num),
+        note: Schema.optional(Str),
+        /** The outcome this recovery set aside, e.g. a REVIEW_UNUSABLE failure. */
+        supersededOutcome: Schema.optional(
+          Schema.Struct({
+            state: Schema.optional(Str),
+            reason: Schema.optional(Str),
+            message: Schema.optional(Str),
+          }),
+        ),
       }),
     ),
   ),

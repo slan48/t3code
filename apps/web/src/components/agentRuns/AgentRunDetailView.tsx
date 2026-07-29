@@ -16,7 +16,20 @@ import {
   quietMillis,
   toneToBadgeVariant,
 } from "~/agentRunFormat";
+import {
+  ATTENTION_LABELS,
+  describeAgentsRunning,
+  describeAttemptGap,
+  describeGuidance,
+  formatExecutionBudget,
+} from "~/agentRunAttention";
 import { buildAgentRunMarkdown } from "~/agentRunReport";
+import {
+  describeReportOutcome,
+  groupValidationByPhase,
+  VALIDATION_STAGE_LABELS,
+  type ValidationPhaseView,
+} from "~/agentRunValidation";
 import { useNowMs } from "~/hooks/useNowMs";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { cn } from "~/lib/utils";
@@ -73,7 +86,11 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
         </div>
       </header>
 
+      <GuidancePanel detail={detail} />
+
       {summary.humanRequired.present ? <HumanRequiredPanel detail={detail} /> : null}
+
+      <ExecutionBudgetPanel detail={detail} />
 
       {detail.objective !== null ? <ObjectivePanel objective={detail.objective} /> : null}
 
@@ -97,7 +114,7 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
       ) : null}
 
       {detail.cycles.map((cycle) => (
-        <CyclePanels key={cycle.number} cycle={cycle} />
+        <CyclePanels key={cycle.number} cycle={cycle} agents={detail.agents} />
       ))}
 
       <Panel title="Timeline">
@@ -108,6 +125,109 @@ export const AgentRunDetailView = memo(function AgentRunDetailView({
     </div>
   );
 });
+
+/* --------------------------------------------------------------- guidance */
+
+/**
+ * The first thing on the page: is anything expected of me?
+ *
+ * A product decision, an orchestrator recovery and a failed run all used to
+ * render as "human input required", which is three different jobs for
+ * potentially three different people wearing one label. They are now visually
+ * and verbally distinct, and a run that needs nothing says so rather than
+ * leaving the operator to infer it from the absence of a warning.
+ */
+const GuidancePanel = memo(function GuidancePanel({ detail }: { detail: AgentRunDetail }) {
+  const guidance = describeGuidance(detail.summary);
+  const agents = describeAgentsRunning(detail);
+
+  return (
+    <section
+      className={cn(
+        "flex min-w-0 flex-col gap-1.5 rounded-xl border px-3.5 py-3",
+        guidance.actionRequired
+          ? "border-warning/50 bg-warning/8"
+          : guidance.tone === "failure"
+            ? "border-destructive/40 bg-destructive/6"
+            : "bg-card",
+      )}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <ToneIcon
+          tone={guidance.tone}
+          className={cn("size-4 shrink-0", toneTextClass(guidance.tone))}
+        />
+        <h2 className={cn("min-w-0 text-sm font-semibold", toneTextClass(guidance.tone))}>
+          {guidance.headline}
+        </h2>
+        {detail.summary.attention.kind !== "none" ? (
+          <Badge variant={toneToBadgeVariant(guidance.tone)} size="sm" className="shrink-0">
+            {ATTENTION_LABELS[detail.summary.attention.kind]}
+          </Badge>
+        ) : null}
+      </div>
+      <p className="min-w-0 break-words text-sm text-muted-foreground">{guidance.detail}</p>
+      {/*
+        Always stated, in every state. "Is something still running on my
+        subscription?" must never be something an operator has to infer.
+      */}
+      <p className="min-w-0 break-words text-xs text-muted-foreground/90">{agents}</p>
+    </section>
+  );
+});
+
+/* -------------------------------------------------------- execution budget */
+
+/**
+ * Provider executions against the authorization actually in force.
+ *
+ * Promoted out of technical details because it is the number an operator uses
+ * to decide whether a run can continue. It previously read "4 / 2" — allocated
+ * attempts over the *base* limit — which claimed an overrun that never
+ * happened. Attempts are still shown, but as a footnote and only when they
+ * differ from executions.
+ */
+const ExecutionBudgetPanel = memo(function ExecutionBudgetPanel({
+  detail,
+}: {
+  detail: AgentRunDetail;
+}) {
+  return (
+    <Panel title="Provider executions">
+      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:gap-6">
+        <BudgetRow
+          label={`Worker · ${detail.agents.worker}`}
+          budget={detail.summary.executions.worker}
+        />
+        <BudgetRow
+          label={`Reviewer · ${detail.agents.reviewer}`}
+          budget={detail.summary.executions.reviewer}
+        />
+      </div>
+    </Panel>
+  );
+});
+
+function BudgetRow({
+  label,
+  budget,
+}: {
+  label: string;
+  budget: AgentRunDetail["summary"]["executions"]["worker"];
+}) {
+  const gap = describeAttemptGap(budget);
+  return (
+    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="font-mono text-lg font-semibold text-foreground tabular-nums">
+        {formatExecutionBudget(budget)}
+      </span>
+      {gap !== null ? (
+        <span className="min-w-0 break-words text-xs text-muted-foreground">{gap}</span>
+      ) : null}
+    </div>
+  );
+}
 
 /* ------------------------------------------------------------ copy report */
 
@@ -397,26 +517,33 @@ function roleLabel(detail: AgentRunDetail): string {
 
 /* ---------------------------------------------------------------- cycles */
 
-const CyclePanels = memo(function CyclePanels({ cycle }: { cycle: AgentRunCycle }) {
-  const validationChecks = cycle.validation.flatMap((report) =>
-    report.stage === "post_worker" || report.stage === "final" ? report.checks : [],
-  );
+const CyclePanels = memo(function CyclePanels({
+  cycle,
+  agents,
+}: {
+  cycle: AgentRunCycle;
+  agents: AgentRunDetail["agents"];
+}) {
+  const phases = groupValidationByPhase(cycle);
 
   return (
     <>
-      {validationChecks.length > 0 ? (
+      {phases.length > 0 || cycle.finalGate !== null ? (
         <Panel title={`Validation · cycle ${cycle.number}`}>
-          <div className="flex min-w-0 flex-col divide-y divide-border/50">
-            {validationChecks.map((check) => (
-              <CheckRow key={`${check.id}-${check.outcome}`} check={check} />
+          <div className="flex min-w-0 flex-col gap-3">
+            {phases.map((phase) => (
+              <ValidationPhaseBlock key={phase.stage} phase={phase} />
             ))}
           </div>
+
           {cycle.finalGate !== null ? (
-            <div className="mt-2 border-t pt-2">
+            <div className="mt-3 border-t pt-2">
               <AgentRunPhaseRow
-                label="Final gate"
+                label="Final acceptance gate"
                 status={cycle.finalGate.passed ? "passed" : "failed"}
-                detail={`${cycle.finalGate.checksRun.length} checks run`}
+                detail={`${
+                  cycle.finalGate.checksRun.length - cycle.finalGate.failures.length
+                } / ${cycle.finalGate.checksRun.length} passed`}
               />
               {cycle.finalGate.failures.map((failure) => (
                 <CheckRow key={failure.id} check={failure} />
@@ -427,9 +554,80 @@ const CyclePanels = memo(function CyclePanels({ cycle }: { cycle: AgentRunCycle 
       ) : null}
 
       {cycle.review !== null ? (
-        <ReviewPanel review={cycle.review} agentLabel={`cycle ${cycle.number}`} />
+        <ReviewPanel
+          review={cycle.review}
+          agentLabel={`${agents.reviewer} · cycle ${cycle.number}`}
+        />
       ) : null}
     </>
+  );
+});
+
+/**
+ * One semantic validation phase: the answer, then the history behind it.
+ *
+ * The latest run is the answer and is always open. Earlier runs of the same
+ * phase are counted and collapsed — they are real, and an evidence recovery
+ * makes several of them routine, but only one of them is current. A collapsed
+ * group that contains a failure says so on its label, so the cycle-1 format
+ * failure cannot hide behind a green heading.
+ */
+const ValidationPhaseBlock = memo(function ValidationPhaseBlock({
+  phase,
+}: {
+  phase: ValidationPhaseView;
+}) {
+  const [open, setOpen] = useState(false);
+  const status =
+    phase.latest.passed === null ? "unknown" : phase.latest.passed ? "passed" : "failed";
+
+  return (
+    <div className="flex min-w-0 flex-col">
+      <AgentRunPhaseRow
+        label={VALIDATION_STAGE_LABELS[phase.stage]}
+        status={status}
+        detail={describeReportOutcome(phase.latest)}
+      />
+      <div className="flex min-w-0 flex-col divide-y divide-border/50 ps-6">
+        {phase.latest.checks.map((check) => (
+          <CheckRow key={`${phase.latest.artifact}-${check.id}`} check={check} />
+        ))}
+      </div>
+
+      {phase.previous.length > 0 ? (
+        <div className="ps-6">
+          <Button
+            size="xs"
+            variant="ghost"
+            className="mt-1 self-start"
+            onClick={() => setOpen((value) => !value)}
+          >
+            {open ? "Hide" : "Show"} previous validation attempts ({phase.previous.length})
+            {phase.hasEarlierFailure ? " · includes a failure" : ""}
+          </Button>
+
+          {open ? (
+            <div className="mt-1 flex min-w-0 flex-col gap-2 border-s ps-3">
+              {phase.previous.map((report) => (
+                <div key={report.artifact} className="flex min-w-0 flex-col">
+                  <span className="text-xs text-muted-foreground">
+                    {report.ranAt ?? "time unknown"} · {describeReportOutcome(report)}
+                  </span>
+                  <span className="font-mono text-[0.6875rem] text-muted-foreground/70">
+                    {report.artifact}
+                  </span>
+                  {report.checks
+                    .filter((check) => check.passed === false)
+                    .map((check) => (
+                      <CheckRow key={`${report.artifact}-${check.id}`} check={check} />
+                    ))}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 });
 
@@ -573,18 +771,40 @@ const TechnicalDetails = memo(function TechnicalDetails({ detail }: { detail: Ag
                 : "not held"
             }
           />
+          {/*
+            Attempts and provider executions are different facts, and the
+            difference is exactly what made the old single number wrong. Both
+            are shown here, against the base limit and the effective one.
+          */}
+          <Detail label="Worker attempts" value={`${detail.summary.executions.worker.attempts}`} />
           <Detail
-            label="Executions"
-            value={`worker ${detail.summary.workerExecutionCount}${
-              detail.limits.maxWorkerExecutions === null
-                ? ""
-                : ` / ${detail.limits.maxWorkerExecutions}`
-            }, reviewer ${detail.summary.reviewerExecutionCount}${
-              detail.limits.maxReviewerExecutions === null
-                ? ""
-                : ` / ${detail.limits.maxReviewerExecutions}`
+            label="Worker provider executions"
+            value={formatExecutionBudget(detail.summary.executions.worker)}
+          />
+          <Detail
+            label="Reviewer attempts"
+            value={`${detail.summary.executions.reviewer.attempts}`}
+          />
+          <Detail
+            label="Reviewer provider executions"
+            value={formatExecutionBudget(detail.summary.executions.reviewer)}
+          />
+          <Detail
+            label="Base authorization"
+            value={`worker ${detail.limits.maxWorkerExecutions ?? "—"}, reviewer ${
+              detail.limits.maxReviewerExecutions ?? "—"
             }`}
           />
+          <Detail
+            label="Effective reviewer authorization"
+            value={
+              detail.summary.executions.reviewer.effectiveLimit === null
+                ? "uncapped"
+                : `${detail.summary.executions.reviewer.effectiveLimit}`
+            }
+          />
+          <Detail label="Attention" value={detail.summary.attention.kind} />
+          <Detail label="Last durable event seq" value={`${detail.summary.lastEventSeq}`} />
           <Detail
             label="Interruptions"
             value={`${detail.interruptions} (resumed ${detail.resumes}×)`}

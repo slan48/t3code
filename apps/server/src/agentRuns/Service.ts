@@ -61,7 +61,7 @@ import {
   cycleDirName,
   isAttemptId,
   isRunId,
-  validationArtifactNames,
+  isValidationArtifactFor,
 } from "./Artifacts.ts";
 import {
   type AttemptEvidence,
@@ -415,36 +415,41 @@ export const make = (options: MakeOptions = {}) =>
       cycleNumbers: readonly number[],
     ): Effect.Effect<readonly ValidationEvidence[]> =>
       Effect.forEach(cycleNumbers, (cycleNumber) =>
-        Effect.forEach(AGENT_RUN_VALIDATION_STAGES, (stage) =>
-          Effect.forEach(validationArtifactNames(stage), (fileName) =>
-            Effect.gen(function* () {
+        Effect.gen(function* () {
+          const cycleDir = homePath(ORCHESTRATOR_RUNS_DIR, runId, cycleDirName(cycleNumber));
+          if (cycleDir === null) return [] as readonly ValidationEvidence[];
+
+          // Listed, not guessed. The orchestrator names reruns in more than one
+          // way, and a fixed candidate list drops the ones it did not predict
+          // without ever saying so.
+          const names = [...(yield* listDirectory(cycleDir))].sort();
+          const found: ValidationEvidence[] = [];
+
+          for (const stage of AGENT_RUN_VALIDATION_STAGES) {
+            for (const fileName of names) {
+              if (!isValidationArtifactFor(stage, fileName)) continue;
               const filePath = homePath(
                 ORCHESTRATOR_RUNS_DIR,
                 runId,
                 cycleDirName(cycleNumber),
                 fileName,
               );
-              if (filePath === null) return Option.none<ValidationEvidence>();
+              if (filePath === null) continue;
               const report = yield* readJsonFile(filePath, decodeValidation);
-              if (report === null) return Option.none<ValidationEvidence>();
+              if (report === null) continue;
               const info = yield* statInfo(filePath);
-              return Option.some({
+              found.push({
                 cycle: cycleNumber,
                 stage: stage as AgentRunValidationStage,
                 report,
                 writtenAt: info?.mtime ?? null,
-              } satisfies ValidationEvidence);
-            }),
-          ),
-        ),
-      ).pipe(
-        Effect.map((groups) =>
-          groups
-            .flat(2)
-            .filter(Option.isSome)
-            .map((entry) => entry.value),
-        ),
-      );
+                artifact: fileName,
+              });
+            }
+          }
+          return found as readonly ValidationEvidence[];
+        }),
+      ).pipe(Effect.map((groups) => groups.flat()));
 
     /* --------------------------------------------------------- lock reads */
 

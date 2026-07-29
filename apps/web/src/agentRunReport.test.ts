@@ -33,6 +33,16 @@ const summary = (overrides: Partial<AgentRunSummary> = {}): AgentRunSummary =>
     finishedAt: "2026-07-28T18:54:46.360Z",
     workerExecutionCount: 1,
     reviewerExecutionCount: 1,
+    executions: {
+      worker: { providerExecutions: 2, attempts: 2, effectiveLimit: 2 },
+      reviewer: { providerExecutions: 3, attempts: 4, effectiveLimit: 3 },
+    },
+    attention: {
+      kind: "product-decision",
+      actionable: true,
+      summary: "A product or authorization decision is needed before this run can continue.",
+    },
+    lastEventSeq: 19,
     terminalReason: "ESCALATED",
     humanRequired: {
       present: true,
@@ -91,6 +101,7 @@ const cycle = (overrides: Partial<AgentRunCycle> = {}): AgentRunCycle =>
       {
         stage: "post_worker",
         cycle: 1,
+        artifact: "validation.post-worker.json",
         ranAt: "2026-07-28T18:53:52.055Z",
         passed: false,
         checks: [
@@ -158,6 +169,7 @@ const detail = (overrides: Partial<AgentRunDetail> = {}): AgentRunDetail =>
     limits: { maxWorkerExecutions: 2, maxReviewerExecutions: 2 },
     interruptions: 0,
     resumes: 0,
+    evidenceRecoveries: [],
     degraded: [],
     ...overrides,
   }) as AgentRunDetail;
@@ -314,6 +326,7 @@ describe("buildAgentRunMarkdown", () => {
             {
               stage: "post_worker",
               cycle: 1,
+              artifact: "validation.post-worker.json",
               ranAt: "2026-07-28T18:53:52.055Z",
               passed: true,
               checks: [
@@ -384,7 +397,11 @@ describe("buildAgentRunMarkdown", () => {
     expect(technical).toContain("**Worker adapter:** claude-code");
     expect(technical).toContain("**Reviewer adapter:** codex");
     expect(technical).toContain("**Base commit:** fa82be694f777dba68567d802421e579ad05fcf5");
-    expect(technical).toContain("**Worker executions:** 1 / 2");
+    // Provider executions against the effective limit — never allocated
+    // attempts against the base limit, which is what produced "4 / 2".
+    expect(technical).toContain("**Worker provider executions:** 2 / 2");
+    expect(technical).toContain("**Reviewer provider executions:** 3 / 3");
+    expect(technical).toContain("**Reviewer attempts:** 4");
     expect(technical).toContain("**Interruptions:** 0 (resumed 0×)");
     expect(technical).toContain("**Run lock:** not held");
     // Paths are allowed, but only down here.
@@ -462,6 +479,7 @@ describe("buildAgentRunMarkdown", () => {
             {
               stage: "post_worker",
               cycle: 1,
+              artifact: "validation.post-worker.json",
               ranAt: "2026-07-28T18:53:52.055Z",
               passed: false,
               checks: [
@@ -485,6 +503,193 @@ describe("buildAgentRunMarkdown", () => {
     // The fence must be longer than the longest backtick run it contains, or
     // the block would terminate early and the rest of the report would break.
     expect(md).toContain("````\nexpected ```fenced``` output\n````");
+  });
+
+  it("leads with canonical provider executions, never allocated attempts", () => {
+    const md = buildAgentRunMarkdown(detail(), { nowMs: NOW });
+    const glance = md.slice(md.indexOf("## At a glance"), md.indexOf("**Objective:**"));
+
+    // The whole point of the accounting fix: 3 provider executions against an
+    // effective limit of 3, not 4 allocated attempts against a base of 2.
+    expect(glance).toContain("**Worker provider executions:** 2 / 2");
+    expect(glance).toContain("**Reviewer provider executions:** 3 / 3");
+    expect(glance).not.toContain("4 / 2");
+  });
+
+  it("summarises the verdict before any evidence", () => {
+    const md = buildAgentRunMarkdown(detail(), { nowMs: NOW });
+    expect(md.indexOf("## At a glance")).toBeLessThan(md.indexOf("## Cycles"));
+    expect(md).toContain("**Latest post-worker validation:**");
+    expect(md).toContain("**Reviewer final verdict:** ESCALATE");
+    expect(md).toContain("**Agents:** No agents are currently running");
+  });
+
+  it("prints one authoritative validation result per phase, not one per rerun", () => {
+    const reran = detail({
+      cycles: [
+        cycle({
+          validation: [
+            {
+              stage: "post_worker",
+              cycle: 1,
+              artifact: "validation.post-worker.json",
+              ranAt: "2026-07-28T22:50:24.104Z",
+              passed: true,
+              checks: [
+                {
+                  id: "unit",
+                  name: "unit",
+                  outcome: "PASSED",
+                  passed: true,
+                  durationMs: 1000,
+                  exitCode: 0,
+                  failureDetail: null,
+                },
+              ],
+            },
+            {
+              stage: "post_worker",
+              cycle: 1,
+              artifact: "validation.post-worker.rerun-1.json",
+              ranAt: "2026-07-29T00:14:10.484Z",
+              passed: true,
+              checks: [
+                {
+                  id: "unit",
+                  name: "unit",
+                  outcome: "PASSED",
+                  passed: true,
+                  durationMs: 1000,
+                  exitCode: 0,
+                  failureDetail: null,
+                },
+              ],
+            },
+            {
+              stage: "post_worker",
+              cycle: 1,
+              artifact: "validation.post-worker.attempt-3.json",
+              ranAt: "2026-07-29T01:32:10.887Z",
+              passed: true,
+              checks: [
+                {
+                  id: "unit",
+                  name: "unit",
+                  outcome: "PASSED",
+                  passed: true,
+                  durationMs: 1000,
+                  exitCode: 0,
+                  failureDetail: null,
+                },
+              ],
+            },
+          ],
+        }),
+      ],
+    });
+
+    const md = buildAgentRunMarkdown(reran, { nowMs: NOW });
+    // Three identical green runs collapse to one result plus a count.
+    expect(md.match(/- `unit` — PASSED/g)).toHaveLength(1);
+    expect(md).toContain("2 earlier runs of this phase, all superseded");
+  });
+
+  it("summarises what went wrong earlier so a green run still tells its story", () => {
+    const md = buildAgentRunMarkdown(detail(), { nowMs: NOW });
+    const notable = md.slice(md.indexOf("## Notable earlier events"));
+
+    expect(md).toContain("## Notable earlier events");
+    expect(notable).toContain("reviewer returned ESCALATE");
+    expect(notable).toContain("Post-worker validation failed (format-check)");
+    // The refused attempt and the widened authorization are both durable facts
+    // and both explain the accounting a reader would otherwise question.
+    expect(notable).toContain("1 reviewer attempt refused before any process started");
+    expect(notable).toContain("Reviewer authorization widened from 2 to 3");
+  });
+
+  it("names the orchestrator-side recovery that widened the authorization", () => {
+    const recovered = detail({
+      evidenceRecoveries: [
+        {
+          at: "2026-07-29T00:15:21.438Z",
+          authorizedBy: "sergio",
+          note: "Integration evidence was never produced: it was configured post-review only.",
+          supersededReason: "REVIEW_UNUSABLE",
+          additionalReviewerExecutions: 1,
+        },
+      ],
+    });
+
+    const md = buildAgentRunMarkdown(recovered, { nowMs: NOW });
+    const notable = md.slice(md.indexOf("## Notable earlier events"), md.indexOf("## Cycles"));
+
+    // The engine failed its own review, a human authorized a retake, and the
+    // ceiling moved. Without this the 3/3 reads as an unexplained overrun.
+    expect(notable).toContain("Orchestrator recovery");
+    expect(notable).toContain("superseded REVIEW_UNUSABLE");
+    expect(notable).toContain("authorized by sergio");
+    expect(notable).toContain("+1 reviewer execution");
+    expect(notable).toContain("Integration evidence was never produced");
+  });
+
+  it("omits the notable-events section when a run went straight through", () => {
+    const clean = detail({
+      summary: summary({
+        state: "COMPLETED",
+        terminalReason: "OBJECTIVE_DONE",
+        attention: { kind: "none", actionable: false, summary: "" },
+        executions: {
+          worker: { providerExecutions: 1, attempts: 1, effectiveLimit: 2 },
+          reviewer: { providerExecutions: 1, attempts: 1, effectiveLimit: 2 },
+        },
+        humanRequired: {
+          present: false,
+          source: "none",
+          reasonCode: null,
+          summary: null,
+          decisionNeeded: null,
+          options: [],
+          evidence: [],
+          createdAt: null,
+        },
+      }),
+      cycles: [
+        cycle({
+          validationStatus: "passed",
+          reviewerStatus: "passed",
+          review: {
+            cycle: 1,
+            verdict: "OBJECTIVE_DONE",
+            summary: "Looks right.",
+            requiredChanges: [],
+            blockingReason: null,
+            evidence: [],
+          },
+          validation: [
+            {
+              stage: "post_worker",
+              cycle: 1,
+              artifact: "validation.post-worker.json",
+              ranAt: "2026-07-28T18:53:52.055Z",
+              passed: true,
+              checks: [
+                {
+                  id: "unit",
+                  name: "unit",
+                  outcome: "PASSED",
+                  passed: true,
+                  durationMs: 1000,
+                  exitCode: 0,
+                  failureDetail: null,
+                },
+              ],
+            },
+          ],
+        }),
+      ],
+    });
+
+    expect(buildAgentRunMarkdown(clean, { nowMs: NOW })).not.toContain("## Notable earlier events");
   });
 
   it("reads as a document, not as generated output", () => {

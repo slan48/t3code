@@ -106,6 +106,12 @@ export interface FixtureRun {
   readonly validation?: readonly {
     readonly cycle: number;
     readonly stage: string;
+    /**
+     * Artifact suffix, e.g. `rerun-1` or `attempt-2`. Omitted writes the plain
+     * `validation.<stage>.json`. The orchestrator uses more than one naming
+     * convention for reruns, which is exactly what the reader must tolerate.
+     */
+    readonly suffix?: string;
     readonly checks: readonly {
       readonly id: string;
       readonly name?: string;
@@ -269,7 +275,9 @@ export const writeOrchestratorHome = Effect.fn("agentRuns.fixtures.writeHome")(f
         path.join(
           runDir,
           `cycle-${String(report.cycle).padStart(3, "0")}`,
-          `validation.${report.stage.replace(/_/g, "-")}.json`,
+          `validation.${report.stage.replace(/_/g, "-")}${
+            report.suffix === undefined ? "" : `.${report.suffix}`
+          }.json`,
         ),
         toJson({ stage: report.stage, checks: report.checks }),
       );

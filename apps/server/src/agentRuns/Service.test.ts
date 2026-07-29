@@ -7,7 +7,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
 import * as ProcessRunner from "../processRunner.ts";
-import { failureTail, redactSecrets } from "./Artifacts.ts";
+import { failureTail, isValidationArtifactFor, redactSecrets } from "./Artifacts.ts";
 import { writeOrchestratorHome, type FixtureRun } from "./fixtures.ts";
 import {
   AgentRunsService,
@@ -517,6 +517,78 @@ it.layer(BaseLayer)("AgentRunsService", (it) => {
         }),
       ),
     );
+  });
+
+  describe("validation artifact discovery", () => {
+    /**
+     * The real run wrote seven post-worker reports for one cycle using two
+     * different suffix conventions. A reader that probes a fixed list of names
+     * silently returned three of them — the worst kind of wrong, because the
+     * answer still looks complete.
+     */
+    it.effect("finds every rerun of a phase, whatever the suffix convention", () =>
+      withHome(
+        [
+          {
+            ...completedRun,
+            validation: [
+              { cycle: 1, stage: "post_worker", checks: [{ id: "unit", passed: true }] },
+              {
+                cycle: 1,
+                stage: "post_worker",
+                suffix: "rerun-1",
+                checks: [{ id: "unit", passed: true }],
+              },
+              {
+                cycle: 1,
+                stage: "post_worker",
+                suffix: "attempt-2",
+                checks: [{ id: "unit", passed: true }],
+              },
+              {
+                cycle: 1,
+                stage: "post_worker",
+                suffix: "rerun-2",
+                checks: [{ id: "unit", passed: true }],
+              },
+              {
+                cycle: 1,
+                stage: "pre_review",
+                suffix: "rerun-1",
+                checks: [{ id: "integration", passed: true }],
+              },
+            ],
+          },
+        ],
+        [],
+        (service) =>
+          Effect.gen(function* () {
+            const detail = yield* service.get(RUN_DONE);
+            const reports = detail.cycles[0]?.validation ?? [];
+            const postWorker = reports.filter((report) => report.stage === "post_worker");
+
+            expect(postWorker).toHaveLength(4);
+            expect(postWorker.map((report) => report.artifact).sort()).toEqual([
+              "validation.post-worker.attempt-2.json",
+              "validation.post-worker.json",
+              "validation.post-worker.rerun-1.json",
+              "validation.post-worker.rerun-2.json",
+            ]);
+            expect(reports.filter((report) => report.stage === "pre_review")).toHaveLength(1);
+          }),
+      ),
+    );
+
+    it("never reads one stage's artifact as another's", () => {
+      expect(isValidationArtifactFor("pre_review", "validation.pre-worker.json")).toBe(false);
+      expect(isValidationArtifactFor("pre_worker", "validation.pre-worker.json")).toBe(true);
+      expect(isValidationArtifactFor("post_worker", "validation.post-worker.rerun-3.json")).toBe(
+        true,
+      );
+      // Not a validation artifact at all.
+      expect(isValidationArtifactFor("post_worker", "worker-result.json")).toBe(false);
+      expect(isValidationArtifactFor("final", "validation.final.json")).toBe(true);
+    });
   });
 
   describe("human-required packet", () => {
