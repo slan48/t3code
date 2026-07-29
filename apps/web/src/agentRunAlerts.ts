@@ -1,21 +1,32 @@
 import type { AgentRunSummary } from "@t3tools/contracts";
-import { agentRunStateLabel } from "@t3tools/contracts";
 
 /**
- * Which agent runs still owe the operator a look, and what to say about them.
+ * What the operator is told about a run, and when they are told it once.
  *
- * Acknowledgement lives entirely in T3Code. The orchestrator's history is a
- * record of what the engine did; whether a human has glanced at a browser tab
- * is not part of that record, and writing it there would be rewriting history
- * to store a UI preference.
+ * The bug this exists to kill: reloading the page replayed every terminal
+ * toast, including for runs that finished days ago. On a phone, where reloading
+ * is how you check whether anything changed, that made the cockpit unusable —
+ * the act of looking produced a wall of notifications about things already
+ * known.
  *
- * A run is keyed by `id` *and* terminal state, so a run that goes
- * `HUMAN_REQUIRED` → (operator resumes it from a terminal) → `FAILED` alerts
- * again. Acknowledging is a statement about a specific outcome, not a
- * permanent mute on the run.
+ * The fix separates two things that were one:
+ *
+ *   announced     — a toast has been shown for this transition. Durable, so a
+ *                   reload does not show it again.
+ *   acknowledged  — the operator has actually dealt with it. Drives the badge.
+ *
+ * Announcement is keyed by *transition*, not by run. A run that goes
+ * HUMAN_REQUIRED → resolved → FAILED → recovered → COMPLETED reaches several
+ * announceable states, and each is genuinely new information. The key uses the
+ * orchestrator's durable event sequence, which is monotonic and survives
+ * everything; a client-side timestamp would make the same outcome look new on
+ * every poll.
+ *
+ * Nothing here is written back to the orchestrator. Whether a human has glanced
+ * at a browser tab is not part of the engine's history.
  */
 
-export const AGENT_RUN_ACK_STORAGE_KEY = "t3code:agent-run-acknowledgements:v1";
+export const AGENT_RUN_ACK_STORAGE_KEY = "t3code:agent-run-acknowledgements:v2";
 
 export interface AgentRunAlert {
   readonly key: string;
@@ -23,96 +34,140 @@ export interface AgentRunAlert {
   readonly title: string;
   readonly message: string;
   readonly tone: "success" | "attention" | "failure";
-}
-
-export function acknowledgementKey(run: { readonly id: string; readonly state: string }): string {
-  return `${run.id}::${run.state}`;
+  /** True when the operator is blocking something, not merely informed. */
+  readonly actionable: boolean;
 }
 
 /**
- * The runs that should raise an in-app alert right now.
+ * Identity of one announceable transition.
  *
- * Deliberately derived from current state rather than from a transition the
- * client happened to witness: T3Code may have been closed when the run
- * finished, and "I was not watching" must not mean "I never find out".
+ * `lastEventSeq` is the orchestrator's own durable sequence number. Two
+ * different outcomes of the same run always differ; the same outcome observed
+ * twice never does.
  */
+export function alertKey(run: AgentRunSummary): string {
+  return `${run.id}::${run.lastEventSeq}::${run.state}`;
+}
+
+/** Terminal or parked: the states worth telling someone about. */
+function isAnnounceable(run: AgentRunSummary): boolean {
+  return run.terminal || run.state === "RECOVERY_REQUIRED";
+}
+
 /**
  * How many toasts may be raised at once.
  *
- * Opening T3Code after a week away should not bury the app under a stack of
- * notifications. Past this point the badge carries the count and the run list
- * carries the detail, which is a better way to read six outcomes than six
- * toasts competing for the same corner of the screen.
+ * Opening the cockpit after a week away should not bury the app. Past this
+ * point the badge carries the count and the run list carries the detail, which
+ * is a better way to read six outcomes than six toasts fighting for a corner.
  */
 export const MAX_CONCURRENT_ALERTS = 3;
 
-export function pendingAgentRunAlerts(
-  runs: readonly AgentRunSummary[],
-  acknowledged: readonly string[],
-): readonly AgentRunAlert[] {
-  const seen = new Set(acknowledged);
+export interface AlertDecision {
+  /** Toasts to raise now. */
+  readonly alerts: readonly AgentRunAlert[];
+  /**
+   * Keys to record as announced without showing anything.
+   *
+   * This is the first-load baseline: history that was already over before the
+   * cockpit opened is absorbed silently, so it never toasts — not now, and not
+   * on any later reload.
+   */
+  readonly silence: readonly string[];
+}
+
+export interface AlertInput {
+  readonly runs: readonly AgentRunSummary[];
+  readonly announced: readonly string[];
+  /**
+   * True the first time this browser sees any runs at all.
+   *
+   * On that pass, finished history is absorbed silently — except for runs still
+   * *actively asking* for something, which are announced once because the
+   * request is still open and was simply made while nobody was looking.
+   */
+  readonly firstLoad: boolean;
+}
+
+export function decideAgentRunAlerts(input: AlertInput): AlertDecision {
+  const seen = new Set(input.announced);
   const alerts: AgentRunAlert[] = [];
-  for (const run of runs) {
-    if (alerts.length >= MAX_CONCURRENT_ALERTS) break;
-    if (!run.terminal && run.state !== "RECOVERY_REQUIRED") continue;
-    const key = acknowledgementKey(run);
+  const silence: string[] = [];
+
+  for (const run of input.runs) {
+    if (!isAnnounceable(run)) continue;
+    const key = alertKey(run);
     if (seen.has(key)) continue;
+
+    // Finished history discovered on a cold start is absorbed, not announced.
+    // A run still waiting on a decision is announced even then: the ask is
+    // open, and "you were not watching" must not mean "you never find out".
+    if (input.firstLoad && !run.attention.actionable) {
+      silence.push(key);
+      continue;
+    }
+
+    if (alerts.length >= MAX_CONCURRENT_ALERTS) {
+      // Over the cap, but still recorded as announced so the next reload does
+      // not surface it as though it were new.
+      silence.push(key);
+      continue;
+    }
+
     alerts.push({
       key,
       runId: run.id,
       title: run.title,
       message: alertMessage(run),
-      tone: run.state === "COMPLETED" ? "success" : alertTone(run.state),
+      tone: alertTone(run),
+      actionable: run.attention.actionable,
     });
   }
-  return alerts;
+
+  return { alerts, silence };
 }
 
-function alertTone(state: AgentRunSummary["state"]): "attention" | "failure" {
-  return state === "FAILED" || state === "TIMED_OUT" ? "failure" : "attention";
+function alertTone(run: AgentRunSummary): "success" | "attention" | "failure" {
+  if (run.state === "COMPLETED") return "success";
+  if (run.attention.actionable) return "attention";
+  return "failure";
 }
 
 function alertMessage(run: AgentRunSummary): string {
-  switch (run.state) {
-    case "COMPLETED":
-      return "completed";
-    case "HUMAN_REQUIRED":
-      return "needs your input";
-    case "RECOVERY_REQUIRED":
-      return "needs recovery";
-    case "MAX_CYCLES_REACHED":
-      return "reached its cycle limit and needs review";
-    case "FAILED":
-      return "failed";
-    case "TIMED_OUT":
-      return "timed out";
+  switch (run.attention.kind) {
+    case "product-decision":
+      return "needs a product decision";
+    case "orchestrator-recovery":
+      return "needs orchestrator recovery";
+    case "run-failed":
+      return run.state === "TIMED_OUT" ? "timed out" : "stopped without completing";
     default:
-      return agentRunStateLabel(run.state).toLowerCase();
+      return run.state === "COMPLETED" ? "completed" : "finished";
   }
 }
 
 /**
- * The sidebar badge count.
+ * The sidebar badge: what is actionable *now*.
  *
- * Counts only unacknowledged runs that are actually asking for something —
- * a completed run is worth one toast, not a permanent number next to the nav
- * entry.
+ * Not "terminal outcomes this browser has not clicked". The badge previously
+ * showed 5 because five historical runs had never been acknowledged, which is
+ * not a number anyone can act on. A finished run belongs in the list; only a
+ * run actually waiting on a person belongs in the badge.
  */
 export function agentRunBadgeCount(
   runs: readonly AgentRunSummary[],
   acknowledged: readonly string[],
 ): number {
   const seen = new Set(acknowledged);
-  return runs.filter((run) => run.attentionRequired && !seen.has(acknowledgementKey(run))).length;
+  return runs.filter((run) => run.attention.actionable && !seen.has(alertKey(run))).length;
 }
 
-/** Keep the acknowledgement list from growing without bound. */
+/** Keep the stored keys from growing without bound. */
 export const MAX_ACKNOWLEDGEMENTS = 200;
 
-export function withAcknowledgement(
-  acknowledged: readonly string[],
-  key: string,
-): readonly string[] {
-  if (acknowledged.includes(key)) return acknowledged;
-  return [...acknowledged, key].slice(-MAX_ACKNOWLEDGEMENTS);
+export function withKeys(existing: readonly string[], added: readonly string[]): readonly string[] {
+  if (added.length === 0) return existing;
+  const merged = [...existing];
+  for (const key of added) if (!merged.includes(key)) merged.push(key);
+  return merged.slice(-MAX_ACKNOWLEDGEMENTS);
 }

@@ -254,6 +254,53 @@ export type AgentRunHumanRequired = typeof AgentRunHumanRequired.Type;
 
 /* ------------------------------------------------------------------ runs */
 
+/**
+ * Provider executions against the effective authorization.
+ *
+ * `providerExecutions` counts attempts that reached the spawn boundary (or ran
+ * in-process and produced a result). `attempts` counts every attempt the engine
+ * allocated, including any refused before a process existed — those cost
+ * nothing and must not be shown as agent runs. `effectiveLimit` is the Work
+ * Order's ceiling plus any durable grants, which is why it can exceed the
+ * number the run was originally authorized for.
+ *
+ * The orchestrator defines these semantics; see its
+ * docs/UNATTENDED-RUN-INVARIANTS.md. This projection mirrors them and must not
+ * invent a second rule.
+ */
+export const AgentRunExecutionBudget = Schema.Struct({
+  providerExecutions: NonNegativeInt,
+  attempts: NonNegativeInt,
+  /** Null when the run was authorized without a ceiling. */
+  effectiveLimit: Schema.NullOr(NonNegativeInt),
+});
+export type AgentRunExecutionBudget = typeof AgentRunExecutionBudget.Type;
+
+/**
+ * Why a run wants a human, classified rather than left to prose.
+ *
+ * A product decision and an orchestrator recovery both used to render as
+ * "human input required", which tells an operator nothing about who has to do
+ * what. `run-failed` is separate again: it may need investigation, but it is
+ * not a decision anyone is blocking.
+ */
+export const AgentRunAttentionKind = Schema.Literals([
+  "none",
+  "product-decision",
+  "orchestrator-recovery",
+  "run-failed",
+]);
+export type AgentRunAttentionKind = typeof AgentRunAttentionKind.Type;
+
+export const AgentRunAttention = Schema.Struct({
+  kind: AgentRunAttentionKind,
+  /** True only for states a human is actively blocking. Drives the badge. */
+  actionable: Schema.Boolean,
+  /** One line an operator can act on. Never a raw state name. */
+  summary: Schema.String,
+});
+export type AgentRunAttention = typeof AgentRunAttention.Type;
+
 export const AgentRunSummary = Schema.Struct({
   id: TrimmedNonEmptyString,
   project: Schema.String,
@@ -276,8 +323,27 @@ export const AgentRunSummary = Schema.Struct({
   startedAt: IsoDateTime,
   updatedAt: IsoDateTime,
   finishedAt: Schema.NullOr(IsoDateTime),
+  /**
+   * Attempts allocated, per role. Kept for technical detail — it is NOT the
+   * number an operator should read as "how many times an agent ran".
+   */
   workerExecutionCount: NonNegativeInt,
   reviewerExecutionCount: NonNegativeInt,
+  /** Provider executions against the effective authorization, per role. */
+  executions: Schema.Struct({
+    worker: AgentRunExecutionBudget,
+    reviewer: AgentRunExecutionBudget,
+  }),
+  /** What kind of attention this run needs, if any. */
+  attention: AgentRunAttention,
+  /**
+   * Sequence number of the newest durable orchestrator event.
+   *
+   * Notification identity is built on this, so a client can tell "the same
+   * outcome I already announced" from "the run moved again". Durable and
+   * monotonic; never a client-side timestamp.
+   */
+  lastEventSeq: NonNegativeInt,
   /** Terminal outcome reason, e.g. `ESCALATED`. Null while non-terminal. */
   terminalReason: Schema.NullOr(Schema.String),
   humanRequired: AgentRunHumanRequired,

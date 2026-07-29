@@ -10,7 +10,14 @@ import { cn } from "~/lib/utils";
 import { agentRunsListAtom } from "~/state/agentRuns";
 import { SidebarMenuButton, SidebarMenuItem, useSidebar } from "../ui/sidebar";
 
-const AcknowledgementsSchema = Schema.Struct({ keys: Schema.Array(Schema.String) });
+// Tolerant on purpose: the same store carries announcement bookkeeping this
+// component does not read, and a stricter shape would reject the whole value
+// and silently blank the badge.
+const AcknowledgementsSchema = Schema.Struct({
+  keys: Schema.Array(Schema.String),
+  announced: Schema.optional(Schema.Array(Schema.String)),
+  initialised: Schema.optional(Schema.Boolean),
+});
 
 /**
  * The navigation entry, and the only permanently visible footprint of this
@@ -27,7 +34,11 @@ export const SidebarAgentRunsEntry = memo(function SidebarAgentRunsEntry() {
   const list = useAtomValue(agentRunsListAtom);
   const [acknowledged] = useLocalStorage(
     AGENT_RUN_ACK_STORAGE_KEY,
-    { keys: [] as readonly string[] },
+    {
+      keys: [] as readonly string[],
+      announced: [] as readonly string[],
+      initialised: false,
+    },
     AcknowledgementsSchema,
   );
 

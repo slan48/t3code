@@ -33,6 +33,7 @@ import type {
   AgentRunWorkspace,
 } from "@t3tools/contracts";
 import { AGENT_RUN_STATES, isAgentRunTerminal, needsAgentRunAttention } from "@t3tools/contracts";
+import type { AgentRunAttention, AgentRunExecutionBudget } from "@t3tools/contracts";
 
 import {
   deriveJournalStatus,
@@ -342,6 +343,129 @@ function lastReview(run: OrchestratorRunRecord) {
   return undefined;
 }
 
+/* ------------------------------------------------------ execution budgets */
+
+/**
+ * Provider executions, attempts, and the ceiling actually in force.
+ *
+ * The distinction is not cosmetic. This run really did allocate four reviewer
+ * attempts, and really did run the provider three times: the fourth was refused
+ * before any process existed. Reporting "4 / 2" — allocated attempts over the
+ * *base* limit — was wrong twice over, and told the operator they had overrun
+ * an authorization they had not.
+ *
+ * The rule mirrors the orchestrator's, which is normative:
+ * docs/UNATTENDED-RUN-INVARIANTS.md §8-10 and §14. A spawn claim counts, an
+ * unknown outcome after one counts, an in-process result counts, and an attempt
+ * that failed before doing anything does not.
+ */
+export function projectExecutionBudget(
+  evidence: RunEvidence,
+  role: "worker" | "reviewer",
+): AgentRunExecutionBudget {
+  const { run, attempts } = evidence;
+
+  const mine = attempts.filter((attempt) => attemptRole(attempt.attemptId) === role);
+  const journalled = new Set(mine.map((attempt) => `${attempt.cycle}/${attempt.attemptId}`));
+
+  let providerExecutions = mine.filter((attempt) =>
+    attemptSpentAnExecution(attempt.entries),
+  ).length;
+  let allocated = mine.length;
+
+  // Attempts with no journal on disk fall back to the run snapshot, so a
+  // partially readable run still reports something honest.
+  for (const cycle of run.cycles ?? []) {
+    for (const execution of cycle.executions ?? []) {
+      if (execution.role !== role) continue;
+      const key = `${cycle.number}/${execution.attemptId ?? `n${execution.attempt}`}`;
+      if (journalled.has(key)) continue;
+      allocated += 1;
+      if (execution.status !== "ABANDONED") providerExecutions += 1;
+    }
+  }
+
+  const base =
+    role === "worker" ? run.limits?.maxWorkerExecutions : run.limits?.maxReviewerExecutions;
+  const granted = (run.evidenceRecoveries ?? []).reduce(
+    (total, recovery) => total + Math.trunc(recovery.additionalReviewerExecutions ?? 0),
+    0,
+  );
+
+  return {
+    providerExecutions,
+    attempts: allocated,
+    // Grants only ever widen the reviewer: an evidence recovery must never buy
+    // another worker.
+    effectiveLimit:
+      base === undefined || base === null ? null : base + (role === "reviewer" ? granted : 0),
+  };
+}
+
+/** `reviewer-02` → `reviewer`. */
+function attemptRole(attemptId: string): "worker" | "reviewer" | null {
+  if (attemptId.startsWith("worker")) return "worker";
+  if (attemptId.startsWith("reviewer")) return "reviewer";
+  return null;
+}
+
+/**
+ * Did this attempt actually run a provider?
+ *
+ * Mirrors the orchestrator's `attemptSpentAnExecution`. Kept small and local
+ * rather than duplicated across the UI: everything that needs the number reads
+ * the projection, not the journals.
+ */
+function attemptSpentAnExecution(entries: readonly OrchestratorJournalEntry[]): boolean {
+  if (entries.some((entry) => entry.phase === "SPAWN_CLAIMED")) return true;
+  const outcome = entries.findLast((entry) => entry.phase === "OUTCOME_RECORDED");
+  return outcome?.status === "OK" || outcome?.status === "INVALID_OUTPUT";
+}
+
+/* ----------------------------------------------------------- attention */
+
+/**
+ * Who has to do something, and what kind of something.
+ *
+ * Derived from the state and the structured terminal reason — never from
+ * message prose. A product decision and an internal recovery are different
+ * jobs for different people, and an operator glancing at a phone should not
+ * have to read a paragraph to tell them apart.
+ */
+export function projectAttention(
+  run: OrchestratorRunRecord,
+  state: AgentRunState,
+): AgentRunAttention {
+  if (state === "HUMAN_REQUIRED") {
+    return {
+      kind: "product-decision",
+      actionable: true,
+      summary: "A product or authorization decision is needed before this run can continue.",
+    };
+  }
+  if (state === "RECOVERY_REQUIRED") {
+    return {
+      kind: "orchestrator-recovery",
+      actionable: true,
+      summary: "The orchestrator stopped on an internal lifecycle question and needs a decision.",
+    };
+  }
+  if (state === "FAILED" || state === "TIMED_OUT" || state === "MAX_CYCLES_REACHED") {
+    const reason = run.outcome?.reason ?? null;
+    return {
+      kind: "run-failed",
+      // Worth investigating, but nobody is blocking on a decision — so it does
+      // not sit in the actionable badge forever.
+      actionable: false,
+      summary:
+        reason === null
+          ? "The run stopped without completing."
+          : `The run stopped without completing (${reason}).`,
+    };
+  }
+  return { kind: "none", actionable: false, summary: "" };
+}
+
 /* --------------------------------------------------------------- summary */
 
 export function projectSummary(evidence: RunEvidence, state: AgentRunState): AgentRunSummary {
@@ -365,6 +489,15 @@ export function projectSummary(evidence: RunEvidence, state: AgentRunState): Age
     finishedAt: run.finishedAt ?? null,
     workerExecutionCount: executions.filter((entry) => entry.role === "worker").length,
     reviewerExecutionCount: executions.filter((entry) => entry.role === "reviewer").length,
+    executions: {
+      worker: projectExecutionBudget(evidence, "worker"),
+      reviewer: projectExecutionBudget(evidence, "reviewer"),
+    },
+    attention: projectAttention(run, state),
+    lastEventSeq: evidence.events.reduce(
+      (highest, event) => Math.max(highest, Math.trunc(event.seq ?? 0)),
+      0,
+    ),
     terminalReason: run.outcome?.reason ?? null,
     humanRequired: projectHumanRequired(evidence, state),
     process: projectProcess(evidence, state),

@@ -1,71 +1,104 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
-import {
-  AGENT_RUN_ACK_STORAGE_KEY,
-  pendingAgentRunAlerts,
-  withAcknowledgement,
-} from "~/agentRunAlerts";
+import { AGENT_RUN_ACK_STORAGE_KEY, decideAgentRunAlerts, withKeys } from "~/agentRunAlerts";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { agentRunsListAtom } from "~/state/agentRuns";
 import { toastManager } from "../ui/toast";
 
-export const AcknowledgementsSchema = Schema.Struct({ keys: Schema.Array(Schema.String) });
+/**
+ * Two lists, deliberately.
+ *
+ * `announced` is "a toast was shown for this transition", and it is what stops
+ * a reload from replaying history. `keys` is "the operator dealt with it", and
+ * it is what clears the badge. Conflating them is what made reloading the page
+ * re-announce every terminal run that had never been clicked.
+ *
+ * `initialised` records that this browser has completed one pass over the run
+ * list, so the first pass can absorb finished history silently instead of
+ * announcing all of it at once.
+ */
+export const AcknowledgementsSchema = Schema.Struct({
+  keys: Schema.Array(Schema.String),
+  announced: Schema.optional(Schema.Array(Schema.String)),
+  initialised: Schema.optional(Schema.Boolean),
+});
 
 /**
- * Tells the operator when a run reaches a terminal state.
+ * Tells the operator, once, when a run reaches a state worth knowing about.
  *
- * Deliberately not a transition watcher. T3Code may have been closed, asleep,
- * or on another device when the run finished, and an alert that only fires
- * for transitions it personally witnessed would silently skip exactly the
- * cases this feature exists for. Instead it alerts on *unacknowledged terminal
- * state*, which survives a reload, a reconnect, and a phone that was in a
- * pocket.
- *
- * Acknowledgement is stored locally, per run *and* outcome. Nothing is written
- * back to the orchestrator: whether a human has looked at a browser tab is not
- * part of the engine's history.
+ * Not a transition watcher: T3Code may have been closed, asleep, or on another
+ * device, and an alert that only fires for transitions it personally witnessed
+ * would skip exactly the cases this exists for. But equally not a function of
+ * current state alone, which is what replayed old news on every reload. What is
+ * announced is a *transition it has not announced before*, identified by the
+ * orchestrator's own durable event sequence.
  */
 export function AgentRunAlertCoordinator() {
   const navigate = useNavigate();
   const runs = useAtomValue(agentRunsListAtom).runs;
-  const [acknowledged, setAcknowledged] = useLocalStorage(
+  const [store, setStore] = useLocalStorage(
     AGENT_RUN_ACK_STORAGE_KEY,
-    { keys: [] as readonly string[] },
+    {
+      keys: [] as readonly string[],
+      announced: [] as readonly string[],
+      initialised: false,
+    },
     AcknowledgementsSchema,
   );
 
-  // Guards against re-raising a toast on every poll while the operator has
-  // simply not clicked it yet.
-  const raised = useRef(new Set<string>());
+  const announced = store.announced ?? [];
+  const initialised = store.initialised ?? false;
 
   useEffect(() => {
-    const alerts = pendingAgentRunAlerts(runs, acknowledged.keys);
-    for (const alert of alerts) {
-      if (raised.current.has(alert.key)) continue;
-      raised.current.add(alert.key);
+    // Nothing to baseline against yet; an empty list is not a cold start.
+    if (runs.length === 0) return;
 
+    const { alerts, silence } = decideAgentRunAlerts({
+      runs,
+      announced,
+      firstLoad: !initialised,
+    });
+
+    if (alerts.length === 0 && silence.length === 0 && initialised) return;
+
+    // Record everything decided in this pass *before* raising anything, so a
+    // reload mid-toast cannot produce a second copy.
+    setStore((current) => ({
+      keys: current.keys,
+      announced: withKeys(current.announced ?? [], [
+        ...silence,
+        ...alerts.map((alert) => alert.key),
+      ]),
+      initialised: true,
+    }));
+
+    for (const alert of alerts) {
       toastManager.add({
         type: alert.tone === "success" ? "success" : alert.tone === "failure" ? "error" : "warning",
         title: `${alert.title} ${alert.message}`,
         // No timeout for anything asking for a decision — a toast that
         // disappears on its own is not how you tell someone they are blocking
-        // a run.
-        ...(alert.tone === "success" ? { timeout: 8_000 } : { timeout: 0 }),
+        // a run. Informational outcomes may fade.
+        ...(alert.actionable ? { timeout: 0 } : { timeout: 8_000 }),
         actionProps: {
           children: "View run",
           onClick: () => {
-            setAcknowledged((current) => ({
-              keys: withAcknowledgement(current.keys, alert.key),
+            // Clicking through is the acknowledgement: it clears the badge,
+            // separately from the announcement already recorded above.
+            setStore((current) => ({
+              keys: withKeys(current.keys, [alert.key]),
+              announced: current.announced ?? [],
+              initialised: current.initialised ?? true,
             }));
             void navigate({ to: "/agent-runs/$runId", params: { runId: alert.runId } });
           },
         },
       });
     }
-  }, [runs, acknowledged.keys, navigate, setAcknowledged]);
+  }, [runs, announced, initialised, navigate, setStore]);
 
   return null;
 }

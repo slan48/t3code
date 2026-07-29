@@ -200,6 +200,20 @@ export const OrchestratorRunRecord = Schema.Struct({
       maxReviewerExecutions: Schema.optional(Num),
     }),
   ),
+  /**
+   * Reviewer executions granted after the fact, when the orchestrator itself
+   * failed a review. Read because the effective ceiling is the base plus these:
+   * a run can legitimately be authorized for more than its Work Order said.
+   */
+  evidenceRecoveries: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        at: Schema.optional(Str),
+        authorizedBy: Schema.optional(Str),
+        additionalReviewerExecutions: Schema.optional(Num),
+      }),
+    ),
+  ),
   interruptions: Schema.optional(Num),
   resumes: Schema.optional(Num),
 });
