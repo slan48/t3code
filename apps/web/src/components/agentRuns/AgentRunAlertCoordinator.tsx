@@ -1,9 +1,14 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
-import { AGENT_RUN_ACK_STORAGE_KEY, decideAgentRunAlerts, withKeys } from "~/agentRunAlerts";
+import {
+  AGENT_RUN_ACK_STORAGE_KEY,
+  decideAgentRunAlerts,
+  deliverAgentRunAlerts,
+  withKeys,
+} from "~/agentRunAlerts";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { agentRunsListAtom } from "~/state/agentRuns";
 import { toastManager } from "../ui/toast";
@@ -52,52 +57,62 @@ export function AgentRunAlertCoordinator() {
   const announced = store.announced ?? [];
   const initialised = store.initialised ?? false;
 
+  /**
+   * Keys already handed to the toast system by this mounted page.
+   *
+   * Survives StrictMode's double-invoked effects and every poll tick, so a
+   * repeated pass cannot raise a second copy of a toast whose durable write
+   * has not landed yet.
+   */
+  const deliveredRef = useRef<Set<string>>(new Set());
+
   useEffect(() => {
     // Nothing to baseline against yet; an empty list is not a cold start.
     if (runs.length === 0) return;
 
-    const { alerts, silence } = decideAgentRunAlerts({
-      runs,
-      announced,
-      firstLoad: !initialised,
+    const decision = decideAgentRunAlerts({ runs, announced, firstLoad: !initialised });
+    if (decision.alerts.length === 0 && decision.silence.length === 0 && initialised) return;
+
+    const { announced: toRecord, delivered } = deliverAgentRunAlerts({
+      decision,
+      alreadyDelivered: deliveredRef.current,
+      deliver: (alert) => {
+        toastManager.add({
+          type:
+            alert.tone === "success" ? "success" : alert.tone === "failure" ? "error" : "warning",
+          title: `${alert.title} ${alert.message}`,
+          // No timeout for anything asking for a decision — a toast that
+          // disappears on its own is not how you tell someone they are blocking
+          // a run. Informational outcomes may fade.
+          ...(alert.actionable ? { timeout: 0 } : { timeout: 8_000 }),
+          actionProps: {
+            children: "View run",
+            onClick: () => {
+              // Clicking through is the acknowledgement: it clears the badge,
+              // separately from the announcement recorded on delivery.
+              setStore((current) => ({
+                keys: withKeys(current.keys, [alert.key]),
+                announced: current.announced ?? [],
+                initialised: current.initialised ?? true,
+              }));
+              void navigate({ to: "/agent-runs/$runId", params: { runId: alert.runId } });
+            },
+          },
+        });
+        return true;
+      },
     });
 
-    if (alerts.length === 0 && silence.length === 0 && initialised) return;
+    for (const key of delivered) deliveredRef.current.add(key);
+    if (toRecord.length === 0 && initialised) return;
 
-    // Record everything decided in this pass *before* raising anything, so a
-    // reload mid-toast cannot produce a second copy.
+    // Recorded *after* the toast system has taken them, never before: an alert
+    // that was not delivered stays unannounced and is retried next pass.
     setStore((current) => ({
       keys: current.keys,
-      announced: withKeys(current.announced ?? [], [
-        ...silence,
-        ...alerts.map((alert) => alert.key),
-      ]),
+      announced: withKeys(current.announced ?? [], toRecord),
       initialised: true,
     }));
-
-    for (const alert of alerts) {
-      toastManager.add({
-        type: alert.tone === "success" ? "success" : alert.tone === "failure" ? "error" : "warning",
-        title: `${alert.title} ${alert.message}`,
-        // No timeout for anything asking for a decision — a toast that
-        // disappears on its own is not how you tell someone they are blocking
-        // a run. Informational outcomes may fade.
-        ...(alert.actionable ? { timeout: 0 } : { timeout: 8_000 }),
-        actionProps: {
-          children: "View run",
-          onClick: () => {
-            // Clicking through is the acknowledgement: it clears the badge,
-            // separately from the announcement already recorded above.
-            setStore((current) => ({
-              keys: withKeys(current.keys, [alert.key]),
-              announced: current.announced ?? [],
-              initialised: current.initialised ?? true,
-            }));
-            void navigate({ to: "/agent-runs/$runId", params: { runId: alert.runId } });
-          },
-        },
-      });
-    }
   }, [runs, announced, initialised, navigate, setStore]);
 
   return null;

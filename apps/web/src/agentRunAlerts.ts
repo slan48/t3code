@@ -146,6 +146,68 @@ function alertMessage(run: AgentRunSummary): string {
   }
 }
 
+/* --------------------------------------------------------------- delivery */
+
+/**
+ * Handing a decision to the toast system, and only then calling it announced.
+ *
+ * `decideAgentRunAlerts` says what the operator should be told; it cannot know
+ * whether the telling worked. That distinction matters because the toast
+ * manager underneath is a bare event emitter: `add()` notifies whatever
+ * listeners exist at that instant and returns an id whether or not anybody was
+ * listening, and it never replays. A provider attaches its listener from an
+ * effect, so there are real windows — a StrictMode remount, for one — in which
+ * nobody is. Treating the returned id as delivery would mark an escalation
+ * told, durably, when it was in fact dropped, and it would never be raised
+ * again.
+ *
+ * So delivery reports back. An alert is recorded only when the channel
+ * accepted it; one that was not accepted stays unannounced and is retried on
+ * the next pass. Silenced history needs no delivery and is recorded straight
+ * away.
+ *
+ * `alreadyDelivered` keeps this idempotent within a mounted session — under
+ * StrictMode's double-invoked effects, re-renders and the three-second poll —
+ * so a repeated pass cannot raise a second copy of a toast whose durable write
+ * has not landed yet. Across a reload, `announced` does that job. The gap
+ * between the two is a crash in the microseconds between raising and
+ * persisting, which costs at most one duplicate; the alternative ordering
+ * costs a permanently missed HUMAN_REQUIRED, which is far worse.
+ */
+export interface AlertDeliveryInput {
+  readonly decision: AlertDecision;
+  /** Keys this mounted session has already handed to the toast system. */
+  readonly alreadyDelivered: ReadonlySet<string>;
+  /**
+   * Hand one alert to the toast system.
+   *
+   * Must return false when the notification could not be accepted, so the
+   * alert is retried rather than silently recorded as told.
+   */
+  readonly deliver: (alert: AgentRunAlert) => boolean;
+}
+
+export interface AlertDeliveryResult {
+  /** Keys safe to persist as announced. */
+  readonly announced: readonly string[];
+  /** Keys handed to the toast system in this pass. */
+  readonly delivered: readonly string[];
+}
+
+export function deliverAgentRunAlerts(input: AlertDeliveryInput): AlertDeliveryResult {
+  const announced: string[] = [...input.decision.silence];
+  const delivered: string[] = [];
+
+  for (const alert of input.decision.alerts) {
+    if (input.alreadyDelivered.has(alert.key)) continue;
+    if (!input.deliver(alert)) continue;
+    delivered.push(alert.key);
+    announced.push(alert.key);
+  }
+
+  return { announced, delivered };
+}
+
 /**
  * The sidebar badge: what is actionable *now*.
  *

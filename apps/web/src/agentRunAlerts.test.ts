@@ -8,6 +8,7 @@ import {
   MAX_ACKNOWLEDGEMENTS,
   MAX_CONCURRENT_ALERTS,
   withKeys,
+  deliverAgentRunAlerts,
 } from "./agentRunAlerts";
 
 /**
@@ -251,5 +252,102 @@ describe("bounds and storage hygiene", () => {
     const once = withKeys([], ["a", "b"]);
     expect(withKeys(once, ["a", "b"])).toEqual(once);
     expect(withKeys(once, [])).toBe(once);
+  });
+});
+
+describe("an alert is announced only once the toast system has taken it", () => {
+  /**
+   * The hazard this guards: the toast manager underneath is an emitter with no
+   * queue. `add()` returns an id whether or not a provider is listening, and a
+   * provider subscribes from an effect — so there are windows where nobody is.
+   * Recording an alert as announced on the strength of that id would durably
+   * mark an escalation told when it was dropped, and it would never be raised
+   * again.
+   */
+  const coldStart = () =>
+    decideAgentRunAlerts({
+      runs: [completed("done"), humanRequired("blocked"), recoveryRequired("stuck")],
+      announced: [],
+      firstLoad: true,
+    });
+
+  it("records the alerts the channel accepted", () => {
+    const seen: string[] = [];
+    const result = deliverAgentRunAlerts({
+      decision: coldStart(),
+      alreadyDelivered: new Set(),
+      deliver: (alert) => {
+        seen.push(alert.runId);
+        return true;
+      },
+    });
+
+    expect(seen).toEqual(["blocked", "stuck"]);
+    expect(result.delivered).toHaveLength(2);
+    expect(result.announced).toHaveLength(3);
+  });
+
+  it("refuses to record an alert the channel dropped", () => {
+    const decision = coldStart();
+    const result = deliverAgentRunAlerts({
+      decision,
+      alreadyDelivered: new Set(),
+      deliver: () => false,
+    });
+
+    expect(result.delivered).toEqual([]);
+    // Only the silenced completion. Neither open ask may be marked told.
+    expect(result.announced).toEqual(decision.silence);
+  });
+
+  it("retries a dropped alert on the next pass instead of losing it", () => {
+    const dropped = deliverAgentRunAlerts({
+      decision: coldStart(),
+      alreadyDelivered: new Set(),
+      deliver: () => false,
+    });
+
+    const second = decideAgentRunAlerts({
+      runs: [completed("done"), humanRequired("blocked"), recoveryRequired("stuck")],
+      announced: withKeys([], dropped.announced),
+      firstLoad: false,
+    });
+    expect(second.alerts.map((a) => a.runId)).toEqual(["blocked", "stuck"]);
+
+    const retried = deliverAgentRunAlerts({
+      decision: second,
+      alreadyDelivered: new Set(),
+      deliver: () => true,
+    });
+    expect(retried.delivered).toHaveLength(2);
+  });
+
+  it("delivers once when the effect runs twice, as StrictMode makes it", () => {
+    const decision = coldStart();
+    const delivered = new Set<string>();
+    let calls = 0;
+    const deliver = () => {
+      calls += 1;
+      return true;
+    };
+
+    const first = deliverAgentRunAlerts({ decision, alreadyDelivered: delivered, deliver });
+    for (const key of first.delivered) delivered.add(key);
+    const second = deliverAgentRunAlerts({ decision, alreadyDelivered: delivered, deliver });
+
+    expect(calls).toBe(2);
+    expect(second.delivered).toEqual([]);
+  });
+
+  it("leaves the badge alone: announcing is not acknowledging", () => {
+    const runs = [humanRequired("blocked"), recoveryRequired("stuck")];
+    deliverAgentRunAlerts({
+      decision: decideAgentRunAlerts({ runs, announced: [], firstLoad: true }),
+      alreadyDelivered: new Set(),
+      deliver: () => true,
+    });
+
+    expect(agentRunBadgeCount(runs, [])).toBe(2);
+    expect(agentRunBadgeCount(runs, [alertKey(humanRequired("blocked"))])).toBe(1);
   });
 });
