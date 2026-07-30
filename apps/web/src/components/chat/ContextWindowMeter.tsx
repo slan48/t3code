@@ -1,6 +1,8 @@
 import { cn } from "~/lib/utils";
+import type { AccountUsageSnapshot } from "~/lib/accountUsage";
 import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+import { AccountUsageSection } from "./AccountUsageSection";
 
 function formatPercentage(value: number | null): string | null {
   if (value === null || !Number.isFinite(value)) {
@@ -15,8 +17,9 @@ function formatPercentage(value: number | null): string | null {
 export function ContextWindowMeter(props: {
   usage: ContextWindowSnapshot;
   providerDisplayName?: string | null;
+  accountUsage?: AccountUsageSnapshot | null;
 }) {
-  const { usage, providerDisplayName } = props;
+  const { usage, providerDisplayName, accountUsage } = props;
   const usedPercentage = formatPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const radius = 9.75;
@@ -84,7 +87,10 @@ export function ContextWindowMeter(props: {
         tooltipStyle
         side="top"
         align="end"
-        className="dropdown-glass w-64 max-w-none border-0! bg-secondary! p-0 shadow-none! before:hidden"
+        className={cn(
+          "dropdown-glass max-w-none border-0! bg-secondary! p-0 shadow-none! before:hidden",
+          accountUsage ? "w-72" : "w-64",
+        )}
       >
         <div className="flex flex-col gap-2 p-3">
           <div className="flex items-center justify-between gap-3">
@@ -132,6 +138,7 @@ export function ContextWindowMeter(props: {
               {providerDisplayName ?? "It"} automatically compacts its context when needed.
             </div>
           ) : null}
+          {accountUsage ? <AccountUsageSection usage={accountUsage} /> : null}
         </div>
       </PopoverPopup>
     </Popover>

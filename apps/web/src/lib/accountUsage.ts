@@ -22,7 +22,7 @@ export interface AccountUsageSnapshot {
     readonly limit: string;
     readonly used: string;
     readonly remainingPercentage: number;
-    readonly resetsAt: number;
+    readonly resetsAt: number | null;
   } | null;
   readonly reachedType: string | null;
   readonly updatedAt: string;
@@ -138,13 +138,12 @@ export function deriveLatestAccountUsageSnapshot(
       const limit = asString(value?.limit);
       const used = asString(value?.used);
       const remainingPercentage = asFiniteNumber(value?.remainingPercentage);
-      const resetsAt = asFiniteNumber(value?.resetsAt);
-      if (limit && used && remainingPercentage !== null && resetsAt !== null) {
+      if (limit && used && remainingPercentage !== null) {
         spendLimit = {
           limit,
           used,
           remainingPercentage: clampPercentage(remainingPercentage),
-          resetsAt,
+          resetsAt: asFiniteNumber(value?.resetsAt),
         };
       }
     }

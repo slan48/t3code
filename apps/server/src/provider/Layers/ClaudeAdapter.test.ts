@@ -8,6 +8,7 @@ import type {
   Options as ClaudeQueryOptions,
   PermissionMode,
   PermissionResult,
+  SDKControlGetUsageResponse,
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -109,6 +110,18 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
     this.setMaxThinkingTokensCalls.push(maxThinkingTokens);
   };
+
+  public usageResponse: SDKControlGetUsageResponse | undefined;
+  public usageReadCalls = 0;
+
+  readonly usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+    async (): Promise<SDKControlGetUsageResponse> => {
+      this.usageReadCalls += 1;
+      if (!this.usageResponse) {
+        throw new Error("usage unavailable");
+      }
+      return this.usageResponse;
+    };
 
   readonly close = (): void => {
     this.closeCalls += 1;
@@ -1934,8 +1947,19 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("normalizes Claude subscription rate limit events", () => {
+  it.effect("reports Claude account usage from the structured usage snapshot", () => {
     const harness = makeHarness();
+    harness.query.usageResponse = {
+      subscription_type: "max",
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 72, resets_at: "2026-04-01T12:00:00.000Z" },
+        seven_day: { utilization: 31.5, resets_at: null },
+        seven_day_opus: { utilization: null, resets_at: null },
+        seven_day_oauth_apps: { utilization: 90, resets_at: null },
+      },
+    } as unknown as SDKControlGetUsageResponse;
+
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
       const usageEventFiber = yield* adapter.streamEvents.pipe(
@@ -1949,18 +1973,6 @@ describe("ClaudeAdapterLive", () => {
         provider: ProviderDriverKind.make("claudeAgent"),
         runtimeMode: "full-access",
       });
-
-      harness.query.emit({
-        type: "rate_limit_event",
-        rate_limit_info: {
-          status: "allowed_warning",
-          rateLimitType: "five_hour",
-          utilization: 0.72,
-          resetsAt: 1_775_000_000,
-        },
-        session_id: "sdk-session-rate-limit",
-        uuid: "rate-limit-1",
-      } as unknown as SDKMessage);
 
       const usageEvent = yield* Fiber.join(usageEventFiber);
       assert.equal(usageEvent._tag, "Some");
@@ -1976,11 +1988,76 @@ describe("ClaudeAdapterLive", () => {
           {
             id: "five_hour",
             usedPercentage: 72,
-            resetsAt: 1_775_000_000,
+            resetsAt: 1_775_044_800,
             windowDurationMinutes: 300,
           },
+          {
+            id: "seven_day",
+            usedPercentage: 31.5,
+            windowDurationMinutes: 10_080,
+          },
         ],
+        planType: "max",
       });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("re-reads Claude account usage instead of trusting sparse rate limit events", () => {
+    const harness = makeHarness();
+    harness.query.usageResponse = {
+      subscription_type: null,
+      rate_limits_available: true,
+      rate_limits: {
+        five_hour: { utilization: 10, resets_at: null },
+      },
+    } as unknown as SDKControlGetUsageResponse;
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const usageEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "account.rate-limits.updated"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      // The sparse ping carries no usable utilization; the refreshed snapshot
+      // is what must reach the UI.
+      harness.query.usageResponse = {
+        subscription_type: null,
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: { utilization: 88, resets_at: null },
+        },
+      } as unknown as SDKControlGetUsageResponse;
+      harness.query.emit({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          resetsAt: 1_775_000_000,
+        },
+        session_id: "sdk-session-rate-limit",
+        uuid: "rate-limit-1",
+      } as unknown as SDKMessage);
+
+      const usageEvents = Array.from(yield* Fiber.join(usageEventsFiber));
+      const snapshots = usageEvents.map((event) =>
+        event.type === "account.rate-limits.updated" ? event.payload.rateLimits : undefined,
+      );
+      assert.deepEqual(snapshots, [
+        { windows: [{ id: "five_hour", usedPercentage: 10, windowDurationMinutes: 300 }] },
+        { windows: [{ id: "five_hour", usedPercentage: 88, windowDurationMinutes: 300 }] },
+      ]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

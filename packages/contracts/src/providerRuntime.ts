@@ -553,7 +553,7 @@ export const ProviderAccountUsageSpendLimit = Schema.Struct({
   limit: Schema.String,
   used: Schema.String,
   remainingPercentage: Schema.Number,
-  resetsAt: NonNegativeInt,
+  resetsAt: Schema.optional(NonNegativeInt),
 });
 export type ProviderAccountUsageSpendLimit = typeof ProviderAccountUsageSpendLimit.Type;
 

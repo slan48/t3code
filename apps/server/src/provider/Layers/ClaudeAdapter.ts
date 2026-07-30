@@ -15,6 +15,7 @@ import {
   type PermissionUpdate,
   type SDKMessage,
   type SDKControlGetContextUsageResponse,
+  type SDKControlGetUsageResponse,
   type SDKResultMessage,
   type SettingSource,
   type SDKUserMessage,
@@ -31,6 +32,8 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ModelSelection,
+  type ProviderAccountUsageSnapshot,
+  type ProviderAccountUsageWindow,
   ProviderItemId,
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
@@ -201,6 +204,7 @@ interface ClaudeSessionContext {
   lastKnownTotalProcessedTokens: number | undefined;
   lastAssistantUuid: string | undefined;
   lastThreadStartedId: string | undefined;
+  lastAccountUsageFingerprint: string | undefined;
   stopped: boolean;
 }
 
@@ -210,6 +214,12 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
   readonly getContextUsage?: () => Promise<SDKControlGetContextUsageResponse>;
+  /**
+   * Structured `/usage` payload: the only Claude source that reports real plan
+   * rate-limit utilization. `rate_limit_event` messages are sparse status pings
+   * and carry no trustworthy percentage, so account usage is read from here.
+   */
+  readonly usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: () => Promise<SDKControlGetUsageResponse>;
   readonly close: () => void;
 }
 
@@ -480,6 +490,121 @@ function normalizeClaudeContextUsageApiSnapshot(
     ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
     compactsAutomatically: value.isAutoCompactEnabled,
   });
+}
+
+/**
+ * Plan rate-limit windows surfaced by `/usage`, in the order the Claude usage
+ * dialog lists them. `seven_day_oauth_apps` is deliberately excluded: it tracks
+ * third-party OAuth app usage, not this session's plan consumption.
+ */
+const CLAUDE_ACCOUNT_USAGE_WINDOWS = [
+  { id: "five_hour", windowDurationMinutes: 300 },
+  { id: "seven_day", windowDurationMinutes: 10_080 },
+  { id: "seven_day_opus", windowDurationMinutes: 10_080 },
+  { id: "seven_day_sonnet", windowDurationMinutes: 10_080 },
+] as const satisfies ReadonlyArray<{
+  readonly id: keyof NonNullable<SDKControlGetUsageResponse["rate_limits"]>;
+  readonly windowDurationMinutes: number;
+}>;
+
+function claudeResetsAtUnixSeconds(value: string | null | undefined): number | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return undefined;
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
+  }
+  return Math.floor(parsed / 1000);
+}
+
+function formatClaudeExtraUsageAmount(value: number, currency: string | null | undefined): string {
+  const code = currency?.trim().toUpperCase();
+  if (code === undefined || code.length === 0 || code === "USD") {
+    return `$${value.toFixed(2)}`;
+  }
+  return `${value.toFixed(2)} ${code}`;
+}
+
+/**
+ * Maps the structured `/usage` response onto the canonical account usage
+ * snapshot. Windows without a reported utilization are dropped rather than
+ * defaulted, so the UI never renders an invented percentage.
+ */
+function normalizeClaudeAccountUsage(
+  response: SDKControlGetUsageResponse,
+): ProviderAccountUsageSnapshot | undefined {
+  const rateLimits = response.rate_limits;
+  const windows: Array<ProviderAccountUsageWindow> = [];
+
+  if (response.rate_limits_available && rateLimits) {
+    for (const descriptor of CLAUDE_ACCOUNT_USAGE_WINDOWS) {
+      const window = rateLimits[descriptor.id];
+      const utilization = window?.utilization;
+      if (typeof utilization !== "number" || !Number.isFinite(utilization)) {
+        continue;
+      }
+      const resetsAt = claudeResetsAtUnixSeconds(window?.resets_at);
+      windows.push({
+        id: descriptor.id,
+        usedPercentage: Math.max(0, Math.min(100, utilization)),
+        ...(resetsAt !== undefined ? { resetsAt } : {}),
+        windowDurationMinutes: descriptor.windowDurationMinutes,
+      });
+    }
+  }
+
+  const extraUsage = rateLimits?.extra_usage;
+  const spendLimit =
+    extraUsage?.is_enabled === true &&
+    typeof extraUsage.monthly_limit === "number" &&
+    Number.isFinite(extraUsage.monthly_limit) &&
+    typeof extraUsage.used_credits === "number" &&
+    Number.isFinite(extraUsage.used_credits)
+      ? {
+          limit: formatClaudeExtraUsageAmount(extraUsage.monthly_limit, extraUsage.currency),
+          used: formatClaudeExtraUsageAmount(extraUsage.used_credits, extraUsage.currency),
+          remainingPercentage: Math.max(
+            0,
+            Math.min(
+              100,
+              typeof extraUsage.utilization === "number" && Number.isFinite(extraUsage.utilization)
+                ? 100 - extraUsage.utilization
+                : extraUsage.monthly_limit > 0
+                  ? 100 - (extraUsage.used_credits / extraUsage.monthly_limit) * 100
+                  : 0,
+            ),
+          ),
+        }
+      : undefined;
+
+  if (windows.length === 0 && spendLimit === undefined) {
+    return undefined;
+  }
+
+  const planType = response.subscription_type?.trim();
+  return {
+    windows,
+    ...(planType ? { planType } : {}),
+    ...(spendLimit ? { spendLimit } : {}),
+  };
+}
+
+/**
+ * Stable identity for an account usage snapshot, used to suppress duplicate
+ * emissions when `/usage` is re-read but nothing moved.
+ */
+function claudeAccountUsageFingerprint(snapshot: ProviderAccountUsageSnapshot): string {
+  const windows = snapshot.windows
+    .map(
+      (window) =>
+        `${window.id}:${window.usedPercentage}:${window.resetsAt ?? ""}:${window.windowDurationMinutes ?? ""}`,
+    )
+    .join("|");
+  const spendLimit = snapshot.spendLimit
+    ? `${snapshot.spendLimit.used}/${snapshot.spendLimit.limit}:${snapshot.spendLimit.remainingPercentage}`
+    : "";
+  return `${snapshot.planType ?? ""}~${windows}~${spendLimit}`;
 }
 
 function compactBoundaryTokenUsageSnapshot(
@@ -1793,6 +1918,57 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     return normalizeClaudeContextUsageApiSnapshot(usage, totalProcessedTokens);
   });
 
+  /**
+   * Reads real plan rate-limit utilization from the structured `/usage` control
+   * request and emits it when it differs from the last emitted snapshot. Older
+   * CLIs (and API key / Bedrock / Vertex sessions) simply report nothing.
+   */
+  const refreshAccountUsage = Effect.fn("refreshAccountUsage")(function* (
+    context: ClaudeSessionContext,
+  ) {
+    const readUsage = context.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+    if (context.stopped || !readUsage) {
+      return;
+    }
+
+    const response = yield* Effect.promise(async () => {
+      try {
+        return await readUsage.call(context.query);
+      } catch {
+        return undefined;
+      }
+    });
+    if (!response) {
+      return;
+    }
+
+    const snapshot = normalizeClaudeAccountUsage(response);
+    if (!snapshot) {
+      return;
+    }
+
+    const fingerprint = claudeAccountUsageFingerprint(snapshot);
+    if (fingerprint === context.lastAccountUsageFingerprint) {
+      return;
+    }
+    context.lastAccountUsageFingerprint = fingerprint;
+
+    const turnState = context.turnState;
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "account.rate-limits.updated",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      ...(turnState ? { turnId: turnState.turnId } : {}),
+      payload: {
+        rateLimits: snapshot,
+      },
+      providerRefs: nativeProviderRefs(context),
+    });
+  });
+
   const emitProposedPlanCompleted = Effect.fn("emitProposedPlanCompleted")(function* (
     context: ClaudeSessionContext,
     input: {
@@ -1897,6 +2073,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       context,
       accumulatedTotalProcessedTokens ?? context.lastKnownTotalProcessedTokens,
     );
+    yield* refreshAccountUsage(context);
     const resultUsageRecord =
       result?.usage && typeof result.usage === "object" && !Array.isArray(result.usage)
         ? (result.usage as Record<string, unknown>)
@@ -2904,39 +3081,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     if (message.type === "rate_limit_event") {
-      const info = message.rate_limit_info;
-      const usedPercentage =
-        info.utilization === undefined
-          ? info.status === "rejected"
-            ? 100
-            : 0
-          : Math.max(
-              0,
-              Math.min(100, info.utilization <= 1 ? info.utilization * 100 : info.utilization),
-            );
-      yield* offerRuntimeEvent({
-        ...base,
-        type: "account.rate-limits.updated",
-        payload: {
-          rateLimits: {
-            windows: [
-              {
-                id: info.rateLimitType ?? "subscription",
-                usedPercentage,
-                ...(info.resetsAt !== undefined ? { resetsAt: info.resetsAt } : {}),
-                ...(info.rateLimitType === "five_hour"
-                  ? { windowDurationMinutes: 300 }
-                  : info.rateLimitType === "seven_day" ||
-                      info.rateLimitType === "seven_day_opus" ||
-                      info.rateLimitType === "seven_day_sonnet"
-                    ? { windowDurationMinutes: 10_080 }
-                    : {}),
-              },
-            ],
-            ...(info.status === "rejected" ? { reachedType: "rate_limit_reached" } : {}),
-          },
-        },
-      });
+      // `rate_limit_info` is a sparse status ping: `utilization` is frequently
+      // absent and its scale is unspecified, so it is only used as a signal to
+      // re-read the authoritative `/usage` snapshot.
+      yield* refreshAccountUsage(context);
       return;
     }
   });
@@ -3664,6 +3812,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastKnownTotalProcessedTokens: undefined,
         lastAssistantUuid: resumeState?.resumeSessionAt,
         lastThreadStartedId: undefined,
+        lastAccountUsageFingerprint: undefined,
         stopped: false,
       };
       yield* Ref.set(contextRef, context);
@@ -3736,6 +3885,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           context.streamFiber = undefined;
         }
       });
+
+      // Seed account usage without blocking session start: the `/usage` read
+      // round-trips to claude.ai and only resolves once the stream is pumping.
+      runFork(
+        refreshAccountUsage(context).pipe(
+          Effect.catch((cause) =>
+            Effect.logDebug("Unable to read initial Claude account usage.", { cause, threadId }),
+          ),
+        ),
+      );
 
       return {
         ...session,
