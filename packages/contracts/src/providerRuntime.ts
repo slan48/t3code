@@ -534,8 +534,42 @@ const AccountUpdatedPayload = Schema.Struct({
 });
 export type AccountUpdatedPayload = typeof AccountUpdatedPayload.Type;
 
+export const ProviderAccountUsageWindow = Schema.Struct({
+  id: TrimmedNonEmptyStringSchema,
+  usedPercentage: Schema.Number,
+  resetsAt: Schema.optional(NonNegativeInt),
+  windowDurationMinutes: Schema.optional(NonNegativeInt),
+});
+export type ProviderAccountUsageWindow = typeof ProviderAccountUsageWindow.Type;
+
+export const ProviderAccountUsageCredits = Schema.Struct({
+  balance: Schema.optional(Schema.String),
+  hasCredits: Schema.Boolean,
+  unlimited: Schema.Boolean,
+});
+export type ProviderAccountUsageCredits = typeof ProviderAccountUsageCredits.Type;
+
+export const ProviderAccountUsageSpendLimit = Schema.Struct({
+  limit: Schema.String,
+  used: Schema.String,
+  remainingPercentage: Schema.Number,
+  resetsAt: NonNegativeInt,
+});
+export type ProviderAccountUsageSpendLimit = typeof ProviderAccountUsageSpendLimit.Type;
+
+export const ProviderAccountUsageSnapshot = Schema.Struct({
+  windows: Schema.Array(ProviderAccountUsageWindow),
+  planType: Schema.optional(TrimmedNonEmptyStringSchema),
+  limitId: Schema.optional(TrimmedNonEmptyStringSchema),
+  limitName: Schema.optional(TrimmedNonEmptyStringSchema),
+  credits: Schema.optional(ProviderAccountUsageCredits),
+  spendLimit: Schema.optional(ProviderAccountUsageSpendLimit),
+  reachedType: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type ProviderAccountUsageSnapshot = typeof ProviderAccountUsageSnapshot.Type;
+
 const AccountRateLimitsUpdatedPayload = Schema.Struct({
-  rateLimits: Schema.Unknown,
+  rateLimits: ProviderAccountUsageSnapshot,
 });
 export type AccountRateLimitsUpdatedPayload = typeof AccountRateLimitsUpdatedPayload.Type;
 

@@ -1150,6 +1150,74 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       });
     }),
   );
+
+  it.effect("normalizes Codex account rate limits for clients", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+
+      yield* runtime.emit({
+        id: asEventId("evt-codex-account-rate-limits-updated"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "account/rateLimits/updated",
+        payload: {
+          rateLimits: {
+            planType: "plus",
+            primary: {
+              usedPercent: 38,
+              windowDurationMins: 300,
+              resetsAt: 1_767_225_600,
+            },
+            secondary: {
+              usedPercent: 12,
+              windowDurationMins: 10_080,
+              resetsAt: 1_767_830_400,
+            },
+            credits: {
+              balance: "12.50",
+              hasCredits: true,
+              unlimited: false,
+            },
+          },
+        },
+      } satisfies ProviderEvent);
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") {
+        return;
+      }
+      NodeAssert.equal(firstEvent.value.type, "account.rate-limits.updated");
+      if (firstEvent.value.type !== "account.rate-limits.updated") {
+        return;
+      }
+      NodeAssert.deepEqual(firstEvent.value.payload.rateLimits, {
+        windows: [
+          {
+            id: "primary",
+            usedPercentage: 38,
+            resetsAt: 1_767_225_600,
+            windowDurationMinutes: 300,
+          },
+          {
+            id: "secondary",
+            usedPercentage: 12,
+            resetsAt: 1_767_830_400,
+            windowDurationMinutes: 10_080,
+          },
+        ],
+        planType: "plus",
+        credits: {
+          balance: "12.50",
+          hasCredits: true,
+          unlimited: false,
+        },
+      });
+    }),
+  );
 });
 
 const scopedLifecycleRuntimeFactory = makeScopedRuntimeFactory();

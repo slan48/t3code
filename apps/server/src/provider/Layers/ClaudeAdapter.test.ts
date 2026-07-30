@@ -1934,6 +1934,59 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("normalizes Claude subscription rate limit events", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const usageEventFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "account.rate-limits.updated"),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.72,
+          resetsAt: 1_775_000_000,
+        },
+        session_id: "sdk-session-rate-limit",
+        uuid: "rate-limit-1",
+      } as unknown as SDKMessage);
+
+      const usageEvent = yield* Fiber.join(usageEventFiber);
+      assert.equal(usageEvent._tag, "Some");
+      if (usageEvent._tag !== "Some") {
+        return;
+      }
+      assert.equal(usageEvent.value.type, "account.rate-limits.updated");
+      if (usageEvent.value.type !== "account.rate-limits.updated") {
+        return;
+      }
+      assert.deepEqual(usageEvent.value.payload.rateLimits, {
+        windows: [
+          {
+            id: "five_hour",
+            usedPercentage: 72,
+            resetsAt: 1_775_000_000,
+            windowDurationMinutes: 300,
+          },
+        ],
+      });
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("emits Claude context window on result completion usage snapshots", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

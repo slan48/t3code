@@ -814,6 +814,19 @@ export const makeCodexSessionRuntime = (
         method,
         message,
       });
+    const refreshAccountRateLimits = Effect.fn("CodexSessionRuntime.refreshAccountRateLimits")(
+      function* () {
+        const response = yield* client.request("account/rateLimits/read", undefined);
+        yield* emitEvent({
+          kind: "notification",
+          threadId: options.threadId,
+          method: "account/rateLimits/updated",
+          payload: {
+            rateLimits: response.rateLimits,
+          },
+        });
+      },
+    );
 
     const settlePendingApprovals = (decision: ProviderApprovalDecision) =>
       Ref.get(pendingApprovalsRef).pipe(
@@ -1216,6 +1229,14 @@ export const makeCodexSessionRuntime = (
       yield* emitSessionEvent("session/connecting", "Starting Codex App Server session.");
       yield* client.request("initialize", buildCodexInitializeParams());
       yield* client.notify("initialized", undefined);
+      yield* refreshAccountRateLimits().pipe(
+        Effect.catch((cause) =>
+          Effect.logDebug("Unable to read initial Codex account rate limits.", {
+            cause,
+            threadId: options.threadId,
+          }),
+        ),
+      );
 
       const requestedModel = normalizeCodexModelSlug(options.model);
 

@@ -13,6 +13,7 @@ import {
   type CodexSettings,
   ProviderDriverKind,
   type ProviderEvent,
+  type ProviderAccountUsageSnapshot,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
@@ -187,6 +188,79 @@ function normalizeCodexTokenUsage(
       ? { lastReasoningOutputTokens: reasoningOutputTokens }
       : {}),
     compactsAutomatically: true,
+  };
+}
+
+function clampPercentage(value: number): number {
+  return Math.max(0, Math.min(100, value));
+}
+
+function normalizeCodexAccountUsage(
+  payload:
+    | EffectCodexSchema.V2AccountRateLimitsUpdatedNotification
+    | EffectCodexSchema.V2GetAccountRateLimitsResponse,
+): ProviderAccountUsageSnapshot {
+  const snapshot = payload.rateLimits;
+  const windows: Array<ProviderAccountUsageSnapshot["windows"][number]> = [];
+
+  if (snapshot.primary) {
+    windows.push({
+      id: "primary",
+      usedPercentage: clampPercentage(snapshot.primary.usedPercent),
+      ...(snapshot.primary.resetsAt !== undefined && snapshot.primary.resetsAt !== null
+        ? { resetsAt: snapshot.primary.resetsAt }
+        : {}),
+      ...(snapshot.primary.windowDurationMins !== undefined &&
+      snapshot.primary.windowDurationMins !== null
+        ? { windowDurationMinutes: snapshot.primary.windowDurationMins }
+        : {}),
+    });
+  }
+  if (snapshot.secondary) {
+    windows.push({
+      id: "secondary",
+      usedPercentage: clampPercentage(snapshot.secondary.usedPercent),
+      ...(snapshot.secondary.resetsAt !== undefined && snapshot.secondary.resetsAt !== null
+        ? { resetsAt: snapshot.secondary.resetsAt }
+        : {}),
+      ...(snapshot.secondary.windowDurationMins !== undefined &&
+      snapshot.secondary.windowDurationMins !== null
+        ? { windowDurationMinutes: snapshot.secondary.windowDurationMins }
+        : {}),
+    });
+  }
+
+  return {
+    windows,
+    ...(snapshot.planType ? { planType: snapshot.planType } : {}),
+    ...(snapshot.limitId ? { limitId: snapshot.limitId } : {}),
+    ...(snapshot.limitName ? { limitName: snapshot.limitName } : {}),
+    ...(snapshot.credits
+      ? {
+          credits: {
+            ...(snapshot.credits.balance !== undefined && snapshot.credits.balance !== null
+              ? { balance: snapshot.credits.balance }
+              : {}),
+            hasCredits: snapshot.credits.hasCredits,
+            unlimited: snapshot.credits.unlimited,
+          },
+        }
+      : {}),
+    ...(snapshot.individualLimit
+      ? {
+          spendLimit: {
+            limit: snapshot.individualLimit.limit,
+            used: snapshot.individualLimit.used,
+            remainingPercentage: clampPercentage(snapshot.individualLimit.remainingPercent),
+            resetsAt: snapshot.individualLimit.resetsAt,
+          },
+        }
+      : {}),
+    ...(snapshot.rateLimitReachedType
+      ? { reachedType: snapshot.rateLimitReachedType }
+      : snapshot.spendControlReached === true
+        ? { reachedType: "spend_control_reached" }
+        : {}),
   };
 }
 
@@ -1125,7 +1199,11 @@ function mapToRuntimeEvents(
   }
 
   if (event.method === "account/rateLimits/updated") {
-    if (!readPayload(EffectCodexSchema.V2AccountRateLimitsUpdatedNotification, event.payload)) {
+    const payload = readPayload(
+      EffectCodexSchema.V2AccountRateLimitsUpdatedNotification,
+      event.payload,
+    );
+    if (!payload) {
       return [];
     }
     return [
@@ -1133,7 +1211,7 @@ function mapToRuntimeEvents(
         type: "account.rate-limits.updated",
         ...runtimeEventBase(event, canonicalThreadId),
         payload: {
-          rateLimits: event.payload ?? {},
+          rateLimits: normalizeCodexAccountUsage(payload),
         },
       },
     ];
