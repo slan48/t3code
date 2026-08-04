@@ -38,6 +38,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
   type ProviderSendTurnInput,
+  type ProviderPendingBackgroundWork,
   type ProviderSession,
   type ThreadTokenUsageSnapshot,
   type ProviderUserInputAnswers,
@@ -181,6 +182,92 @@ interface ClaudeTaskState {
   readonly blockedBy: Set<string>;
 }
 
+/**
+ * One in-flight entry of the CLI's background task registry: monitors,
+ * backgrounded shells, subagents, workflows. Distinct from `ClaudeTaskState`,
+ * which mirrors the model-authored TaskCreate/TaskList plan.
+ */
+interface ClaudeBackgroundTaskState {
+  readonly id: string;
+  /** Provider-native task kind (`monitor`, `local_bash`, `local_agent`, …). */
+  readonly kind: string;
+}
+
+const CLAUDE_BACKGROUND_TASK_FALLBACK_KIND = "task";
+
+/**
+ * Task statuses that mean the registry entry is gone. `paused` is deliberately
+ * absent: a paused task still expects to be resumed inside this session.
+ */
+const CLAUDE_TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "killed", "stopped"]);
+
+function isTerminalClaudeTaskStatus(status: string | undefined): boolean {
+  return status !== undefined && CLAUDE_TERMINAL_TASK_STATUSES.has(status);
+}
+
+/**
+ * Snapshot the background registry for `ProviderSession.pendingBackgroundWork`.
+ * Returns undefined when nothing is in flight so the field stays absent rather
+ * than serializing an empty shell.
+ */
+function pendingBackgroundWorkSnapshot(
+  tasks: Map<string, ClaudeBackgroundTaskState>,
+): ProviderPendingBackgroundWork | undefined {
+  if (tasks.size === 0) {
+    return undefined;
+  }
+  const kinds = Array.from(new Set(Array.from(tasks.values(), (task) => task.kind))).sort();
+  return { count: tasks.size, kinds };
+}
+
+/**
+ * Reconcile from a `background_tasks_changed` roster snapshot. The subtype is
+ * absent from the SDK's typed union, so every field is parsed defensively and
+ * an unparseable payload leaves the incrementally-tracked map untouched rather
+ * than blowing the roster away.
+ */
+function reconcileClaudeBackgroundTasks(
+  tasks: Map<string, ClaudeBackgroundTaskState>,
+  payload: unknown,
+): boolean {
+  const roster = (payload as { tasks?: unknown } | undefined)?.tasks;
+  if (!Array.isArray(roster)) {
+    return false;
+  }
+
+  const next = new Map<string, ClaudeBackgroundTaskState>();
+  for (const entry of roster) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const summary = entry as Record<string, unknown>;
+    // The roster is undeclared, and the two shapes it has been observed with
+    // disagree on key names: the SDK's `BackgroundTaskSummary` uses
+    // `id`/`type`, the task_* lifecycle messages use `task_id`/`task_type`.
+    // Accept either rather than betting on one.
+    const id = readString(summary.id) ?? readString(summary.task_id);
+    if (!id) {
+      continue;
+    }
+    if (isTerminalClaudeTaskStatus(readString(summary.status))) {
+      continue;
+    }
+    next.set(id, {
+      id,
+      kind:
+        readString(summary.type) ??
+        readString(summary.task_type) ??
+        CLAUDE_BACKGROUND_TASK_FALLBACK_KIND,
+    });
+  }
+
+  tasks.clear();
+  for (const [id, task] of next) {
+    tasks.set(id, task);
+  }
+  return true;
+}
+
 interface ClaudeSessionContext {
   session: ProviderSession;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
@@ -198,6 +285,12 @@ interface ClaudeSessionContext {
   }>;
   readonly inFlightTools: Map<number, ToolInFlight>;
   readonly claudeTasks: Map<string, ClaudeTaskState>;
+  /**
+   * In-flight background task registry, keyed by provider task id. Survives
+   * turn boundaries — that is the whole point: it is what tells the session
+   * reaper this session is waiting on work rather than finished.
+   */
+  readonly backgroundTasks: Map<string, ClaudeBackgroundTaskState>;
   turnState: ClaudeTurnState | undefined;
   lastKnownContextWindow: number | undefined;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
@@ -2770,6 +2863,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     // authoritative per-agent data and the typed background_tasks control
     // request is the reconciliation source.
     if ((message.subtype as string) === "background_tasks_changed") {
+      // Still emits nothing, but the roster is the one payload that can repair
+      // drift in the in-flight set (missed lifecycle events, tasks already
+      // running when a session is resumed), so it is folded in before exit.
+      reconcileClaudeBackgroundTasks(context.backgroundTasks, message);
       return;
     }
 
@@ -2854,6 +2951,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
         return;
       case "task_started":
+        context.backgroundTasks.set(message.task_id, {
+          id: message.task_id,
+          kind: message.task_type ?? CLAUDE_BACKGROUND_TASK_FALLBACK_KIND,
+        });
         yield* offerRuntimeEvent({
           ...base,
           type: "task.started",
@@ -2887,10 +2988,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         return;
       // Task state patch (status/backgrounded/end_time). No runtime mapping
       // yet — the terminal task_notification reports the outcome — but it
-      // must not surface as an unknown-subtype warning row.
+      // must not surface as an unknown-subtype warning row. A terminal status
+      // here still retires the registry entry: `task_updated` can be the last
+      // word for tasks that never emit a notification (e.g. killed).
       case "task_updated":
+        if (isTerminalClaudeTaskStatus(message.patch.status)) {
+          context.backgroundTasks.delete(message.task_id);
+        }
         return;
       case "task_notification":
+        context.backgroundTasks.delete(message.task_id);
         yield* emitThreadTokenUsage(
           context,
           normalizeClaudeTaskProgressTokenUsage(message.usage, context),
@@ -3364,6 +3471,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
       const inFlightTools = new Map<number, ToolInFlight>();
       const claudeTasks = new Map<string, ClaudeTaskState>();
+      const backgroundTasks = new Map<string, ClaudeBackgroundTaskState>();
 
       const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
 
@@ -3806,6 +3914,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         turns: [],
         inFlightTools,
         claudeTasks,
+        backgroundTasks,
         turnState: undefined,
         lastKnownContextWindow: initialContextWindow,
         lastKnownTokenUsage: undefined,
@@ -4076,7 +4185,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   );
 
   const listSessions: ClaudeAdapterShape["listSessions"] = () =>
-    Effect.sync(() => Array.from(sessions.values(), ({ session }) => ({ ...session })));
+    Effect.sync(() =>
+      Array.from(sessions.values(), (context) => {
+        const pendingBackgroundWork = pendingBackgroundWorkSnapshot(context.backgroundTasks);
+        return {
+          ...context.session,
+          ...(pendingBackgroundWork ? { pendingBackgroundWork } : {}),
+        };
+      }),
+    );
 
   const hasSession: ClaudeAdapterShape["hasSession"] = (threadId) =>
     Effect.sync(() => {

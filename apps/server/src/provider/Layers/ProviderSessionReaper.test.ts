@@ -5,6 +5,8 @@ import {
   TurnId,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderPendingBackgroundWork,
+  type ProviderSession,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -15,6 +17,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -55,6 +58,22 @@ const drainFibers = Effect.forEach(Array.from({ length: 10 }), () => Effect.yiel
 });
 
 const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
+
+function makeActiveSession(
+  threadId: ThreadId,
+  timestamp: string,
+  pendingBackgroundWork?: ProviderPendingBackgroundWork,
+): ProviderSession {
+  return {
+    provider: ProviderDriverKind.make("claudeAgent"),
+    status: "ready",
+    runtimeMode: "full-access",
+    threadId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...(pendingBackgroundWork ? { pendingBackgroundWork } : {}),
+  };
+}
 
 function makeReadModel(
   threads: ReadonlyArray<{
@@ -135,11 +154,18 @@ describe("ProviderSessionReaper", () => {
     runtime = null;
   });
 
-  async function createHarness(input: {
+  /**
+   * Builds the reaper under test as a plain layer. Kept separate from
+   * `createHarness` so tests can run on `it.effect` without standing up a
+   * manual `ManagedRuntime`.
+   */
+  function makeHarnessLayer(input: {
     readonly readModel: ReturnType<typeof makeReadModel>;
     readonly stopSessionImplementation?: (input: {
       readonly threadId: ThreadId;
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
+    readonly activeSessions?: ReadonlyArray<ProviderSession>;
+    readonly backgroundWorkCeilingMs?: number;
   }) {
     const stoppedThreadIds = new Set<ThreadId>();
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
@@ -158,7 +184,7 @@ describe("ProviderSessionReaper", () => {
       respondToRequest: () => unsupported(),
       respondToUserInput: () => unsupported(),
       stopSession,
-      listSessions: () => Effect.succeed([]),
+      listSessions: () => Effect.succeed(input.activeSessions ?? []),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
       getInstanceInfo: (instanceId) => {
         const driverKind = ProviderDriverKind.make(String(instanceId));
@@ -186,6 +212,9 @@ describe("ProviderSessionReaper", () => {
     const layer = makeProviderSessionReaperLive({
       inactivityThresholdMs: 1_000,
       sweepIntervalMs: 60_000,
+      ...(input.backgroundWorkCeilingMs !== undefined
+        ? { backgroundWorkCeilingMs: input.backgroundWorkCeilingMs }
+        : {}),
     }).pipe(
       Layer.provideMerge(providerSessionDirectoryLayer),
       Layer.provideMerge(runtimeRepositoryLayer),
@@ -217,8 +246,13 @@ describe("ProviderSessionReaper", () => {
       Layer.provideMerge(NodeServices.layer),
     );
 
-    runtime = ManagedRuntime.make(layer);
-    return { stopSession, stoppedThreadIds };
+    return { layer, stopSession, stoppedThreadIds };
+  }
+
+  async function createHarness(input: Parameters<typeof makeHarnessLayer>[0]) {
+    const harness = makeHarnessLayer(input);
+    runtime = ManagedRuntime.make(harness.layer);
+    return { stopSession: harness.stopSession, stoppedThreadIds: harness.stoppedThreadIds };
   }
 
   it("reaps stale persisted sessions without active turns", async () => {
@@ -367,6 +401,163 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
     expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  effectIt.live("skips stale sessions that still hold in-flight background work", () => {
+    const threadId = ThreadId.make("thread-reaper-background-work");
+    const harness = makeHarnessLayer({
+      backgroundWorkCeilingMs: 600_000,
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      ]),
+      activeSessions: [
+        makeActiveSession(threadId, "2026-01-01T00:00:00.000Z", {
+          count: 1,
+          kinds: ["monitor"],
+        }),
+      ],
+    });
+
+    return Effect.gen(function* () {
+      const repository = yield* Effect.service(
+        ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      );
+      const now = yield* DateTime.now;
+
+      yield* repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        // Idle well past the 1s threshold, but far short of the 10m ceiling.
+        lastSeenAt: DateTime.formatIso(DateTime.subtract(now, { seconds: 5 })),
+        resumeCursor: {
+          opaque: "resume-background-work",
+        },
+        runtimePayload: null,
+      });
+
+      const reaper = yield* Effect.service(ProviderSessionReaper);
+      yield* reaper.start();
+      yield* drainFibers;
+
+      expect(harness.stopSession).not.toHaveBeenCalled();
+      const remaining = yield* repository.getByThreadId({ threadId });
+      expect(Option.isSome(remaining)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(harness.layer));
+  });
+
+  effectIt.live("reaps sessions whose background work outlives the hard ceiling", () => {
+    const threadId = ThreadId.make("thread-reaper-background-ceiling");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = makeHarnessLayer({
+      backgroundWorkCeilingMs: 600_000,
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+      activeSessions: [
+        makeActiveSession(threadId, now, { count: 2, kinds: ["local_bash", "monitor"] }),
+      ],
+    });
+
+    return Effect.gen(function* () {
+      const repository = yield* Effect.service(
+        ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      );
+
+      yield* repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        // Idle since April; any sane ceiling has long since expired.
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-background-ceiling",
+        },
+        runtimePayload: null,
+      });
+
+      const reaper = yield* Effect.service(ProviderSessionReaper);
+      yield* reaper.start();
+      yield* Effect.promise(() => waitFor(() => harness.stopSession.mock.calls.length === 1));
+
+      expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
+    }).pipe(Effect.scoped, Effect.provide(harness.layer));
+  });
+
+  effectIt.live("reaps stale sessions when the live session reports no background work", () => {
+    const threadId = ThreadId.make("thread-reaper-no-background-work");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = makeHarnessLayer({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+      activeSessions: [makeActiveSession(threadId, now)],
+    });
+
+    return Effect.gen(function* () {
+      const repository = yield* Effect.service(
+        ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      );
+
+      yield* repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-no-background-work",
+        },
+        runtimePayload: null,
+      });
+
+      const reaper = yield* Effect.service(ProviderSessionReaper);
+      yield* reaper.start();
+      yield* Effect.promise(() => waitFor(() => harness.stopSession.mock.calls.length === 1));
+
+      expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
+    }).pipe(Effect.scoped, Effect.provide(harness.layer));
   });
 
   it("skips persisted sessions that are already marked stopped", async () => {

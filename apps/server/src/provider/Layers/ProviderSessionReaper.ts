@@ -14,10 +14,19 @@ import {
 import { ProviderService } from "../Services/ProviderService.ts";
 
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
+/**
+ * Hard ceiling on how long in-flight background work alone may hold a session
+ * open. Without it a single long-lived monitor or `/loop` pins a provider
+ * process forever, which is how sessions leak. Measured from `lastSeenAt` —
+ * the same idle clock as the base threshold — so it caps total idle time, not
+ * time-since-the-task-started.
+ */
+const DEFAULT_BACKGROUND_WORK_CEILING_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface ProviderSessionReaperLiveOptions {
   readonly inactivityThresholdMs?: number;
+  readonly backgroundWorkCeilingMs?: number;
   readonly sweepIntervalMs?: number;
 }
 
@@ -32,11 +41,28 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       options?.inactivityThresholdMs ?? DEFAULT_INACTIVITY_THRESHOLD_MS,
     );
     const sweepIntervalMs = Math.max(1, options?.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS);
+    // A ceiling below the base threshold would mean "reap sessions with
+    // background work sooner than idle ones", which is never the intent.
+    const backgroundWorkCeilingMs = Math.max(
+      inactivityThresholdMs,
+      options?.backgroundWorkCeilingMs ?? DEFAULT_BACKGROUND_WORK_CEILING_MS,
+    );
 
     const sweep = Effect.gen(function* () {
       const bindings = yield* directory.listBindings();
       const now = yield* Clock.currentTimeMillis;
       let reapedCount = 0;
+
+      // Live adapter state, read once per sweep. Sessions whose adapter is
+      // gone simply have no entry, which correctly reads as "no background
+      // work to protect".
+      const pendingBackgroundWorkByThreadId = new Map(
+        (yield* providerService.listSessions()).flatMap((session) =>
+          session.pendingBackgroundWork
+            ? ([[session.threadId, session.pendingBackgroundWork]] as const)
+            : [],
+        ),
+      );
 
       for (const binding of bindings) {
         if (binding.status === "stopped") {
@@ -70,13 +96,36 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           continue;
         }
 
+        // A session parked on a monitor, a backgrounded shell, or a subagent
+        // has no active turn and emits no traffic, so the idle clock alone
+        // cannot tell it apart from an abandoned one. Killing it closes the
+        // provider process and the pending work dies silently with it.
+        const pendingBackgroundWork = pendingBackgroundWorkByThreadId.get(binding.threadId);
+        if (pendingBackgroundWork && idleDurationMs < backgroundWorkCeilingMs) {
+          yield* Effect.logDebug("provider.session.reaper.skipped-background-work", {
+            threadId: binding.threadId,
+            provider: binding.provider,
+            idleDurationMs,
+            backgroundWorkCeilingMs,
+            pendingTaskCount: pendingBackgroundWork.count,
+            pendingTaskKinds: pendingBackgroundWork.kinds,
+          });
+          continue;
+        }
+
         const reaped = yield* providerService.stopSession({ threadId: binding.threadId }).pipe(
           Effect.tap(() =>
             Effect.logInfo("provider.session.reaped", {
               threadId: binding.threadId,
               provider: binding.provider,
               idleDurationMs,
-              reason: "inactivity_threshold",
+              reason: pendingBackgroundWork ? "background_work_ceiling" : "inactivity_threshold",
+              ...(pendingBackgroundWork
+                ? {
+                    pendingTaskCount: pendingBackgroundWork.count,
+                    pendingTaskKinds: pendingBackgroundWork.kinds,
+                  }
+                : {}),
             }),
           ),
           Effect.as(true),
@@ -123,6 +172,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
 
         yield* Effect.logInfo("provider.session.reaper.started", {
           inactivityThresholdMs,
+          backgroundWorkCeilingMs,
           sweepIntervalMs,
         });
       });
