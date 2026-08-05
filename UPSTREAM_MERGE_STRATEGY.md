@@ -41,21 +41,25 @@ drop ours.
 
 ### 2. AGENTS.md expansion
 
-- **Commit:** `03be0dfd`
+- **Commit:** `03be0dfd`, reduced to a two-bullet residue in the
+  v0.0.32-nightly.1000 sync
 - **Files:** `AGENTS.md`
-- **What:** Expanded architecture notes, commands, and conventions doc for
-  agent-driven edits.
-- **Pre-merge check:** Upstream may refresh AGENTS.md with new guidance.
-  Merge theirs, then re-apply our additions that aren't already covered.
-  This conflicts on nearly every sync because our expansion occupies the whole
-  region between "Task Completion Requirements" and "Package Roles", which is
-  exactly where upstream inserts new sections. Resolve by keeping both — take
-  our block, then append theirs ahead of "Package Roles". The v0.0.29 sync
-  added their `## Dev Servers` section that way; it overlaps our "Multiple dev
-  instances" paragraph in subject but not in content (theirs covers worktree
-  `.t3` precedence and `vp run dev --share`, ours covers
-  `T3CODE_DEV_INSTANCE`/`T3CODE_PORT_OFFSET`), so both were kept.
-- **Post-merge test:** read-through only; no runtime impact.
+- **What:** Two bullets upstream's rewritten AGENTS.md does not cover: the
+  "No Node-test / import from `vite-plus/test`, not `vitest`" rule under
+  `## Verifying`, and the Codex OSS + CodexMonitor reference links under
+  `## Additional tips`.
+- **Pre-merge check:** The old "keep our whole block, append theirs" recipe is
+  **dead** — do not reach for it. Upstream #4807 / #4782 rewrote AGENTS.md into
+  a short high-level doc and split the detail into `docs/internals/` and
+  `docs/user/`. Our package-roles, architecture, and command sections became
+  straight duplicates of `docs/internals/workspace-layout.md` and
+  `docs/internals/scripts.md` (which now documents
+  `T3CODE_DEV_INSTANCE`/`T3CODE_PORT_OFFSET`), and were dropped. The
+  `REMOTE.md` pointer was dropped too — that file no longer exists on either
+  side. Take upstream's AGENTS.md wholesale, then re-add only the two bullets
+  above, checking first whether upstream has since absorbed them.
+- **Post-merge test:** read-through only; no runtime impact. `CLAUDE.md` is a
+  symlink to `AGENTS.md` — confirm it still resolves.
 
 ### 3. Dev-only artifact .gitignore
 
@@ -263,6 +267,73 @@ drop ours.
   under every assistant response without needing a tap-to-hover, and that it
   copies the full response.
 
+### 12. Sessions with in-flight background work survive the reaper
+
+- **Commit:** `d1b67465` ("fix: keep sessions with in-flight background work
+  alive")
+- **Files:** `apps/server/src/provider/Layers/ProviderSessionReaper.{ts,test.ts}`,
+  `apps/server/src/provider/Layers/ClaudeAdapter.{ts,test.ts}`,
+  `packages/contracts/src/provider.ts`
+- **What:** `ProviderSessionReaper` stopped any session idle 30 minutes with no
+  active turn, which killed sessions parked on a monitor, a backgrounded shell,
+  or a subagent — a monitor needing more than ~30 minutes never reported back.
+  `ClaudeAdapter` now tracks the CLI's background task registry from the
+  `task_started` / `task_updated` / `task_notification` lifecycle (reconciled
+  from the undeclared `background_tasks_changed` roster) and exposes it as
+  `ProviderSession.pendingBackgroundWork`. The reaper skips sessions holding
+  in-flight work, bounded by `DEFAULT_BACKGROUND_WORK_CEILING_MS` (8h).
+- **Pre-merge check:** Upstream owns both files. The v0.0.32 sync swapped
+  `Effect.forkScoped` → `forkParked` in the reaper's `start()` and renamed
+  `Schema.UnknownFromJsonString` in the adapter; both auto-merged. Verify (a)
+  the reaper still reads `providerService.listSessions()` into
+  `pendingBackgroundWorkByThreadId` and consults it before `stopSession`, and
+  (b) `ClaudeAdapter`'s `listSessions` still spreads `pendingBackgroundWork`.
+  If upstream ever ships its own idle-work exemption, prefer theirs.
+- **Known gap:** the ceiling is measured from `lastSeenAt`, which only refreshes
+  on session start, `sendTurn`, and recovery — never on monitor-driven turns. A
+  monitor firing usefully for over 8h is still reaped.
+- **Post-merge test:** covered by the `apps/server` suite (75 tests across the
+  two files).
+
+### 13. Agent-run observation RPCs
+
+- **Files:** `packages/contracts/src/rpc.ts`,
+  `apps/server/src/auth/RpcAuthorization.ts`
+- **What:** Fork-only `agentRunsList` / `agentRunsGet` RPCs, read-scoped. There
+  is deliberately no operate-scoped agent-run method — T3Code cannot resume,
+  recover, or kill a run.
+- **Pre-merge check:** The fork used to carry its own inline `RPC_REQUIRED_SCOPE`
+  map in `apps/server/src/ws.ts`. **Superseded** in the v0.0.32-nightly.1000
+  sync: upstream extracted the same map, with identical fail-closed `throw`
+  semantics, into `apps/server/src/auth/RpcAuthorization.ts`, and its call sites
+  now use `requiredScopeForRpcMethod()`. We dropped the inline map and migrated
+  our two entries into upstream's module. This is not optional — upstream's map
+  is `satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>`, so any
+  fork RPC added to `WsRpcGroup` without a scope entry is a **typecheck
+  failure**, and would throw at runtime if it slipped through.
+- **Post-merge test:** covered by the `apps/server` suite.
+
+### 14. Account usage in the context-window popup
+
+- **Commit:** `eb10313dc` ("fix: report real Claude account usage in the context
+  window popup")
+- **Files:** `apps/web/src/components/chat/ContextWindowMeter.tsx`
+- **What:** Renders real plan rate-limit utilization in the context-window
+  popover, widening it (`w-72` vs `w-64`) when `accountUsage` is present.
+- **Pre-merge check:** Upstream restyles this popover regularly; the conflict
+  site is the `<PopoverPopup>` prop block. The v0.0.32 sync moved padding to
+  `viewportClassName="p-0"` and added `text-left whitespace-normal` — both were
+  taken, alongside our `dropdown-glass` classes and the conditional width.
+- **Post-merge test:** visual — open a thread and click the context-window ring;
+  the popup should show account usage and be visibly wider than on a thread
+  without it.
+
+> **The list above is not exhaustive.** The fork is ~58 commits ahead of
+> upstream and items 12–14 were added only because the v0.0.32-nightly.1000 sync
+> surfaced them through conflicts. Other undocumented fork-only work exists
+> (e.g. provider usage limits, run notifications). When a sync conflicts in a
+> file no entry mentions, add an entry rather than resolving it silently.
+
 ## Merge workflow
 
 1. **Fetch upstream:**
@@ -357,7 +428,9 @@ drop ours.
    # 14/14 pass in 1.8s. Treat any failure in this file's setup hook as load, and
    # re-run before investigating.
    cd apps/web && corepack pnpm@11.10.0 exec vp test run src/components/chat/MessagesTimeline.test.tsx
-   # mobile: "keeps grammar state across inline comment rows" (observed 4.4s under load, 0.4s alone)
+   # mobile: "keeps grammar state across inline comment rows" (observed 4.4s under load, 0.4s alone).
+   # Flaked again in the v0.0.32-nightly.1000 sync — the sole failure in an otherwise
+   # green whole-workspace run; 4/4 pass in 0.5s alone.
    cd apps/mobile && corepack pnpm@11.10.0 exec vp test run src/features/diffs/nativeReviewDiffHighlighter.test.ts
    ```
 

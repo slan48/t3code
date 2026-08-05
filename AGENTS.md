@@ -1,187 +1,150 @@
-# AGENTS.md
+# T3 Code
 
-This file provides guidance to Claude Code (claude.ai/code) and other coding agents when working with code in this repository. `CLAUDE.md` is a symlink to this file — edit this file to update both.
+T3 Code is a minimal GUI for coding agents. A Node WebSocket server wraps provider CLIs (Codex, Claude Code, Cursor, Grok, OpenCode) and serves web, desktop, and mobile clients.
 
-## Task Completion Requirements
+You can think of T3 Code as an open source "bring-your-own-subscription" alternative to apps like Claude Desktop, Codex App, Cursor Glass and Conductor.
 
-- Keep local verification focused on the files and packages changed. Run the smallest relevant test set; do not run the full workspace test suite as a routine completion step.
-  - Use `vp test run <test-files>` for focused built-in Vite+ tests. Use `vp run test` only when the affected package specifically requires its `test` script.
-  - Backend changes must include and run focused tests for the changed behavior.
-  - Run targeted formatting, lint, and type checks for the affected scope when available.
-  - If changing native mobile code, `vp run lint:mobile` must also pass.
-- Do not run repo-wide `vp check`, `vp run typecheck`, `vp run test`, or equivalent full-suite commands locally unless the user explicitly requests them. CI is responsible for the full verification suite.
-- After frontend feature development or any user-visible frontend behavior change, the primary agent must run one integrated verification pass for each affected client surface after integrating the work:
-  - Web: use the `test-t3-app` skill. Launch one isolated environment, authenticate through the printed pairing URL, and verify the affected flow in the controlled browser.
-  - Mobile: use the `test-t3-mobile` skill. Connect one representative iOS Simulator or Android Emulator available on the host to one isolated environment and verify the affected flow. On compatible macOS hosts, prefer iOS for cross-platform changes and stream it through serve-sim in the T3 Code in-app browser or another available agent browser; use Android when it is the affected or viable platform.
-  - Subagents must not independently launch dev servers or repeat integrated client verification unless their delegated task explicitly requires it.
-  - Stop dev servers, watchers, and other long-running verification processes when the focused verification is complete.
+## What makes T3 Code special?
 
-## Project Snapshot
+We have over 100,000 users who love T3 Code. It's important we maintain the things they love as we continue to iterate on the product. Here's a brief list of the things we can never compromise on.
 
-T3 Code is a minimal web GUI for coding agents (Codex, Claude, Cursor via ACP, opencode). The repo is a **very early WIP** — proposing sweeping changes that improve long-term maintainability is encouraged.
+### 1. Open at the core
 
-## Core Priorities
+T3 Code is truly open. We share our roadmap, we share how we think about things, and of course we share all our code. A large number of our users run forks. We work in the open, and should strive to stay that way.
 
-1. Performance first.
-2. Reliability first.
-3. Keep behavior predictable under load and during failures (session restarts, reconnects, partial streams).
+### 2. Performance without compromise
 
-If a tradeoff is required, choose correctness and robustness over short-term convenience. Long-term maintainability is a core priority — if you add functionality, first check for shared logic that can be extracted. Duplicated logic across multiple files is a code smell. Don't be afraid to change existing code; don't take shortcuts by adding local logic to solve a shared problem.
+Lots of apps have gotten bogged down with bad tech decisions and "slop". We have not, and we're proud of the performance of T3 Code. We regularly audit for performance regressions, often caused by sending too much data over websockets, css animations causing gpu spikes, lists being hard to render, and more. Make sure all changes are considerate of performance impact.
 
-## Common Commands
+### 3. Remote ready
 
-Package manager is **pnpm 11.10.0** (Node 24.13.1), pinned via `packageManager` in `package.json` — invoke through `corepack pnpm@11.10.0 …` if pnpm isn't on PATH. The build/test runner is **`vp` (vite-plus)**, which replaced Turbo.
+The architecture of T3 Code's websocket layer (npx t3) enables a lot of awesome remote features. These have become core to the product. Whether users are connecting directly over their local network, using Tailscale, or leaning in fully with T3 Connect (our tunnel solution, also in this repo), we need to make sure new features are properly supported.
 
-Top-level (all routed through `vp`/vite-plus unless noted):
+### 4. Multi-surface
 
-- `pnpm run dev` — contracts + server + web in watch mode with a TUI.
-- `pnpm run dev:server` / `pnpm run dev:web` / `pnpm run dev:desktop` — individual stacks.
-- `pnpm run build` — full workspace build.
-- `pnpm run typecheck` — `vp run -r typecheck` (tsgo `--noEmit`) across all packages.
-- `pnpm run lint` — `vp lint --report-unused-disable-directives` (oxlint) at the repo root.
-- `pnpm run fmt` / `pnpm run fmt:check` — `oxfmt` formatter.
-- `pnpm run test` — vite-plus test (`vp run -r test`) across all workspaces.
-- `pnpm run start` — production server (serves the built web app as static files).
-- `pnpm run build:contracts` — rebuild only `@t3tools/contracts` (needed before server/web typecheck after contract changes).
-- `pnpm run clean` — nukes `node_modules`, all `dist`, `dist-electron`, and `.vite-plus` caches.
+T3 Code has 3 key app surfaces: **web**, **desktop**, and **mobile**.
 
-Running a single test file / name filter (run inside the owning package):
+**Web** is kind of two surfaces, as we have the public facing "app.t3.codes" as well as locally hosting the web app through the `npx t3` command. Both need to be supported by all new features where reasonable.
 
-```bash
-cd apps/server && pnpm exec vp test run src/orchestration/decider.ts
-cd apps/server && pnpm exec vp test run -t "turn start"
-```
+**Desktop** is the main surface most users install first. It's a full Electron app that bundles the server runner as well. The desktop app can also be used as the host server, allowing remote connections from app.t3.codes or the mobile app.
 
-Web browser tests use Playwright and a separate config:
+**Mobile** is a React Native app for both iOS and Android, available on the App Store and Google Play. The mobile app allows for connecting to any T3 Code server to control work remotely.
 
-```bash
-cd apps/web && pnpm run test:browser:install   # one-time
-cd apps/web && pnpm run test:browser
-```
+## A note from Theo
 
-Server-only focused suites:
+I like ambitious ideas, simple systems, and software that feels obvious. Do not preserve complexity just because it already exists. Do not introduce machinery because it looks architecturally impressive. Understand the real constraint, then fight for the smallest model that makes the correct behavior unsurprising.
 
-- `cd apps/server && pnpm run test:process-reaper` — targeted process-lifecycle suite used when touching provider adapters / session reapers.
+Channel both "measure twice, cut once" and "yagni". Fight scope creep. Try to honor the dev's intent in both a minimal and realistic fashion.
 
-Desktop packaging:
+The rest of this document is meant to help you navigate the codebase and make changes effectively. Think of these instructions less as "hard rules", more as "good defaults". The developer's preferences should be able to override anything here.
 
-- `pnpm run dist:desktop:dmg` (arm64 default), `:dmg:x64`, `:linux`, `:win`, `:win:arm64`, `:win:x64`.
-- `pnpm run test:desktop-smoke` for the packaged smoke test.
+Of note: Most T3 Code contributions will come from T3 Code itself, often controlled remotely. This means you should be careful about accessing data, killing dev servers, and other things that may damage the T3 Code instance that the contributor is using.
 
-Multiple dev instances on the same machine: set `T3CODE_DEV_INSTANCE=<name>` (hashes to a port offset) or `T3CODE_PORT_OFFSET=<n>` (explicit). Defaults: server `3773`, web `5733`. Dev commands default `T3CODE_STATE_DIR` to `~/.t3/dev` to keep dev state isolated.
+## A small glossary
 
-Pass flags through to the server from the root dev command with `--`, e.g. `pnpm run dev -- --base-dir ~/.t3-2`.
+We need to be on the same page with terminology. When communicating, use this language:
 
-## Dev Servers
+- **you** means the agent reading this file and changing T3 Code.
+- **we, us, and maintainers** mean Theo, Julius and the people building T3 Code. These are who you are talking to now.
+- **user** means the person using T3 Code to direct coding agents.
+- **agent** means the coding agent a user runs inside T3 Code. Depending on context, that may also include you.
+- **provider** means the agent runtime or harness T3 Code talks to, such as Codex, Claude, Cursor, or OpenCode.
+- **client** means the web, desktop, or mobile UI.
+- **environment** means one running T3 server and the machine, filesystem, provider credentials, and state it owns.
+- **project** means an environment-local workspace record rooted at a directory.
+- **thread** means the durable conversation and work history for a project.
+- **turn** means one user-to-agent cycle, including follow-up work such as checkpointing.
+- **T3 home** means the base data directory. Runtime state normally lives below its userdata directory.
 
-- In a linked git worktree, dev state defaults to that worktree's gitignored `.t3`. This deliberately outranks an ambient `T3CODE_HOME`, which could otherwise select the installed app's live `~/.t3/userdata` database. An explicit `--home-dir` still wins.
-- Start the web stack with `vp run dev`. Add `--share` when someone needs to open it from another device on the tailnet.
-- Browser dev is single-origin: Vite proxies `/api`, `/ws`, `/oauth`, and `/.well-known` to the backend. Do not set `VITE_HTTP_URL` or `VITE_WS_URL` for `dev`/`dev:web`.
-- Worktree paths supply stable preferred port offsets. Read the actual server and web ports from the `[dev-runner]` line because occupied ports can still shift them.
-- Before handing off a `--share` URL, open its origin in a controlled browser and confirm the app loads. A successful curl is insufficient because browsers reject some otherwise reachable ports.
+## The three ways to hurt yourself
 
-## Package Roles
+1. **Killing by pattern.** Never `pkill -f`, `pgrep | kill`, or `kill` a PID you found by matching a name, path, or worktree string. Your own agent process has this worktree's path in its argv, and this machine runs several other dev servers at once. Kill only a PID you captured at spawn, or the owner of your port from `ss -H -ltnp` after confirming `/proc/<pid>/cwd` is your worktree.
+2. **Writing to the live install.** `~/.t3/userdata` is the developer's real T3 Code database, in use while you work. Reading it and copying from it are fine, and a good way to get real test data (see Test data). Never start a server against it, never open it read-write, never clean it up.
+3. **Baking in origins.** Never set `VITE_HTTP_URL` or `VITE_WS_URL` for dev. Dev is single-origin and Vite proxies `/api`, `/ws`, `/oauth`, and `/.well-known`. Setting them bakes localhost into the bundle and silently breaks every remote browser.
 
-- `apps/server` (`t3` on npm) — Node WebSocket server. Spawns provider runtimes (Codex `app-server` via JSON-RPC over stdio, Claude, Cursor via ACP, opencode), serves the React web app, owns orchestration state, persistence (sqlite), git, terminals, and auth/pairing.
-- `apps/web` (`@t3tools/web`) — React 19 + Vite (vite-plus) UI. Tanstack Router, Tailwind 4, Effect `@effect/atom-react` + Zustand for state, Lexical editor, xterm.js terminal. React Compiler is enabled.
-- `apps/desktop` (`@t3tools/desktop`) — Electron shell that spawns a desktop-scoped `t3` backend on loopback (auth-token protected) and loads the bundled UI from `t3://app/index.html`.
-- `apps/marketing` — Separate site build; not part of the main dev loop.
-- `packages/contracts` (`@t3tools/contracts`) — Effect `Schema` schemas + TypeScript contracts for provider events, the WebSocket protocol, orchestration domain, and settings. **Schema only — no runtime logic.**
-- `packages/shared` (`@t3tools/shared`) — Shared runtime utilities consumed by both server and web. **Explicit subpath exports only** (e.g. `@t3tools/shared/git`, `@t3tools/shared/DrainableWorker`) — no barrel index.
-- `packages/client-runtime` — Small runtime bits shared with the client.
-- `packages/effect-acp` — Effect-flavored Agent Client Protocol (ACP) client/agent/schema. Generated from upstream schema via `pnpm run generate`.
+## Hit every surface
 
-## Architecture At A Glance
+The most common defect in this repo is a change that works on the path you tested and is missing everywhere else. Before calling frontend work done, walk this list and say which entries applied:
 
-```
-Browser (React)  ──ws://host:3773──►  apps/server  ──JSON-RPC stdio──►  codex app-server / other providers
-  wsTransport                          WS + HTTP static                   (provider runtime processes)
-  typed push decode                    ServerPushBus (ordered pushes)
-  atom/zustand state                   OrchestrationEngine (CQRS-ish)
-                                       ProviderService
-                                       CheckpointReactor
-                                       RuntimeReceiptBus (sqlite persistence)
-```
+- **Entry points.** A behavior reachable from the chat view is usually also reachable from Settings, the command palette, and a keybinding. Fixing one is not fixing the feature.
+- **Clients.** Web, desktop (wraps web, adds Electron shell/IPC), and mobile (React Native, separate navigation). Shared logic lives in `packages/client-runtime`
+- **Providers.** Codex, Claude, Cursor, Grok, and OpenCode each have an adapter. Provider-shaped features need a decision per adapter, even if the decision is "not supported here".
+- **Contracts.** Anything crossing the wire is typed in `packages/contracts`. Change the schema and the server, web, mobile, and desktop all follow.
+- **Reverse states.** If you added a way in, add the way out and the way to see it. Snooze needs unsnooze. Close needs reopen. A one-way door is a bug.
+- **Connection modes.** Local, remote/relay, and tunnel behave differently. Multi-device and multi-environment cases are real.
+- **Docs.** `docs/` splits by audience. Behavior changes that a user would notice belong in `docs/user/` (shipped-product voice, no repo tooling or source paths); architecture and contributor changes in `docs/internals/`; runbooks in `docs/operations/`; new vocabulary in `docs/internals/glossary.md`.
 
-### The push/request protocol
+## Dev servers
 
-- Simple JSON-RPC-style over WebSocket: `{ id, method, params }` → `{ id, result | error }` for calls; typed envelopes `{ channel, sequence, data }` for server-initiated pushes. Channels include `server.welcome`, `server.configUpdated`, `terminal.event`, `orchestration.domainEvent`.
-- Payloads are schema-validated at the transport boundary in `apps/web/src/rpc/wsTransport.ts`. Decode failures produce structured `WsDecodeDiagnostic` — don't bypass validation, fix the schema.
-- Method names mirror the `NativeApi` interface in `@t3tools/contracts` (e.g. `providers.startSession`, `providers.sendTurn`, `providers.respondToRequest`, `shell.openInEditor`, `server.getConfig`).
-- Client transport state machine: `connecting → open → reconnecting → closed → disposed`. Outbound requests queue while disconnected and flush on reconnect. Push channels cache last value; subscribers can opt into `replayLatest`.
+- `vp i` installs. Worktrees get this from the t3.json setup script; if module resolution looks broken, it probably did not run.
+- `vp run dev` starts server and web. In a worktree, state defaults to that worktree's gitignored `.t3`, which deliberately outranks an ambient `T3CODE_HOME` so you cannot land on shared state by accident. An explicit `--home-dir` still wins.
+- Ports derive from the worktree path and are stable across restarts, but read the real ones from the `[dev-runner]` line since occupied ports shift.
+- `--share` publishes over the tailnet. Do not open the URL when you use this, just send it to the user with the pairing code included in url
+- The web app requires pairing. Hand over the pairing URL, not the bare origin. A URL without its token is useless to whoever you gave it to.
+- Stop what you started, by the PID you tracked. See rule 1.
 
-### Server-side orchestration (the load-bearing part)
+## Test data
 
-Orchestration is an event-sourced domain layer that turns runtime activity into stable app state. Source of truth lives in three files:
+An empty database is a bad test. Seed your worktree's `.t3` with a copy of real data instead of pointing at live state:
 
-- `apps/server/src/orchestration/decider.ts` — pure `(command, state) → events` with preconditions in `commandInvariants.ts`.
-- `apps/server/src/orchestration/projector.ts` — pure `(event, state) → state'` projection; also used by `Layers/ProjectionPipeline.ts` to build persisted read model rows.
-- `apps/server/src/orchestration/Layers/OrchestrationEngine.ts` — glues decider + projector + persistence; exposes command dispatch and domain-event stream.
+- Copy from `~/.t3/userdata` (the developer's real data, the most realistic test set) or `~/.t3/dev`. Worktree state lives at `<worktree>/.t3/userdata`.
+- Snapshot the database with `VACUUM INTO`, which is safe even while a server has the source open and yields one consistent file:
 
-Follow-up async work runs as queue-backed reactors using `DrainableWorker` (`@t3tools/shared/DrainableWorker`), which exposes `drain()` for deterministic test synchronization. The three main reactors:
+  ```bash
+  mkdir -p .t3/userdata
+  rm -f .t3/userdata/state.sqlite*  # VACUUM INTO refuses to overwrite
+  bun -e "new (require('bun:sqlite').Database)(process.env.HOME + '/.t3/userdata/state.sqlite', { readonly: true }).run(\"VACUUM INTO '.t3/userdata/state.sqlite'\")"
+  ```
 
-1. **ProviderRuntimeIngestion** — consumes provider runtime streams and emits orchestration commands/events.
-2. **ProviderCommandReactor** — reacts to orchestration intent events by dispatching provider calls.
-3. **CheckpointReactor** — captures git checkpoints on turn start/complete and publishes runtime receipts.
+  A plain `cp` is only safe when no server has the source open, and must bring the `-wal` and `-shm` siblings along. A live file copy is a corrupt copy.
 
-`RuntimeReceiptBus` emits lightweight typed signals when async milestones finish (e.g. `checkpoint.baseline.captured`, `checkpoint.diff.finalized`, `turn.processing.quiesced`). **Tests and orchestration code should wait on these receipts — not poll git state, projections, or sleep timers.**
+- Bring `secrets` and `settings.json` only if the flow under test needs them.
+- Copy in, never symlink. Data flows one way: into your sandbox, never back out.
 
-Aggregates are `project` or `thread`. Commands are typed (`thread.create`, `thread.turn.start`, `thread.checkpoint.revert`, …). Events are the persisted source of truth (`thread.created`, `thread.message-sent`, `thread.turn-diff-completed`, …). See `packages/contracts/src/orchestration.ts`.
+## Verifying
 
-### Provider adapters
+- Smallest proof that the change works. `vp test run <files>` for the tests you touched, targeted lint and typecheck for the scope you changed.
+- **Do not run repo-wide checks.** No `vp check`, no `vp run -r test`, no `vp run -r typecheck` unless I ask. CI owns the full suite.
+- Backend behavior changes ship with focused tests for that behavior.
+- **No Node-test.** vite-plus test only (`vp test`); import test APIs from `vite-plus/test`, not `vitest`. Tests live next to their source as `*.test.ts`.
+- The server is event-sourced and its async flows emit typed receipts. Wait on receipts and worker drains, never on sleeps or polling. A test that needs a timeout to pass is wrong.
+- Upon request, user-visible frontend changes should get one integrated pass in a real client: `test-t3-app` for web, `test-t3-mobile` for mobile. The primary agent does this once after integrating. Subagents do not launch their own dev servers. Ask permission before doing computer use or spinning up browsers.
 
-- Provider contracts: `apps/server/src/provider/Services/ProviderAdapter.ts`.
-- Adapters live under `apps/server/src/provider/Layers/` — `CodexAdapter.ts`, `ClaudeAdapter.ts`, `OpencodeAdapter.ts`, plus ACP-based flows under `apps/server/src/provider/acp/`.
-- Codex is the historical first-class provider. The server wraps `codex app-server` (JSON-RPC over stdio) per session — session startup/resume and turn lifecycle live in `apps/server/src/codexAppServerManager.ts`. Docs: https://developers.openai.com/codex/sdk/#app-server.
+## Pull requests
 
-### Runtime modes
+- Never make a PR unless the developer explicitly asks you to do so.
+- Conventional commit titles, plain language: `fix(web): new threads no longer spike CPU`.
+- Body: the problem in a sentence or two, then how you fixed it. End with the model and harness that did the work.
+- **Rebase onto latest main before opening.** Stale branches conflict and burn a review round.
+- UI changes need before/after images. Motion or timing needs a short video.
+- One concern per PR. If the description says "also", split it.
+- When babysitting: poll checks and comments newer than the last push, verify each bot finding against the source, fix real ones, dismiss false positives with a written reason. Stay quiet when nothing is new. Stop when the bots are green on the latest commit.
 
-Global toggle in the chat toolbar:
+## How it works
 
-- **Full access** (default): `approvalPolicy: never`, `sandboxMode: danger-full-access`.
-- **Supervised**: `approvalPolicy: on-request`, `sandboxMode: workspace-write`; in-app approvals for commands/files.
+Clients send typed WebSocket requests. The server turns them into _commands_, a pure _decider_ turns commands into persisted _events_, and a _projector_ derives the read model the UI renders. Provider CLIs run as subprocesses; per-provider _adapters_ translate their native protocols into orchestration events. Side effects run in queue-backed _reactors_ that emit _receipts_ when milestones land. Each turn ends with a _checkpoint_, a hidden git ref, so the app can diff and restore.
 
-## Code Conventions Worth Knowing
+Full glossary with file links: `docs/internals/glossary.md`
 
-- **Effect everywhere.** The server, contracts, shared, and much of the web are built on Effect 4 (beta, pinned via the workspace catalog — never bump Effect-family versions in one package alone).
-- **`Effect.fn("name")(function* () { ... })`** is the preferred boundary for tracing and metrics — prefer it over bare `Effect.gen`. See `docs/effect-fn-checklist.md` for the progressive refactor list. New code should follow the pattern.
-- **Spans are load-bearing for debugging.** The server writes completed spans to `~/.t3/userdata/logs/server.trace.ndjson` (configurable) and optionally OTLP-exports to Grafana LGTM. Use `Effect.annotateCurrentSpan({...})` for high-cardinality context (ids, paths). Keep metric labels low-cardinality. Full guide in `docs/observability.md`.
-- **Contracts are schema-only.** Runtime logic in `@t3tools/contracts` is disallowed. Keep it to `effect/Schema` definitions and types.
-- **`@t3tools/shared` has no barrel.** Import from the subpath: `import { gitRunCommand } from "@t3tools/shared/git"`. Don't add an `index.ts`.
-- **Contracts imports resolve to source in tests.** `vite.config.ts` aliases `@t3tools/contracts` to `packages/contracts/src/index.ts`, so you don't need to rebuild contracts to run tests.
-- **`pnpm run dev` depends on a contracts build.** `vp` wires `dev → @t3tools/contracts#build`. If web/server typecheck fails with missing exports after you change contracts, run `pnpm run build:contracts`.
-- **Lint config** (`.oxlintrc.json`): `correctness`, `suspicious`, and `perf` categories are warnings. `no-shadow` and `no-await-in-loop` are disabled intentionally.
-- **No Node-test.** vite-plus test only (`vp test`); import test APIs from `vite-plus/test`, not `vitest`. Tests co-located with source (`*.test.ts`).
+## Where code lives
 
-## Reference Repos
+- `apps/server` - WebSocket, orchestration, providers, checkpointing. Effect-heavy: read `.repos/effect-smol/LLMS.md` before writing Effect code.
+- `apps/web` - React/Vite UI. `apps/desktop` wraps it, `apps/mobile` is React Native, `apps/marketing` is the site.
+- `packages/contracts` - Effect/Schema contracts plus small derived helpers. No heavy runtime logic.
+- `packages/shared` - shared runtime utils, subpath exports, no barrel.
+- `packages/client-runtime` - client code shared by web and mobile.
+- `.repos/` - vendored read-only references. Prefer their patterns over invented ones. Never edit or import from them. Sync with `vpr sync:repos` when bumping the matching dependency.
 
-- Codex (OSS): https://github.com/openai/codex
-- CodexMonitor (Tauri, feature-complete reference for protocol + UX flows): https://github.com/Dimillian/CodexMonitor
+## Taste
 
-Use these as implementation references when designing protocol handling, UX flows, and operational safeguards.
+- Complexity belongs at the adapter boundary. Orchestration stays pure, UI stays dumb.
+- Inferred types over annotations. `any` is the enemy.
+- Comments describe how a thing is used, and move when the code moves. To be used mostly to describe functions, not to annotate every line of behavior.
+- Our users drive agents all day and notice a dropped frame, a lying spinner, and a stale label. No continuously repainting animations; they peg the GPU on high-refresh displays.
+- If a rule here fights the task in front of you, say so loudly and get a human sign-off before breaking it.
 
-## Vendored Repositories
+## Additional tips
 
-This project vendors external repositories under `.repos/` as read-only reference material for coding
-agents.
-
-- Prefer examples and patterns from the vendored source code over generated guesses or web search results.
-- Do not edit files under `.repos/` unless explicitly asked.
-- Do not import from `.repos/`; application code must continue importing from normal package dependencies.
-- Manage vendored subtrees with `vpr sync:repos`; use `vpr sync:repos --repo <id>` to sync one configured repository.
-- When updating a dependency with a configured vendored subtree, sync that subtree in the same change so
-  `.repos/` matches the installed dependency version.
-- When writing Effect code, read `.repos/effect-smol/LLMS.md` first and inspect `.repos/effect-smol/` for
-  examples of idiomatic usage, tests, module structure, and API design.
-- When writing relay infrastructure code with Alchemy, inspect `.repos/alchemy-effect/` for examples of
-  idiomatic usage, tests, module structure, and API design.
-
-## Further Reading (in-repo)
-
-- `.docs/architecture.md` — startup, turn, and async completion sequence diagrams.
-- `.docs/provider-architecture.md` — push channels and transport state machine.
-- `.docs/encyclopedia.md` — glossary for project/thread/turn/aggregate/reactor/receipt vocabulary.
-- `.docs/workspace-layout.md`, `.docs/scripts.md`, `.docs/quick-start.md`, `.docs/runtime-modes.md`.
-- `docs/observability.md` — traces, metrics, OTLP/LGTM setup, jq recipes.
-- `docs/release.md` — release + signing checklist.
-- `REMOTE.md` — pairing + `t3 serve` headless flow.
+- Don't verify with browsers or computer use unless the user explicitly agrees or requests it.
+- Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
+- Outside references for provider protocol and UX flows: Codex (OSS) https://github.com/openai/codex, and CodexMonitor (Tauri, feature-complete reference) https://github.com/Dimillian/CodexMonitor.
