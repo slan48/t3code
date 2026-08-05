@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   ApprovalRequestId,
   EventId,
@@ -31,25 +31,6 @@ const ProviderSessionStatus = Schema.Literals([
   "closed",
 ]);
 
-/**
- * In-flight background work registered inside a provider session: monitors,
- * backgrounded shells, subagents, and workflows that keep running after the
- * turn that started them has completed.
- *
- * A session holding pending background work looks idle from the outside — no
- * active turn, no traffic — but killing it destroys the work. The session
- * reaper reads this to tell "done" apart from "waiting to be woken".
- */
-export const ProviderPendingBackgroundWork = Schema.Struct({
-  count: PositiveInt,
-  /**
-   * Distinct provider-native task kinds (e.g. `monitor`, `local_bash`,
-   * `local_agent`). Deduplicated and sorted so reaper logs stay stable.
-   */
-  kinds: Schema.Array(TrimmedNonEmptyString),
-});
-export type ProviderPendingBackgroundWork = typeof ProviderPendingBackgroundWork.Type;
-
 export const ProviderSession = Schema.Struct({
   provider: ProviderDriverKind,
   // Optional during the driver/instance migration. Once every producer
@@ -63,12 +44,6 @@ export const ProviderSession = Schema.Struct({
   threadId: ThreadId,
   resumeCursor: Schema.optional(Schema.Unknown),
   activeTurnId: Schema.optional(TurnId),
-  /**
-   * Absent when the adapter reports no in-flight background work, and also for
-   * adapters that do not track it at all — consumers must treat "absent" as
-   * "unknown/none", never as proof the session is finished.
-   */
-  pendingBackgroundWork: Schema.optional(ProviderPendingBackgroundWork),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   lastError: Schema.optional(TrimmedNonEmptyString),
