@@ -32,10 +32,13 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import {
   DEFAULT_ENVIRONMENT_IDENTIFICATION_MODE,
+  DEFAULT_PROVIDER_SESSION_IDLE_TIMEOUT,
   DEFAULT_UNIFIED_SETTINGS,
   type EnvironmentIdentificationMode,
   MAX_GLASS_OPACITY,
+  MAX_PROVIDER_SESSION_IDLE_TIMEOUT,
   MIN_GLASS_OPACITY,
+  MIN_PROVIDER_SESSION_IDLE_TIMEOUT,
 } from "@t3tools/contracts/settings";
 import {
   getBackgroundActivityBaseProfile,
@@ -220,6 +223,27 @@ function normalizeIntervalSeconds(value: number | null, minimum = 0): number {
     return minimum;
   }
   return Math.max(minimum, Math.round(value));
+}
+
+const MIN_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS = Math.round(
+  Duration.toHours(MIN_PROVIDER_SESSION_IDLE_TIMEOUT),
+);
+const MAX_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS = Math.round(
+  Duration.toHours(MAX_PROVIDER_SESSION_IDLE_TIMEOUT),
+);
+
+/**
+ * The server clamps this too; mirroring the bounds here keeps the field from
+ * showing a value the server will silently refuse to honour.
+ */
+function normalizeSessionIdleTimeoutHours(value: number | null): number {
+  if (value === null || !Number.isFinite(value)) {
+    return Math.round(Duration.toHours(DEFAULT_PROVIDER_SESSION_IDLE_TIMEOUT));
+  }
+  return Math.min(
+    MAX_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS,
+    Math.max(MIN_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS, Math.round(value)),
+  );
 }
 
 function resetBackgroundActivitySettings() {
@@ -699,6 +723,9 @@ function BackgroundActivityAdvancedDialog({
   const providerHealthRefreshIntervalSeconds = durationToSeconds(
     resolvedBackgroundActivity.providerHealthRefreshInterval,
   );
+  const providerSessionIdleTimeoutHours = Math.round(
+    Duration.toHours(settings.providerSessionIdleTimeout),
+  );
   const hostPowerMonitorActiveIntervalSeconds = durationToSeconds(
     resolvedBackgroundActivity.hostPowerMonitorActiveInterval,
   );
@@ -828,6 +855,41 @@ function BackgroundActivityAdvancedDialog({
                   </NumberFieldGroup>
                 </NumberField>
                 <span className="text-xs text-muted-foreground">seconds</span>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0 space-y-1">
+                <div className="text-sm font-medium">Session idle timeout</div>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Stop an idle provider session after this long. Resuming one re-sends the whole
+                  thread and rebuilds its prompt cache, so short values cost tokens on your next
+                  message. Minimum 1 hour, matching how long the prompt cache lives.
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <NumberField
+                  value={providerSessionIdleTimeoutHours}
+                  min={MIN_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS}
+                  max={MAX_PROVIDER_SESSION_IDLE_TIMEOUT_HOURS}
+                  step={1}
+                  size="sm"
+                  className="w-32"
+                  onValueChange={(value) =>
+                    updateSettings({
+                      providerSessionIdleTimeout: Duration.hours(
+                        normalizeSessionIdleTimeoutHours(value),
+                      ),
+                    })
+                  }
+                >
+                  <NumberFieldGroup>
+                    <NumberFieldDecrement aria-label="Decrease session idle timeout" />
+                    <NumberFieldInput aria-label="Session idle timeout in hours" />
+                    <NumberFieldIncrement aria-label="Increase session idle timeout" />
+                  </NumberFieldGroup>
+                </NumberField>
+                <span className="text-xs text-muted-foreground">hours</span>
               </div>
             </div>
 

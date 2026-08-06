@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -15,11 +16,13 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderValidationError } from "../Errors.ts";
 import { ProviderSessionReaper } from "../Services/ProviderSessionReaper.ts";
 import { ProviderService, type ProviderServiceShape } from "../Services/ProviderService.ts";
@@ -135,11 +138,18 @@ describe("ProviderSessionReaper", () => {
     runtime = null;
   });
 
-  async function createHarness(input: {
+  /**
+   * The reaper as a plain layer, so tests can run on `it.live` without
+   * standing up a manual `ManagedRuntime`.
+   */
+  function makeHarnessLayer(input: {
     readonly readModel: ReturnType<typeof makeReadModel>;
     readonly stopSessionImplementation?: (input: {
       readonly threadId: ThreadId;
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
+    readonly settingsOverrides?: Parameters<typeof ServerSettingsService.layerTest>[0];
+    /** Omit the explicit override so the configured setting drives the threshold. */
+    readonly useConfiguredThreshold?: boolean;
   }) {
     const stoppedThreadIds = new Set<ThreadId>();
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
@@ -184,7 +194,7 @@ describe("ProviderSessionReaper", () => {
       Layer.provide(runtimeRepositoryLayer),
     );
     const layer = makeProviderSessionReaperLive({
-      inactivityThresholdMs: 1_000,
+      ...(input.useConfiguredThreshold ? {} : { inactivityThresholdMs: 1_000 }),
       sweepIntervalMs: 60_000,
     }).pipe(
       Layer.provideMerge(providerSessionDirectoryLayer),
@@ -216,10 +226,16 @@ describe("ProviderSessionReaper", () => {
         }),
       ),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(ServerSettingsService.layerTest(input.settingsOverrides ?? {})),
     );
 
-    runtime = ManagedRuntime.make(layer);
-    return { stopSession, stoppedThreadIds };
+    return { layer, stopSession, stoppedThreadIds };
+  }
+
+  async function createHarness(input: Parameters<typeof makeHarnessLayer>[0]) {
+    const harness = makeHarnessLayer(input);
+    runtime = ManagedRuntime.make(harness.layer);
+    return { stopSession: harness.stopSession, stoppedThreadIds: harness.stoppedThreadIds };
   }
 
   it("reaps stale persisted sessions without active turns", async () => {
@@ -368,6 +384,104 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
     expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  effectIt.live("keeps sessions alive for the configured idle timeout", () => {
+    const threadId = ThreadId.make("thread-reaper-configured-timeout");
+    const harness = makeHarnessLayer({
+      useConfiguredThreshold: true,
+      settingsOverrides: { providerSessionIdleTimeout: Duration.hours(8) },
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      ]),
+    });
+
+    return Effect.gen(function* () {
+      const repository = yield* Effect.service(
+        ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      );
+      const now = yield* DateTime.now;
+
+      yield* repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        // Two hours idle: reaped under the old 30 minute default, kept here.
+        lastSeenAt: DateTime.formatIso(DateTime.subtract(now, { hours: 2 })),
+        resumeCursor: { opaque: "resume-configured-timeout" },
+        runtimePayload: null,
+      });
+
+      const reaper = yield* Effect.service(ProviderSessionReaper);
+      yield* reaper.start();
+      yield* drainFibers;
+
+      expect(harness.stopSession).not.toHaveBeenCalled();
+    }).pipe(Effect.scoped, Effect.provide(harness.layer));
+  });
+
+  effectIt.live("clamps a sub-hour configured timeout up to the prompt-cache floor", () => {
+    const threadId = ThreadId.make("thread-reaper-clamped-timeout");
+    const harness = makeHarnessLayer({
+      useConfiguredThreshold: true,
+      // Below MIN_PROVIDER_SESSION_IDLE_TIMEOUT: reaping here would kill
+      // sessions whose prompt cache is still live and free to reuse.
+      settingsOverrides: { providerSessionIdleTimeout: Duration.minutes(5) },
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      ]),
+    });
+
+    return Effect.gen(function* () {
+      const repository = yield* Effect.service(
+        ProviderSessionRuntime.ProviderSessionRuntimeRepository,
+      );
+      const now = yield* DateTime.now;
+
+      yield* repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        // Well past the configured 5 minutes, well inside the 1 hour floor.
+        lastSeenAt: DateTime.formatIso(DateTime.subtract(now, { minutes: 40 })),
+        resumeCursor: { opaque: "resume-clamped-timeout" },
+        runtimePayload: null,
+      });
+
+      const reaper = yield* Effect.service(ProviderSessionReaper);
+      yield* reaper.start();
+      yield* drainFibers;
+
+      expect(harness.stopSession).not.toHaveBeenCalled();
+    }).pipe(Effect.scoped, Effect.provide(harness.layer));
   });
 
   it("skips persisted sessions that are already marked stopped", async () => {

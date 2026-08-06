@@ -432,6 +432,23 @@ export type SourceControlWritingStyleSettings = typeof SourceControlWritingStyle
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 export const DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL = Duration.minutes(5);
 
+/**
+ * How long a provider session may sit idle — no active turn, no traffic —
+ * before the session reaper stops it.
+ *
+ * Reaping is not free: the next message has to resume the session, which
+ * re-ingests the whole transcript and rewrites the prompt-cache prefix at the
+ * 1.25x cache-creation rate. On a large thread that is hundreds of thousands
+ * of tokens billed before the model produces a single word.
+ *
+ * Anthropic's prompt cache holds for one hour, so anything below that reaps
+ * sessions whose cache is still live and would have been reused for free.
+ * The default sits well clear of that window; the floor enforces it.
+ */
+export const MIN_PROVIDER_SESSION_IDLE_TIMEOUT = Duration.hours(1);
+export const MAX_PROVIDER_SESSION_IDLE_TIMEOUT = Duration.hours(72);
+export const DEFAULT_PROVIDER_SESSION_IDLE_TIMEOUT = Duration.hours(8);
+
 export const BackgroundActivityProfile = Schema.Literals([
   "balanced",
   "performance",
@@ -485,6 +502,11 @@ export const ServerSettings = Schema.Struct({
   providerHealthRefreshInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL)),
+    ),
+  ),
+  providerSessionIdleTimeout: Schema.DurationFromMillis.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed(Duration.toMillis(DEFAULT_PROVIDER_SESSION_IDLE_TIMEOUT)),
     ),
   ),
   backgroundActivityProfile: BackgroundActivityProfile.pipe(
@@ -647,6 +669,7 @@ export const ServerSettingsPatch = Schema.Struct({
   ),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   providerHealthRefreshInterval: Schema.optionalKey(Schema.DurationFromMillis),
+  providerSessionIdleTimeout: Schema.optionalKey(Schema.DurationFromMillis),
   backgroundActivityProfile: Schema.optionalKey(BackgroundActivityProfile),
   defaultThreadEnvMode: Schema.optionalKey(ThreadEnvMode),
   newWorktreesStartFromOrigin: Schema.optionalKey(Schema.Boolean),
