@@ -50,6 +50,10 @@ Two places, in this order of precedence:
    ```
    `peerLoopExecutable` wins over `peerLoopNodeEntry` when both are set.
 
+`local.json` also accepts `peerLoopStopTimeoutSeconds` (or the
+`T3_PEER_LOOP_STOP_TIMEOUT_SECONDS` variable), covered under **Shutting down**
+below.
+
 If none of these is set, T3 Code runs `peer-loop` from `PATH`.
 
 The first source that is _present_ decides, even if its value turns out to be
@@ -75,7 +79,10 @@ read Peer Loop's files and does not read its terminal output.
 - **Start a run**, with the objective that is delivered word for word to the first
   Reviewer turn.
 - **Watch activity** as it happens. Close the laptop, come back an hour later, and
-  the app asks Peer Loop for exactly what it missed — no gaps, nothing twice.
+  the app asks Peer Loop for exactly what it missed — nothing twice, and nothing
+  quietly skipped. If the connection ever cannot keep the feed complete, you are
+  told and the view picks up again from the last point it can vouch for rather
+  than pretending it saw everything.
 - **Send an owner message.** If an agent is mid-turn it is queued and delivered at
   the next Reviewer turn, exactly as it would be if you had typed it into Peer
   Loop's own console. A running tool is never interrupted because you typed
@@ -83,6 +90,19 @@ read Peer Loop's files and does not read its terminal output.
 - **Pause**, which takes effect at the next safe boundary and never mid-turn.
 - **Resume** a paused run.
 - **Resolve an interrupted turn**, by choosing one of Peer Loop's three options.
+
+## Shutting down
+
+Stopping the T3 Code server asks Peer Loop to stop too, and Peer Loop's next safe
+moment is the end of the agent turn it is running. That can be several minutes,
+so the server waits up to ten before it insists — because cutting a Builder off
+mid-task is exactly the situation that leaves you unsure what reached the
+repository.
+
+If your turns legitimately run longer, raise it on this machine with
+`peerLoopStopTimeoutSeconds` in `local.json` (or
+`T3_PEER_LOOP_STOP_TIMEOUT_SECONDS`), anywhere from one minute to one hour.
+Values outside that range are ignored rather than obeyed.
 
 ## Things T3 Code will tell you instead of hiding
 
@@ -104,6 +124,15 @@ read Peer Loop's files and does not read its terminal output.
 - **The bridge stopped.** Your runs are unaffected — Peer Loop's record of them is
   on disk and nothing about them changed. T3 Code says the connection ended and
   waits for you; it does not restart a run to tidy the screen up.
+- **A command timed out.** No answer arrived in time, which is not the same as
+  nothing happening: Peer Loop may have accepted a start, a message or a recovery
+  and finished after T3 Code stopped waiting. So nothing is retried for you.
+  Re-read the run and decide — repeating a start that actually worked would fork
+  the session, and repeating a recovery would replay a Builder task.
+- **Something went wrong with the connection.** You are told which kind of thing —
+  the program could not be started, it sent something unreadable, it stopped —
+  without the filesystem paths or raw output behind it. Those stay on the server,
+  where the person who can act on them already is.
 
 ## What T3 Code will not do
 

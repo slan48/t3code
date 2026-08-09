@@ -12,8 +12,9 @@ import { PeerLoopCommandRefusedError, type PeerLoopError } from "@t3tools/contra
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
-import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
@@ -21,6 +22,28 @@ import * as Schema from "effect/Schema";
 
 import { connect } from "./Bridge.ts";
 import { PEER_LOOP_BRIDGE_ARGS } from "./Command.ts";
+
+/**
+ * Everything a client could read off a typed error, flattened.
+ *
+ * Message plus every own field, so a leak cannot hide in a detail nobody
+ * thought to assert on.
+ */
+const renderPublicError = (error: object): string =>
+  [
+    String((error as { readonly message?: unknown }).message),
+    ...Object.values(error).map(String),
+  ].join(" | ");
+
+/** Read-only liveness probe. Sends no signal; only ever asked about our child. */
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 const isRefusal = Schema.is(PeerLoopCommandRefusedError);
 
@@ -171,26 +194,24 @@ it.layer(NodeServices.layer, { excludeTestServices: true })("Peer Loop bridge tr
 
       yield* connection.request("run.attach", { runId: "run-1", afterSeq: 3 });
 
-      const readThree = (queue: typeof first) =>
-        Stream.runCollect(Stream.take(Stream.fromQueue(queue), 3));
+      const readThree = (feed: typeof first) =>
+        Stream.runCollect(Stream.take(Stream.fromQueue(feed.queue), 3));
 
       const [a, b] = yield* Effect.all([readThree(first), readThree(second)], {
         concurrency: "unbounded",
       });
 
       // Both subscribers see the same notifications: fan-out, not hand-off.
-      assert.deepStrictEqual(
-        a.map((message) => (message.method === "run.event" ? message.params.event.seq : -1)),
-        [4, 5, 6],
-      );
-      assert.deepStrictEqual(
-        b.map((message) => (message.method === "run.event" ? message.params.event.seq : -1)),
-        [4, 5, 6],
-      );
+      const seqOf = (item: (typeof a)[number]): number =>
+        item.kind === "notification" && item.message.method === "run.event"
+          ? item.message.params.event.seq
+          : -1;
+      assert.deepStrictEqual(a.map(seqOf), [4, 5, 6]);
+      assert.deepStrictEqual(b.map(seqOf), [4, 5, 6]);
 
-      // A scoped subscriber's queue is ended when the transport is, so a stream
-      // over it finishes instead of hanging.
-      yield* Queue.size(first as never).pipe(Effect.ignore);
+      // Neither feed lost anything, so neither has to be told to re-attach.
+      assert.isFalse(yield* first.overflowed);
+      assert.isFalse(yield* second.overflowed);
     }),
   );
 
@@ -212,6 +233,224 @@ it.layer(NodeServices.layer, { excludeTestServices: true })("Peer Loop bridge tr
       // And the connection refuses further work instead of hanging.
       const exit = yield* connection.request("health", {}).pipe(Effect.exit);
       assert.isTrue(Exit.isFailure(exit));
+    }),
+  );
+
+  it.effect("keeps a pre-handshake failure in its real category", () =>
+    Effect.gen(function* () {
+      // A child that dies without a word is a transport failure. Calling it an
+      // incompatibility would send an operator to go and fix a version.
+      const exited = yield* fakeCommand("exit-before-ready");
+      const transportFailure = yield* Effect.flip(
+        Effect.asVoid(connect(exited, { handshakeTimeout: Duration.seconds(3) })),
+      );
+      assert.strictEqual(transportFailure._tag, "PeerLoopTransportError");
+
+      // Prose on stdout before the handshake is a protocol failure.
+      const noisy = yield* fakeCommand("garbage-before-ready");
+      const protocolFailure = yield* Effect.flip(
+        Effect.asVoid(connect(noisy, { handshakeTimeout: Duration.seconds(3) })),
+      );
+      assert.strictEqual(protocolFailure._tag, "PeerLoopProtocolError");
+    }),
+  );
+
+  it.effect("refuses a version-1 bridge that is missing a required capability", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("missing-capability");
+      const error = yield* Effect.flip(Effect.asVoid(connect(command)));
+
+      assert.strictEqual(error._tag, "PeerLoopIncompatibleError");
+      // Announcing v1 is a claim; implementing it is the requirement.
+      assert.include(String((error as { readonly detail?: string }).detail), "run.recover");
+    }),
+  );
+
+  it.effect("fails closed on a wrong envelope version after a good handshake", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("wrong-envelope-version");
+      const connection = yield* connect(command);
+
+      const error = yield* Effect.flip(Effect.asVoid(connection.request("health", {})));
+      assert.oneOf(error._tag, ["PeerLoopProtocolError", "PeerLoopTransportError"]);
+
+      const reason = yield* connection.closed;
+      assert.strictEqual(reason._tag, "PeerLoopProtocolError");
+    }),
+  );
+
+  it.effect("fails closed when a response answers a different method", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("method-mismatch");
+      const connection = yield* connect(command);
+
+      const error = yield* Effect.flip(Effect.asVoid(connection.request("health", {})));
+      assert.strictEqual(error._tag, "PeerLoopProtocolError");
+
+      const reason = yield* connection.closed;
+      assert.strictEqual(reason._tag, "PeerLoopProtocolError");
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+    }),
+  );
+
+  it.effect("bounds the enqueue, not just the wait, when the bridge stops reading", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("deaf-stdin");
+      // A short stop bound too: this fixture deliberately never reads stdin, so
+      // closing it is not a signal it can act on.
+      const connection = yield* connect(command, {
+        requestTimeout: Duration.millis(250),
+        stopTimeout: Duration.millis(150),
+      });
+
+      // Enough bytes to fill the OS pipe buffer as well as the server's own
+      // bounded write queue, against a child that never reads. Without the
+      // enqueue inside the bound, these would park forever with no timer.
+      const bulk = "x".repeat(8_192);
+      const errors = yield* Effect.all(
+        Array.from({ length: 120 }, (_, index) =>
+          Effect.flip(
+            Effect.asVoid(
+              connection.request("run.ownerMessage", { runId: `run-${index}`, text: bulk }),
+            ),
+          ),
+        ),
+        { concurrency: "unbounded" },
+      );
+
+      assert.isTrue(errors.every((error) => error._tag === "PeerLoopTimeoutError"));
+      // Nothing is left registered, so a late answer has nothing to resolve.
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+    }),
+  );
+
+  it.effect("marks a timed-out mutation as possibly applied and never retries it", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("never-answers");
+      const connection = yield* connect(command, {
+        requestTimeout: Duration.millis(150),
+        lifecycleRequestTimeout: Duration.millis(150),
+      });
+
+      const read = yield* Effect.flip(Effect.asVoid(connection.request("health", {})));
+      assert.strictEqual(read._tag, "PeerLoopTimeoutError");
+      assert.isFalse((read as { readonly mayHaveApplied?: boolean }).mayHaveApplied);
+
+      const mutation = yield* Effect.flip(
+        Effect.asVoid(connection.request("run.recover", { runId: "run-1", choice: "abandon" })),
+      );
+      assert.strictEqual(mutation._tag, "PeerLoopTimeoutError");
+      assert.isTrue((mutation as { readonly mayHaveApplied?: boolean }).mayHaveApplied);
+      assert.include(mutation.message, "may still have accepted");
+
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+    }),
+  );
+
+  it.effect("forgets a cancelled request and ignores its late answer", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("late-answer");
+      const connection = yield* connect(command);
+
+      // Interrupted while waiting: the registration must go with the caller.
+      const cancelled = yield* Effect.timeoutOption(
+        Effect.asVoid(connection.request("health", {})),
+        Duration.millis(60),
+      );
+      assert.isTrue(Option.isNone(cancelled));
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+
+      // The fixture answers at 400ms. Nothing may resurrect the caller, and the
+      // connection must still be healthy afterwards.
+      yield* Effect.sleep(Duration.millis(500));
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+      const ended = yield* Effect.timeoutOption(connection.closed, Duration.millis(50));
+      assert.isTrue(Option.isNone(ended));
+    }),
+  );
+
+  it.effect("leaves no waiter behind when the transport shuts down", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("never-answers");
+      const scope = yield* Scope.make();
+      const connection = yield* connect(command, {
+        requestTimeout: Duration.seconds(30),
+        stopTimeout: Duration.millis(200),
+      }).pipe(Scope.provide(scope));
+
+      const pending = yield* Effect.forkChild(
+        Effect.exit(Effect.asVoid(connection.request("health", {}))),
+      );
+      yield* Effect.sleep(Duration.millis(60));
+      assert.strictEqual(yield* connection.pendingRequestCount, 1);
+
+      yield* Scope.close(scope, Exit.void);
+
+      const settled = yield* Effect.flatten(Fiber.await(pending));
+      assert.isTrue(Exit.isFailure(settled));
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+    }),
+  );
+
+  it.effect("waits for a mid-turn bridge rather than killing it at ten seconds", () =>
+    Effect.gen(function* () {
+      // The fixture ignores stdin close, exactly like a bridge finishing an
+      // agent turn. The default bound is minutes, so nothing may be terminated
+      // anywhere near the old ten-second boundary.
+      const command = yield* fakeCommand("hangs-on-stop");
+      const scope = yield* Scope.make();
+      const connection = yield* connect(command).pipe(Scope.provide(scope));
+
+      const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void));
+      yield* Effect.sleep(Duration.millis(400));
+
+      assert.isTrue(isProcessAlive(connection.pid));
+      yield* Fiber.interrupt(closing);
+      // Nothing this test started is left running.
+      process.kill(connection.pid, "SIGKILL");
+    }),
+  );
+
+  it.effect("terminates the child it spawned once the injected stop bound elapses", () =>
+    Effect.gen(function* () {
+      const command = yield* fakeCommand("hangs-on-stop");
+      const scope = yield* Scope.make();
+      const connection = yield* connect(command, {
+        stopTimeout: Duration.millis(150),
+      }).pipe(Scope.provide(scope));
+
+      yield* Scope.close(scope, Exit.void);
+      yield* Effect.sleep(Duration.millis(100));
+
+      // Only the handle this server spawned is ever touched; nothing is found
+      // by name, path or pattern.
+      assert.isFalse(isProcessAlive(connection.pid));
+    }),
+  );
+
+  it.effect("keeps the configured path and raw output out of public errors", () =>
+    Effect.gen(function* () {
+      const secretPath = "/Users/nobody/secret-place/peer-loop/dist/cli/main.js";
+      const missing = yield* Effect.flip(
+        Effect.asVoid(
+          connect(
+            {
+              command: process.execPath,
+              args: [secretPath, ...PEER_LOOP_BRIDGE_ARGS],
+              source: "env-node-entry" as const,
+            },
+            { handshakeTimeout: Duration.seconds(3) },
+          ),
+        ),
+      );
+      assert.notInclude(renderPublicError(missing), "secret-place");
+
+      const noisy = yield* fakeCommand("garbage-before-ready");
+      const protocolFailure = yield* Effect.flip(
+        Effect.asVoid(connect(noisy, { handshakeTimeout: Duration.seconds(3) })),
+      );
+      // The offending line said "peer-loop: starting up, please wait".
+      assert.notInclude(renderPublicError(protocolFailure), "please wait");
     }),
   );
 });

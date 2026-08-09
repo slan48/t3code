@@ -46,6 +46,20 @@ import { IsoDateTime, NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from 
 export const PEER_LOOP_PROTOCOL_VERSION = 1;
 
 /**
+ * The envelope version, as a value every message must literally carry.
+ *
+ * A positive integer would have accepted a v2 envelope and then interpreted it
+ * with v1 rules, which is the one thing a version field exists to prevent.
+ * `bridge.ready.params.protocolVersion` is deliberately NOT this: a bridge that
+ * still frames v1 envelopes but announces a newer protocol must be decodable so
+ * it can be classified as incompatible rather than as garbage.
+ */
+export const PeerLoopEnvelopeVersion = Schema.Literal(PEER_LOOP_PROTOCOL_VERSION);
+
+/** The `state.json` schema this build understands. Not any positive integer. */
+export const PEER_LOOP_RUN_STATE_SCHEMA_VERSION = 1;
+
+/**
  * Unmodeled keys, kept verbatim.
  *
  * Applied to the structs Peer Loop is expected to grow. The modeled fields are
@@ -248,7 +262,7 @@ export type PeerLoopAdapterIdentity = typeof PeerLoopAdapterIdentity.Type;
  */
 export const PeerLoopRunStateFile = Schema.StructWithRest(
   Schema.Struct({
-    schemaVersion: PositiveInt,
+    schemaVersion: Schema.Literal(PEER_LOOP_RUN_STATE_SCHEMA_VERSION),
     runId: TrimmedNonEmptyString,
     projectPath: Schema.String,
     state: PeerLoopRunState,
@@ -542,6 +556,37 @@ export const PeerLoopBridgeMethod = Schema.Literals(PEER_LOOP_BRIDGE_METHODS);
 export type PeerLoopBridgeMethod = typeof PeerLoopBridgeMethod.Type;
 
 /**
+ * What a version-1 bridge must offer before T3Code will send it a command.
+ *
+ * Announcing version 1 is not the same as implementing it. A bridge missing a
+ * method this build will call, or a notification it depends on to stay in sync,
+ * is incompatible however it labels itself — and finding that out at the
+ * handshake is far better than finding it out halfway through a run.
+ * Extra methods and notifications are additive and always fine.
+ */
+export const PEER_LOOP_REQUIRED_METHODS = PEER_LOOP_BRIDGE_METHODS;
+export const PEER_LOOP_REQUIRED_NOTIFICATIONS = [
+  "bridge.ready",
+  "run.event",
+  "run.outcome",
+  "run.finished",
+  "run.resync",
+] as const;
+
+/** Names a v1 ready announcement is missing, or empty when it is complete. */
+export function missingPeerLoopCapabilities(health: {
+  readonly methods: readonly string[];
+  readonly notifications: readonly string[];
+}): readonly string[] {
+  const methods = new Set(health.methods);
+  const notifications = new Set(health.notifications);
+  return [
+    ...PEER_LOOP_REQUIRED_METHODS.filter((method) => !methods.has(method)),
+    ...PEER_LOOP_REQUIRED_NOTIFICATIONS.filter((name) => !notifications.has(name)),
+  ];
+}
+
+/**
  * Peer Loop's stable refusal codes.
  *
  * Modeled as a strict union because these are the whole reason the integration
@@ -595,7 +640,7 @@ export type PeerLoopBridgeErrorBody = typeof PeerLoopBridgeErrorBody.Type;
  * the methods that exist before anything is written.
  */
 export const PeerLoopBridgeRequest = Schema.Struct({
-  v: PositiveInt,
+  v: PeerLoopEnvelopeVersion,
   type: Schema.Literal("request"),
   /** Echoed on the response. Correlation is the caller's business. */
   id: TrimmedNonEmptyString,
@@ -605,7 +650,7 @@ export const PeerLoopBridgeRequest = Schema.Struct({
 export type PeerLoopBridgeRequest = typeof PeerLoopBridgeRequest.Type;
 
 const bridgeEnvelopeFields = {
-  v: PositiveInt,
+  v: PeerLoopEnvelopeVersion,
   type: Schema.Literal("response"),
   id: Schema.NullOr(Schema.String),
   method: Schema.NullOr(Schema.String),
@@ -633,7 +678,7 @@ export type PeerLoopBridgeResponse = typeof PeerLoopBridgeResponse.Type;
 
 const notification = <M extends string, P extends Schema.Top>(method: M, params: P) =>
   Schema.Struct({
-    v: PositiveInt,
+    v: PeerLoopEnvelopeVersion,
     type: Schema.Literal("notification"),
     method: Schema.Literal(method),
     params,
@@ -800,12 +845,25 @@ export class PeerLoopTransportError extends Schema.TaggedErrorClass<PeerLoopTran
   }
 }
 
+/**
+ * Peer Loop did not answer in time.
+ *
+ * A timeout is the absence of an answer, not evidence of anything. For a
+ * mutation Peer Loop may already have accepted it — started a run, queued an
+ * owner message, resolved an interrupted turn — and finished after T3Code
+ * stopped waiting. So `mayHaveApplied` is true for those, and T3Code never
+ * retries automatically: repeating a `run.start` that actually succeeded would
+ * fork a session, and repeating a `run.recover` would replay a Builder task.
+ * The owner re-reads the run and decides.
+ */
 export class PeerLoopTimeoutError extends Schema.TaggedErrorClass<PeerLoopTimeoutError>()(
   "PeerLoopTimeoutError",
-  { method: Schema.String, timeoutMs: PositiveInt },
+  { method: Schema.String, timeoutMs: PositiveInt, mayHaveApplied: Schema.Boolean },
 ) {
   override get message() {
-    return `Peer Loop did not answer ${this.method} within ${this.timeoutMs}ms.`;
+    return this.mayHaveApplied
+      ? `Peer Loop did not answer ${this.method} within ${this.timeoutMs}ms. It may still have accepted or completed it; nothing was retried.`
+      : `Peer Loop did not answer ${this.method} within ${this.timeoutMs}ms.`;
   }
 }
 

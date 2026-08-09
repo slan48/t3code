@@ -8,9 +8,11 @@
  * commands and Peer Loop's rules, and a UI that guessed at them would be a
  * second, quieter copy of the state machine.
  *
- * Peer Loop's `seq` is per-run, strictly increasing and contiguous, which is
- * what makes all of this cheap: a duplicate is a `seq` we have already seen,
- * and a gap is a `seq` that skipped. Neither is papered over.
+ * Peer Loop's `seq` is per-run and strictly increasing, but NOT contiguous: an
+ * event can be given a number and then fail to be recorded, so a skip is
+ * ordinary data rather than evidence of loss. A duplicate is therefore a `seq`
+ * already seen, and a missing range is only ever something the server or Peer
+ * Loop states outright — never something inferred from arithmetic.
  *
  * @module PeerLoopReducer
  */
@@ -42,12 +44,23 @@ export interface PeerLoopRunView {
   /**
    * The stream is known to be incomplete. Re-subscribe from `afterSeq`.
    *
-   * Set only when the server or Peer Loop says so — never inferred from a quiet
-   * connection.
+   * Set only by an explicit `run-resync`. Never inferred from a sequence skip,
+   * which is legitimate, and never from a quiet connection.
    */
   readonly needsResync: boolean;
   /** Recent activity, oldest first, bounded for a phone's sake. */
   readonly activity: readonly PeerLoopEvent[];
+}
+
+/**
+ * Where a reconnect should resume from.
+ *
+ * Always the view's own cursor, resync or not: after a resync it has already
+ * been rewound to the last safe point, so there is one answer and no chance of
+ * a caller picking the wrong one.
+ */
+export function peerLoopResumeCursor(view: PeerLoopRunView): number {
+  return view.afterSeq;
 }
 
 export function emptyPeerLoopRunView(runId: string, afterSeq = 0): PeerLoopRunView {
@@ -95,15 +108,14 @@ export function applyPeerLoopSubscriptionEvent(
 
     case "run-event": {
       if (event.runId !== view.runId) return view;
-      // Already rendered. A shared replay for another client lands here.
+      // Already rendered. A shared replay for another client lands here, and so
+      // does the backlog after a reconnect.
       if (event.event.seq <= view.afterSeq) return view;
-      // A skipped sequence can only mean the stream lost something, so say so
-      // rather than quietly rendering a feed with a hole in it.
-      const gapped = view.afterSeq > 0 && event.event.seq > view.afterSeq + 1;
+      // A skip is NOT loss: Peer Loop numbers an event before it records it, so
+      // a number can be spent and never appear. Nothing is flagged here.
       return {
         ...view,
         afterSeq: event.event.seq,
-        needsResync: view.needsResync || gapped,
         activity: appendBounded(view.activity, event.event, limit),
       };
     }
@@ -123,12 +135,20 @@ export function applyPeerLoopSubscriptionEvent(
           }
         : view;
 
-    case "run-resync":
-      // Rewind to what the server says it can serve from, and let the caller
-      // re-subscribe. Nothing is discarded: the durable log still has it all.
-      return event.runId === view.runId
-        ? { ...view, needsResync: true, afterSeq: Math.min(view.afterSeq, event.afterSeq) }
-        : view;
+    case "run-resync": {
+      if (event.runId !== view.runId) return view;
+      // Rewind to the last cursor anyone can vouch for, and trim the retained
+      // activity back to match. Keeping events past the safe cursor would make
+      // the next replay append them a second time — and the point of a resync
+      // is that nobody knows what happened after that point.
+      const safe = Math.min(view.afterSeq, event.afterSeq);
+      return {
+        ...view,
+        needsResync: true,
+        afterSeq: safe,
+        activity: view.activity.filter((entry) => entry.seq <= safe),
+      };
+    }
   }
 }
 

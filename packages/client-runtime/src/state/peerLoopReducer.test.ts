@@ -11,6 +11,7 @@ import {
   applyPeerLoopSubscriptionEvent,
   emptyPeerLoopRunView,
   peerLoopAttention,
+  peerLoopResumeCursor,
   peerLoopRunSnapshot,
   type PeerLoopRunView,
 } from "./peerLoopReducer.ts";
@@ -107,24 +108,60 @@ describe("Peer Loop activity", () => {
     expect(reconnected.needsResync).toBe(false);
   });
 
-  it("flags a gap instead of rendering a feed with a hole in it", () => {
+  it("treats a skipped sequence as data, not as loss", () => {
+    // Peer Loop numbers an event before recording it, so a number can be spent
+    // and never appear. Inferring loss here would cry wolf on a healthy run.
     const view = applyAll(emptyPeerLoopRunView(runId), [runEvent(1), runEvent(4)]);
 
-    expect(view.needsResync).toBe(true);
+    expect(view.needsResync).toBe(false);
     expect(view.afterSeq).toBe(4);
+    expect(view.activity.map((entry) => entry.seq)).toEqual([1, 4]);
   });
 
-  it("rewinds the cursor when the server asks for a resync", () => {
+  it("rewinds to the safe cursor and trims past it when told to resync", () => {
     const view = applyAll(emptyPeerLoopRunView(runId), [
       runEvent(1),
       runEvent(2),
+      runEvent(3),
       { kind: "run-resync", runId, afterSeq: 1, reason: "server could not keep up" },
     ]);
 
     expect(view.needsResync).toBe(true);
     expect(view.afterSeq).toBe(1);
-    // Nothing is thrown away: Peer Loop's log still has everything.
-    expect(view.activity.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(peerLoopResumeCursor(view)).toBe(1);
+    // Anything past the safe cursor is dropped: the replay that follows will
+    // send it again, and keeping it would show the same event twice.
+    expect(view.activity.map((entry) => entry.seq)).toEqual([1]);
+  });
+
+  it("replays after a resync without duplicating or going backwards", () => {
+    const resynced = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      runEvent(3),
+      { kind: "run-resync", runId, afterSeq: 2, reason: "re-subscribe" },
+    ]);
+
+    const replayed = applyAll(resynced, [runEvent(3, true), runEvent(5, true), runEvent(6)]);
+
+    expect(replayed.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 5, 6]);
+    expect(replayed.afterSeq).toBe(6);
+    const seqs = replayed.activity.map((entry) => entry.seq);
+    expect([...new Set(seqs)]).toEqual(seqs);
+    expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
+  });
+
+  it("never advances across a range it was told is missing", () => {
+    const view = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 1, reason: "overflow" },
+    ]);
+
+    // The client resumes from 1; anything it had past that is gone and will
+    // arrive again from the durable log.
+    expect(view.afterSeq).toBe(1);
+    expect(view.activity.some((entry) => entry.seq > 1)).toBe(false);
   });
 
   it("keeps retained activity bounded", () => {

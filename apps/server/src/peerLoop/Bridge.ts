@@ -24,6 +24,7 @@
 import {
   PEER_LOOP_PROTOCOL_VERSION,
   PeerLoopBridgeOutbound,
+  missingPeerLoopCapabilities,
   PeerLoopBridgeRequest,
   PeerLoopCommandRefusedError,
   PeerLoopIncompatibleError,
@@ -49,8 +50,36 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import type { PeerLoopCommand } from "./Command.ts";
 
-/** How long a single bridge request may take before it is abandoned. */
+/**
+ * How long an ordinary bridge call may take.
+ *
+ * `health`, `runs.list`, `run.attach` and the control calls are answered from
+ * state Peer Loop already holds, so seconds are generous.
+ */
 export const PEER_LOOP_REQUEST_TIMEOUT = Duration.seconds(30);
+
+/**
+ * How long `run.start` and `run.resume` may take.
+ *
+ * These are not fast calls and pretending otherwise produces a timeout that
+ * means nothing: before Peer Loop answers it takes an exclusive project lease,
+ * runs its duplicate-run preflight, and probes both agent CLIs for their
+ * capabilities — which spawns `codex` and `claude` and waits for them. Two
+ * minutes is a bound on a stuck machine, not an expectation.
+ */
+export const PEER_LOOP_LIFECYCLE_REQUEST_TIMEOUT = Duration.minutes(2);
+
+/** The methods that change something, and may have done so despite a timeout. */
+const MUTATING_METHODS: ReadonlySet<PeerLoopBridgeMethod> = new Set([
+  "run.start",
+  "run.resume",
+  "run.ownerMessage",
+  "run.pause",
+  "run.recover",
+]);
+
+/** The methods that spawn and probe before they answer. */
+const LIFECYCLE_METHODS: ReadonlySet<PeerLoopBridgeMethod> = new Set(["run.start", "run.resume"]);
 
 /** How long the `bridge.ready` handshake may take before the spawn is a failure. */
 export const PEER_LOOP_HANDSHAKE_TIMEOUT = Duration.seconds(15);
@@ -58,10 +87,18 @@ export const PEER_LOOP_HANDSHAKE_TIMEOUT = Duration.seconds(15);
 /**
  * How long a bridge is given to stop itself after stdin closes.
  *
- * Generous, because it may be finishing an agent turn and releasing leases.
- * Finite, because a server shutdown cannot wait forever on a child.
+ * TEN MINUTES, AND THE NUMBER MATTERS. Closing stdin asks Peer Loop to stop at
+ * its next safe boundary — which is the end of the agent turn already running.
+ * Peer Loop's own per-turn timeouts are optional and off by default, so a
+ * Builder turn legitimately runs for many minutes. A ten-*second* bound would
+ * therefore terminate a live turn as a matter of routine, turning an orderly
+ * shutdown into exactly the ambiguous half-applied state the whole integration
+ * is built to avoid.
+ *
+ * Finite all the same: a server cannot wait forever on a child. An operator
+ * whose turns run longer can raise it machine-locally; see `localConfig.ts`.
  */
-export const PEER_LOOP_STOP_TIMEOUT = Duration.seconds(10);
+export const PEER_LOOP_STOP_TIMEOUT = Duration.minutes(10);
 
 /** stderr lines retained for diagnostics. Bounded: this is a tail, not a log. */
 export const PEER_LOOP_STDERR_TAIL_LINES = 40;
@@ -72,10 +109,13 @@ export const PEER_LOOP_STDERR_LINE_CHARS = 500;
 /**
  * How many notifications one subscriber may fall behind by.
  *
- * Sliding rather than unbounded, so a slow client costs bounded memory here
- * instead of growing the server. Dropping the oldest leaves a `seq` gap, which
- * the subscriber detects and answers with a re-attach — the same mechanism Peer
- * Loop already uses for the same problem, rather than a silent hole in a feed.
+ * Bounded rather than sliding, and the difference is the whole point. A sliding
+ * queue drops the oldest entry and says nothing, leaving the reader to *infer*
+ * loss from a sequence gap — and Peer Loop's sequences are strictly increasing
+ * but NOT contiguous, because an event can take a sequence number and then fail
+ * to be recorded. Inferring loss from a skip would cry wolf on a legitimate gap
+ * and stay silent on a real drop. A bounded queue refuses the offer instead, so
+ * the loss is a fact the feed reports rather than a guess.
  */
 export const PEER_LOOP_NOTIFICATION_BUFFER = 1024;
 
@@ -104,24 +144,75 @@ export interface PeerLoopBridgeConnection {
    * Scoped: leaving the scope removes the subscriber. Each one has its own
    * queue so one slow client cannot stall the reader or another client.
    */
-  readonly subscribe: Effect.Effect<
-    Queue.Dequeue<PeerLoopBridgeNotification, Cause.Done>,
-    never,
-    Scope.Scope
-  >;
+  readonly subscribe: Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope>;
   /** Resolves with the reason the transport ended. Never resolves while healthy. */
   readonly closed: Effect.Effect<PeerLoopTransportError | PeerLoopProtocolError>;
-  /** Bounded stderr tail, newest last. Diagnostics only. */
+  /** Bounded local diagnostics tail, newest last. Never sent to a client. */
   readonly stderrTail: Effect.Effect<readonly string[]>;
+  /**
+   * How many requests are still awaiting an answer.
+   *
+   * An inspection seam for tests, so "nothing was stranded" is an assertion
+   * rather than a hope. Not reachable from any RPC and not part of the product
+   * API — nothing outside this module and its tests reads it.
+   */
+  readonly pendingRequestCount: Effect.Effect<number>;
 }
 
+/**
+ * One subscriber's private view of the notification stream.
+ *
+ * `overflowed` is the explicit answer to "did this feed lose something?". It is
+ * a fact recorded at the moment an offer was refused, never reconstructed later
+ * from sequence numbers — see `PEER_LOOP_NOTIFICATION_BUFFER`.
+ */
+export interface PeerLoopNotificationFeed {
+  readonly queue: Queue.Dequeue<PeerLoopFeedItem, Cause.Done>;
+  readonly overflowed: Effect.Effect<boolean>;
+}
+
+/**
+ * What a subscriber reads.
+ *
+ * `ended` is an item rather than a closed queue because ending a queue does not
+ * wake a consumer already parked on it — a reader would sit on a dead transport
+ * forever. Delivering the end as a value is what makes "the bridge went away"
+ * something a stream can actually observe.
+ */
+export type PeerLoopFeedItem =
+  | { readonly kind: "notification"; readonly message: PeerLoopBridgeNotification }
+  | { readonly kind: "ended" };
+
 interface PendingRequest {
-  readonly method: string;
+  readonly method: PeerLoopBridgeMethod;
   readonly deferred: Deferred.Deferred<unknown, PeerLoopError>;
+}
+
+interface SubscriberFeed {
+  readonly queue: Queue.Queue<PeerLoopFeedItem, Cause.Done>;
+  overflowed: boolean;
 }
 
 /** Hoisted: `Schema.is` compiles a checker, and this runs on every read error. */
 const isProtocolError = Schema.is(PeerLoopProtocolError);
+
+/**
+ * What a client is allowed to be told about a transport failure.
+ *
+ * Deliberately fixed strings. The underlying cause names the configured
+ * executable path, and a malformed stdout line can contain anything Peer Loop
+ * was carrying — an owner message, a repository path, a task. Both are useful
+ * locally and neither may cross to a phone on the tailnet, so the detail here
+ * is a category and the specifics stay in bounded local diagnostics.
+ */
+export const PEER_LOOP_PUBLIC_SPAWN_FAILURE =
+  "the Peer Loop bridge could not be started; check the machine-local executable configuration on the server";
+export const PEER_LOOP_PUBLIC_STDIN_FAILURE = "writing to the Peer Loop bridge failed";
+export const PEER_LOOP_PUBLIC_READ_FAILURE = "reading from the Peer Loop bridge failed";
+export const PEER_LOOP_PUBLIC_MALFORMED_LINE =
+  "the Peer Loop bridge wrote a line that is not protocol";
+export const PEER_LOOP_PUBLIC_METHOD_MISMATCH =
+  "the Peer Loop bridge answered a request with a different method";
 
 const truncateLine = (line: string): string =>
   line.length <= PEER_LOOP_STDERR_LINE_CHARS
@@ -140,6 +231,8 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   command: PeerLoopCommand,
   options: {
     readonly requestTimeout?: Duration.Duration;
+    /** Bound for `run.start`/`run.resume`, which probe before they answer. */
+    readonly lifecycleRequestTimeout?: Duration.Duration;
     readonly handshakeTimeout?: Duration.Duration;
     readonly stopTimeout?: Duration.Duration;
   } = {},
@@ -150,6 +243,7 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
 > {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const requestTimeout = options.requestTimeout ?? PEER_LOOP_REQUEST_TIMEOUT;
+  const lifecycleTimeout = options.lifecycleRequestTimeout ?? PEER_LOOP_LIFECYCLE_REQUEST_TIMEOUT;
   const handshakeTimeout = options.handshakeTimeout ?? PEER_LOOP_HANDSHAKE_TIMEOUT;
   const stopTimeout = options.stopTimeout ?? PEER_LOOP_STOP_TIMEOUT;
 
@@ -158,21 +252,45 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   const handle = yield* spawner
     .spawn(ChildProcess.make(command.command, [...command.args], { extendEnv: true }))
     .pipe(
+      // The cause names the configured path. It is exactly what an operator on
+      // this machine needs and exactly what a remote client must not receive,
+      // so it is logged here and the error carries a category instead.
+      Effect.tapError((cause) =>
+        Effect.logWarning("Could not start the Peer Loop bridge.").pipe(
+          Effect.annotateLogs({ cause: Cause.pretty(Cause.fail(cause)) }),
+        ),
+      ),
       Effect.mapError(
-        (cause) =>
-          new PeerLoopTransportError({
-            detail: `could not start the Peer Loop bridge: ${Cause.pretty(Cause.fail(cause))}`,
-            exitCode: null,
-          }),
+        () =>
+          new PeerLoopTransportError({ detail: PEER_LOOP_PUBLIC_SPAWN_FAILURE, exitCode: null }),
       ),
     );
 
   const pending = new Map<string, PendingRequest>();
-  const subscribers = new Set<Queue.Queue<PeerLoopBridgeNotification, Cause.Done>>();
-  const ready = yield* Deferred.make<PeerLoopHealth, PeerLoopIncompatibleError>();
+  const subscribers = new Set<SubscriberFeed>();
+  /**
+   * The handshake, or why there will not be one.
+   *
+   * Typed with all three failures on purpose: a child that died before saying
+   * anything is a transport failure, junk on stdout is a protocol failure, and
+   * only a bridge that actually announced something we cannot speak is an
+   * incompatibility. Collapsing them would tell an operator to fix the wrong
+   * thing.
+   */
+  const ready = yield* Deferred.make<
+    PeerLoopHealth,
+    PeerLoopIncompatibleError | PeerLoopTransportError | PeerLoopProtocolError
+  >();
   const closed = yield* Deferred.make<PeerLoopTransportError | PeerLoopProtocolError>();
-  const stderrLines: string[] = [];
+  const diagnosticLines: string[] = [];
   let nextRequestId = 0;
+
+  /** Append to the bounded local tail. Never sent to a client. */
+  const recordDiagnostic = (line: string): void => {
+    if (line.trim().length === 0) return;
+    diagnosticLines.push(truncateLine(line));
+    if (diagnosticLines.length > PEER_LOOP_STDERR_TAIL_LINES) diagnosticLines.shift();
+  };
 
   /**
    * The child's exit status, observed once and shared.
@@ -190,61 +308,85 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     Effect.forkScoped,
   );
 
-  const stderrTail = Effect.sync(() => [...stderrLines]);
+  const stderrTail = Effect.sync(() => [...diagnosticLines]);
 
-  /** End the transport once, failing everything still waiting on it. */
+  /**
+   * End the transport once, releasing everything still waiting on it.
+   *
+   * ORDER MATTERS AND IT IS NOT THE OBVIOUS ONE. Resolving `closed` wakes the
+   * layer above, which tears this connection's scope down — and that interrupts
+   * the very fiber running this function. So everything that must actually
+   * happen happens first, and `closed` is resolved last, as the announcement
+   * that it already has. Uninterruptible for the same reason: a half-finished
+   * shutdown leaves subscribers parked on a queue nobody will ever write to.
+   */
   const shutdown = Effect.fn("peerLoop.bridge.shutdown")(function* (
     reason: PeerLoopTransportError | PeerLoopProtocolError,
   ) {
     const settled = yield* Deferred.isDone(closed);
     if (settled) return;
-    yield* Deferred.succeed(closed, reason);
-    yield* Deferred.fail(
-      ready,
-      new PeerLoopIncompatibleError({
-        expected: PEER_LOOP_PROTOCOL_VERSION,
-        reported: null,
-        detail: reason.message,
-      }),
-    );
+
+    yield* Deferred.fail(ready, reason);
+
     const waiting = [...pending.values()];
     pending.clear();
     yield* Effect.forEach(waiting, (entry) => Deferred.fail(entry.deferred, reason), {
       discard: true,
     });
-    // Ended, not shut down: a subscriber sees the feed finish cleanly and can
-    // emit its own closing state rather than dying of an interrupted queue.
+
     const feeds = [...subscribers];
     subscribers.clear();
-    yield* Effect.forEach(feeds, (feed) => Queue.end(feed), { discard: true });
-  });
-
-  const subscribe = Effect.gen(function* () {
-    const feed = yield* Queue.sliding<PeerLoopBridgeNotification, Cause.Done>(
-      PEER_LOOP_NOTIFICATION_BUFFER,
-    );
-    const alreadyClosed = yield* Deferred.isDone(closed);
-    if (alreadyClosed) {
-      yield* Queue.end(feed);
-      return feed as Queue.Dequeue<PeerLoopBridgeNotification, Cause.Done>;
+    for (const feed of feeds) {
+      // The value first, so a consumer parked on an empty queue wakes; then the
+      // end, so nothing can be offered afterwards. Ending alone would leave a
+      // parked reader waiting on a transport that is already gone.
+      Queue.offerUnsafe(feed.queue, { kind: "ended" });
+      Queue.endUnsafe(feed.queue);
     }
-    subscribers.add(feed);
-    yield* Effect.addFinalizer(() =>
-      Effect.sync(() => {
-        subscribers.delete(feed);
-      }).pipe(Effect.andThen(Queue.end(feed)), Effect.ignore),
-    );
-    return feed as Queue.Dequeue<PeerLoopBridgeNotification, Cause.Done>;
-  });
+
+    yield* Deferred.succeed(closed, reason);
+  }, Effect.uninterruptible);
+
+  const subscribe: Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope> = Effect.gen(
+    function* () {
+      const queue = yield* Queue.bounded<PeerLoopFeedItem, Cause.Done>(
+        PEER_LOOP_NOTIFICATION_BUFFER,
+      );
+      const feed: SubscriberFeed = { queue, overflowed: false };
+      const handle: PeerLoopNotificationFeed = {
+        queue,
+        overflowed: Effect.sync(() => feed.overflowed),
+      };
+
+      const alreadyClosed = yield* Deferred.isDone(closed);
+      if (alreadyClosed) {
+        yield* Queue.offer(queue, { kind: "ended" });
+        yield* Queue.end(queue);
+        return handle;
+      }
+
+      subscribers.add(feed);
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          subscribers.delete(feed);
+        }).pipe(Effect.andThen(Queue.end(queue)), Effect.ignore),
+      );
+      return handle;
+    },
+  );
 
   const handleMessage = Effect.fn("peerLoop.bridge.handleMessage")(function* (line: string) {
     const message = yield* decodeOutboundLine(line).pipe(
-      Effect.mapError(
-        () =>
-          new PeerLoopProtocolError({
-            detail: `unrecognised protocol line (${truncateLine(line)})`,
-          }),
+      // The line itself can carry anything Peer Loop was transporting — an
+      // owner message, a task, a path — so it is recorded in the bounded local
+      // tail and the error a client sees says only what category of thing went
+      // wrong.
+      Effect.tapError(() =>
+        Effect.sync(() => {
+          recordDiagnostic(`unrecognised protocol line: ${line}`);
+        }),
       ),
+      Effect.mapError(() => new PeerLoopProtocolError({ detail: PEER_LOOP_PUBLIC_MALFORMED_LINE })),
     );
 
     if (message.type === "notification") {
@@ -266,9 +408,18 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
         yield* Deferred.succeed(ready, health);
         return;
       }
-      // Sliding: a subscriber that has stopped reading loses its oldest
-      // notifications and finds out from the `seq` gap. The reader never waits.
-      for (const feed of subscribers) Queue.offerUnsafe(feed, message);
+      // Never waits, and never drops silently. A refused offer means this
+      // subscriber's feed is full; it is marked and ended so the layer above
+      // can tell the client to re-attach from a cursor it can still trust.
+      for (const feed of subscribers) {
+        if (feed.overflowed) continue;
+        if (Queue.offerUnsafe(feed.queue, { kind: "notification", message })) continue;
+        feed.overflowed = true;
+        subscribers.delete(feed);
+        // Full by definition, so the consumer is not parked and will observe
+        // the end once it has drained what it can still be given.
+        Queue.endUnsafe(feed.queue);
+      }
       return;
     }
 
@@ -284,8 +435,22 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     }
 
     const entry = pending.get(message.id);
+    // Already abandoned — a timed-out or cancelled request. Ignored rather than
+    // resolving a caller that has been told this did not answer.
     if (entry === undefined) return;
     pending.delete(message.id);
+
+    // A response that answers a different method than the request it claims to
+    // answer is not something to interpret optimistically: correlation is the
+    // only thing making any of these results meaningful.
+    if (message.method !== entry.method) {
+      recordDiagnostic(
+        `response ${message.id} claimed method ${String(message.method)} for a ${entry.method} request`,
+      );
+      const violation = new PeerLoopProtocolError({ detail: PEER_LOOP_PUBLIC_METHOD_MISMATCH });
+      yield* Deferred.fail(entry.deferred, violation);
+      return yield* shutdown(violation);
+    }
 
     if (message.ok) {
       yield* Deferred.succeed(entry.deferred, message.result);
@@ -304,11 +469,15 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   yield* Stream.fromQueue(stdinQueue).pipe(
     Stream.run(handle.stdin),
     Effect.catch((cause) =>
-      shutdown(
-        new PeerLoopTransportError({
-          detail: `writing to the Peer Loop bridge failed: ${String(cause)}`,
-          exitCode: null,
-        }),
+      Effect.sync(() => recordDiagnostic(`stdin write failed: ${String(cause)}`)).pipe(
+        Effect.andThen(
+          shutdown(
+            new PeerLoopTransportError({
+              detail: PEER_LOOP_PUBLIC_STDIN_FAILURE,
+              exitCode: null,
+            }),
+          ),
+        ),
       ),
     ),
     Effect.forkScoped,
@@ -320,10 +489,19 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     Stream.runForEach((line) => (line.trim().length === 0 ? Effect.void : handleMessage(line))),
     Effect.matchEffect({
       onFailure: (cause) =>
-        shutdown(
-          isProtocolError(cause)
-            ? cause
-            : new PeerLoopTransportError({ detail: String(cause), exitCode: null }),
+        Effect.sync(() => {
+          if (!isProtocolError(cause)) recordDiagnostic(`stdout read failed: ${String(cause)}`);
+        }).pipe(
+          Effect.andThen(
+            shutdown(
+              isProtocolError(cause)
+                ? cause
+                : new PeerLoopTransportError({
+                    detail: PEER_LOOP_PUBLIC_READ_FAILURE,
+                    exitCode: null,
+                  }),
+            ),
+          ),
         ),
       // stdout ending is the child going away. Whatever the exit code says, the
       // transport is over and every waiting request has to be told.
@@ -348,17 +526,30 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   yield* handle.stderr.pipe(
     Stream.decodeText(),
     Stream.splitLines,
-    Stream.runForEach((line) =>
-      Effect.sync(() => {
-        if (line.trim().length === 0) return;
-        stderrLines.push(truncateLine(line));
-        if (stderrLines.length > PEER_LOOP_STDERR_TAIL_LINES) stderrLines.shift();
-      }),
-    ),
+    Stream.runForEach((line) => Effect.sync(() => recordDiagnostic(line))),
     Effect.ignore,
     Effect.forkScoped,
   );
 
+  /**
+   * One request, bounded end to end and cleaned up on every exit.
+   *
+   * THE TIMEOUT COVERS THE ENQUEUE TOO. stdin is a bounded queue, so a bridge
+   * that has stopped reading makes the offer itself block — and a timer started
+   * after the offer would never run. The bound therefore wraps registering,
+   * enqueueing and awaiting as one thing.
+   *
+   * THE PENDING ENTRY IS REMOVED ON EVERY PATH — success, refusal, timeout, a
+   * cancelled caller, a failed enqueue, a transport that ended underneath it.
+   * `ensuring` is what makes that true for interruption, which is the path a
+   * hand-written cleanup always misses. A response that arrives afterwards
+   * finds nothing to resolve and is ignored.
+   *
+   * A TIMED-OUT MUTATION IS NOT RETRIED. Peer Loop may have accepted it and
+   * finished after we stopped waiting; repeating a `run.start` would fork a
+   * session and repeating a `run.recover` would replay a Builder task. The
+   * error says so and the owner decides.
+   */
   const request = Effect.fn("peerLoop.bridge.request")(function* (
     method: PeerLoopBridgeMethod,
     params: Readonly<Record<string, unknown>>,
@@ -368,8 +559,7 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
 
     nextRequestId += 1;
     const id = `t3-${nextRequestId}`;
-    const deferred = yield* Deferred.make<unknown, PeerLoopError>();
-    pending.set(id, { method, deferred });
+    const timeout = LIFECYCLE_METHODS.has(method) ? lifecycleTimeout : requestTimeout;
 
     const line = encodeRequestLine({
       v: PEER_LOOP_PROTOCOL_VERSION,
@@ -378,17 +568,30 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
       method,
       params,
     });
-    yield* Queue.offer(stdinQueue, encoder.encode(`${line}\n`));
 
-    const answered = yield* Deferred.await(deferred).pipe(Effect.timeoutOption(requestTimeout));
+    const exchange = Effect.gen(function* () {
+      const deferred = yield* Deferred.make<unknown, PeerLoopError>();
+      yield* Effect.sync(() => {
+        pending.set(id, { method, deferred });
+      });
+      yield* Queue.offer(stdinQueue, encoder.encode(`${line}\n`));
+      return yield* Deferred.await(deferred);
+    });
+
+    const answered = yield* exchange.pipe(
+      Effect.timeoutOption(timeout),
+      Effect.ensuring(
+        Effect.sync(() => {
+          pending.delete(id);
+        }),
+      ),
+    );
+
     if (Option.isNone(answered)) {
-      // Abandoned, not cancelled: Peer Loop may still act on it. The pending
-      // entry is dropped so a late response is ignored rather than resolving a
-      // caller that has already been told this timed out.
-      pending.delete(id);
       return yield* new PeerLoopTimeoutError({
         method,
-        timeoutMs: Duration.toMillis(requestTimeout),
+        timeoutMs: Duration.toMillis(timeout),
+        mayHaveApplied: MUTATING_METHODS.has(method),
       });
     }
     return answered.value;
@@ -404,8 +607,10 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
    */
   yield* Effect.addFinalizer(() =>
     // An empty chunk before the end: it costs nothing on the wire and it wakes
-    // the drain fiber, which is what actually closes the child's stdin.
-    Queue.offer(stdinQueue, EMPTY_CHUNK).pipe(
+    // a drain fiber parked on an empty queue, which is what actually closes the
+    // child's stdin. Offered UNSAFELY, because a full queue means the drain
+    // fiber is already awake and shutdown must not block waiting for room.
+    Effect.sync(() => Queue.offerUnsafe(stdinQueue, EMPTY_CHUNK)).pipe(
       Effect.andThen(Queue.end(stdinQueue)),
       Effect.andThen(
         Deferred.await(exited).pipe(
@@ -443,6 +648,19 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   }
   const health = announced.value;
 
+  // Announcing version 1 is a claim, not a guarantee. A bridge missing a method
+  // this build calls, or a notification it stays in sync from, is incompatible
+  // whatever it labels itself — and the handshake is a far better place to find
+  // that out than the middle of a run. Extra capabilities are additive.
+  const missing = missingPeerLoopCapabilities(health);
+  if (missing.length > 0) {
+    return yield* new PeerLoopIncompatibleError({
+      expected: PEER_LOOP_PROTOCOL_VERSION,
+      reported: health.protocolVersion,
+      detail: `the bridge announced protocol 1 without: ${missing.join(", ")}`,
+    });
+  }
+
   return {
     pid: Number(handle.pid),
     health,
@@ -450,6 +668,7 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     subscribe,
     closed: Deferred.await(closed),
     stderrTail,
+    pendingRequestCount: Effect.sync(() => pending.size),
   } satisfies PeerLoopBridgeConnection;
 });
 

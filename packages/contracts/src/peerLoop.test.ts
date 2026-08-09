@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import {
+  PEER_LOOP_BRIDGE_METHODS,
   PEER_LOOP_PROTOCOL_VERSION,
   PEER_LOOP_WS_METHODS,
   PeerLoopBridgeErrorBody,
@@ -18,7 +19,9 @@ import {
   PeerLoopRunSummary,
   PeerLoopStartRunInput,
   PeerLoopSubscriptionEvent,
+  PeerLoopTimeoutError,
   isPeerLoopBridgeErrorCode,
+  missingPeerLoopCapabilities,
   isPeerLoopRecoverableHalt,
   isPeerLoopRunTerminal,
 } from "./peerLoop.ts";
@@ -353,5 +356,91 @@ describe("Peer Loop T3 surface", () => {
       expect(WsRpcGroup.requests.has(method)).toBe(true);
     }
     expect(WS_METHODS.peerLoopStatus).toBe(PEER_LOOP_WS_METHODS.status);
+  });
+});
+
+describe("Peer Loop envelope and capability validation", () => {
+  it("accepts only a literal version-1 envelope", () => {
+    const base = {
+      v: 1,
+      type: "response",
+      id: "req-1",
+      method: "health",
+      ok: true,
+      result: {},
+    };
+    expect(decodeOutbound(base).v).toBe(1);
+    // A v2 envelope interpreted with v1 rules is exactly what a version field
+    // exists to prevent.
+    expect(() => decodeOutbound({ ...base, v: 2 })).toThrow();
+    expect(() =>
+      decodeOutbound({ v: 2, type: "notification", method: "run.resync", params: {} }),
+    ).toThrow();
+  });
+
+  it("still decodes a v1 envelope announcing a newer protocol", () => {
+    // Decodable on purpose: a bridge that frames v1 but speaks something newer
+    // has to reach the handshake to be classified as incompatible rather than
+    // dismissed as garbage.
+    const ready = Schema.decodeUnknownSync(PeerLoopBridgeNotification)({
+      v: 1,
+      type: "notification",
+      method: "bridge.ready",
+      params: {
+        protocolVersion: 99,
+        bridge: { name: "peer-loop", pid: 1, host: "h", node: "v24" },
+        peerLoopHome: "/home",
+        methods: [],
+        notifications: [],
+        errorCodes: [],
+        recoveryChoices: [],
+        capabilities: {},
+        liveRuns: [],
+      },
+    });
+    if (ready.method !== "bridge.ready") throw new Error("unreachable");
+    expect(ready.params.protocolVersion).toBe(99);
+  });
+
+  it("accepts only the run-state schema version this build understands", () => {
+    expect(decodeRunState(runStateWire).schemaVersion).toBe(1);
+    expect(() => decodeRunState({ ...runStateWire, schemaVersion: 2 })).toThrow();
+  });
+
+  it("names every required version-1 capability a bridge is missing", () => {
+    const complete = {
+      methods: [...PEER_LOOP_BRIDGE_METHODS],
+      notifications: [
+        "bridge.ready",
+        "run.event",
+        "run.outcome",
+        "run.finished",
+        "run.resync",
+        "something.additive",
+      ],
+    };
+    expect(missingPeerLoopCapabilities(complete)).toEqual([]);
+
+    const partial = {
+      methods: PEER_LOOP_BRIDGE_METHODS.filter((method) => method !== "run.recover"),
+      notifications: ["bridge.ready", "run.event", "run.outcome", "run.finished"],
+    };
+    expect(missingPeerLoopCapabilities(partial)).toEqual(["run.recover", "run.resync"]);
+  });
+
+  it("says a timed-out mutation may still have been applied", () => {
+    const read = new PeerLoopTimeoutError({
+      method: "runs.list",
+      timeoutMs: 30_000,
+      mayHaveApplied: false,
+    });
+    expect(read.message).not.toContain("may still have accepted");
+
+    const mutation = new PeerLoopTimeoutError({
+      method: "run.start",
+      timeoutMs: 120_000,
+      mayHaveApplied: true,
+    });
+    expect(mutation.message).toContain("may still have accepted");
   });
 });

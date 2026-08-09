@@ -66,6 +66,18 @@ export const LocalConfig = Schema.Struct({
    * Lower precedence than `peerLoopExecutable`.
    */
   peerLoopNodeEntry: Schema.optional(Schema.String),
+
+  /**
+   * How long to wait for Peer Loop to stop itself when this server shuts down.
+   *
+   * Closing stdin asks it to stop at the end of the agent turn already running,
+   * and Peer Loop's own per-turn timeouts are off by default, so the wait has to
+   * be measured against real turns rather than against how long a shutdown
+   * usually feels. The default is ten minutes; raise it if your Builder turns
+   * legitimately run longer. Machine-local like everything else here: no RPC
+   * reads or writes it.
+   */
+  peerLoopStopTimeoutSeconds: Schema.optional(Schema.Number),
 });
 export type LocalConfig = typeof LocalConfig.Type;
 

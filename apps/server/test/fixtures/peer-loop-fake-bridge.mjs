@@ -14,6 +14,7 @@
  * exactly the bridge behaviour it is about.
  */
 import * as NodeReadline from "node:readline";
+import * as NodeStream from "node:stream";
 
 const scenario = process.env["T3_PEER_LOOP_FAKE_SCENARIO"] ?? "ready";
 
@@ -24,20 +25,33 @@ const write = (message) => {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 };
 
+/** Scenarios that withhold a required v1 capability. */
+const missingCapability = scenario === "missing-capability";
+
 const health = {
   protocolVersion: scenario === "bad-version" ? 99 : 1,
   bridge: { name: "peer-loop", pid: process.pid, host: "fake-host", node: process.version },
   peerLoopHome: "/fake/.peer-loop",
-  methods: [
-    "health",
-    "runs.list",
-    "run.attach",
-    "run.start",
-    "run.resume",
-    "run.ownerMessage",
-    "run.pause",
-    "run.recover",
-  ],
+  methods: missingCapability
+    ? [
+        "health",
+        "runs.list",
+        "run.attach",
+        "run.start",
+        "run.resume",
+        "run.ownerMessage",
+        "run.pause",
+      ]
+    : [
+        "health",
+        "runs.list",
+        "run.attach",
+        "run.start",
+        "run.resume",
+        "run.ownerMessage",
+        "run.pause",
+        "run.recover",
+      ],
   notifications: ["bridge.ready", "run.event", "run.outcome", "run.finished", "run.resync"],
   errorCodes: ["CONTROL_UNAVAILABLE", "RUN_NOT_FOUND"],
   recoveryChoices: ["resume_to_reviewer", "replay_builder_task", "abandon"],
@@ -117,10 +131,44 @@ const runEvent = (runId, seq, replay) => ({
   },
 });
 
-/** Replay every seq after `afterSeq` up to 5, then one live event at 6. */
+/**
+ * The sequences this run's durable log actually holds.
+ *
+ * `sequence-gap` leaves 3 out on purpose: Peer Loop numbers an event before it
+ * records it, so a number can be spent and never appear. A consumer that treats
+ * the hole as lost data would be wrong about a perfectly healthy run.
+ */
+const LOG_SEQUENCES = scenario === "sequence-gap" ? [1, 2, 4, 5] : [1, 2, 3, 4, 5];
+const HIGH_WATER_MARK = LOG_SEQUENCES[LOG_SEQUENCES.length - 1];
+
+/** Replay everything after `afterSeq`, then one live event at 6. */
 const emitBacklogAndLive = (runId, afterSeq) => {
-  for (let seq = afterSeq + 1; seq <= 5; seq += 1) write(runEvent(runId, seq, true));
-  setTimeout(() => write(runEvent(runId, 6, false)), 5);
+  const backlog = LOG_SEQUENCES.filter((seq) => seq > afterSeq);
+  const step = scenario === "slow-replay" ? 25 : 0;
+
+  backlog.forEach((seq, index) => {
+    if (step === 0) write(runEvent(runId, seq, true));
+    else setTimeout(() => write(runEvent(runId, seq, true)), step * (index + 1));
+  });
+
+  const liveAt = step === 0 ? 5 : step * (backlog.length + 1);
+  setTimeout(() => {
+    write(runEvent(runId, 6, false));
+    if (scenario === "resync") {
+      write({
+        v: 1,
+        type: "notification",
+        method: "run.resync",
+        params: { runId, afterSeq: 4, reason: "the bridge could not keep this stream gapless" },
+      });
+      setTimeout(() => write(runEvent(runId, 7, false)), 5);
+    }
+  }, liveAt);
+};
+
+/** Floods one run with more notifications than a subscriber's feed can hold. */
+const flood = (runId, count) => {
+  for (let index = 0; index < count; index += 1) write(runEvent(runId, 100 + index, false));
 };
 
 const respond = (id, method, result) => {
@@ -174,10 +222,20 @@ const handle = (request) => {
         runId,
         state: runState(runId),
         control,
-        eventHighWaterMark: 5,
+        eventHighWaterMark: HIGH_WATER_MARK,
         replayFromSeq: afterSeq,
         live: true,
       });
+      if (scenario === "overflow") {
+        setTimeout(() => flood(runId, 6_000), 5);
+        return;
+      }
+      if (scenario === "dies-mid-stream") {
+        write(runEvent(runId, 1, true));
+        write(runEvent(runId, 5, true));
+        setTimeout(() => process.exit(9), 40);
+        return;
+      }
       emitBacklogAndLive(runId, afterSeq);
       return;
     }
@@ -206,7 +264,7 @@ const handle = (request) => {
         projectPath,
         state: runState("run-new"),
         control,
-        eventHighWaterMark: 5,
+        eventHighWaterMark: HIGH_WATER_MARK,
         replayFromSeq: 0,
         live: true,
         awaitingOwnerObjective: params["objective"] === undefined,
@@ -220,7 +278,7 @@ const handle = (request) => {
         projectPath: "/repos/demo",
         state: runState(runId, { state: "interrupted" }),
         control,
-        eventHighWaterMark: 5,
+        eventHighWaterMark: HIGH_WATER_MARK,
         replayFromSeq: 0,
         live: true,
         interrupted: true,
@@ -253,7 +311,16 @@ const handle = (request) => {
 
 /* -------------------------------------------------------------- scenarios */
 
-if (scenario === "silent") {
+if (scenario === "exit-before-ready") {
+  // Dies without a word. A transport failure, not a protocol or version one.
+  process.exit(7);
+}
+
+if (scenario === "garbage-before-ready") {
+  // Writes prose where protocol belongs, and never announces itself.
+  process.stdout.write("peer-loop: starting up, please wait\n");
+  setInterval(() => undefined, 1_000);
+} else if (scenario === "silent") {
   // Announces nothing. Exercises the handshake timeout.
   setInterval(() => undefined, 1_000);
 } else {
@@ -272,7 +339,16 @@ if (scenario === "noisy-stderr") {
 
 const pendingOutOfOrder = [];
 
-const lines = NodeReadline.createInterface({ input: process.stdin });
+// `deaf-stdin` never reads: the server's bounded write queue and the OS pipe
+// buffer both fill, so the enqueue itself is what has to be bounded.
+if (scenario === "deaf-stdin") {
+  process.stdin.pause();
+  setInterval(() => undefined, 1_000);
+}
+
+const lines = NodeReadline.createInterface({
+  input: scenario === "deaf-stdin" ? new NodeStream.PassThrough() : process.stdin,
+});
 lines.on("line", (line) => {
   if (line.trim().length === 0) return;
   const request = JSON.parse(line);
@@ -297,10 +373,38 @@ lines.on("line", (line) => {
     return;
   }
 
+  if (scenario === "wrong-envelope-version") {
+    write({ v: 2, type: "response", id: request.id, method: request.method, ok: true, result: {} });
+    return;
+  }
+
+  if (scenario === "method-mismatch") {
+    write({ v: 1, type: "response", id: request.id, method: "run.pause", ok: true, result: {} });
+    return;
+  }
+
+  if (scenario === "never-answers") {
+    // Reads the request and says nothing at all, ever.
+    return;
+  }
+
+  if (scenario === "late-answer") {
+    // Answers long after any caller could still be waiting.
+    setTimeout(() => handle(request), 400);
+    return;
+  }
+
   handle(request);
 });
 
 // stdin ending is how the server asks the bridge to stop.
 lines.on("close", () => {
+  // `hangs-on-stop` models a bridge mid-turn: it has been asked to stop and is
+  // finishing an agent turn first, which is exactly what the stop bound is for.
+  if (scenario === "hangs-on-stop") return;
   process.exit(0);
 });
+
+if (scenario === "hangs-on-stop") {
+  setInterval(() => undefined, 1_000);
+}
