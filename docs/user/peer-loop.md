@@ -80,9 +80,12 @@ read Peer Loop's files and does not read its terminal output.
   Reviewer turn.
 - **Watch activity** as it happens. Close the laptop, come back an hour later, and
   the app asks Peer Loop for exactly what it missed — nothing twice, and nothing
-  quietly skipped. If the connection ever cannot keep the feed complete, you are
-  told and the view picks up again from the last point it can vouch for rather
-  than pretending it saw everything.
+  quietly skipped. Catching up starts the moment Peer Loop answers, so an hour of
+  history arrives as it is read rather than all at once at the end, and the app
+  tells you when you are actually up to date instead of leaving you to guess. If
+  the connection ever cannot keep the feed complete, you are told and the view
+  picks up again from the last point it can vouch for rather than pretending it
+  saw everything. A busy run in another window never costs this one its place.
 - **Send an owner message.** If an agent is mid-turn it is queued and delivered at
   the next Reviewer turn, exactly as it would be if you had typed it into Peer
   Loop's own console. A running tool is never interrupted because you typed

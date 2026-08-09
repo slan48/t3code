@@ -137,7 +137,21 @@ RPC fiber dies when its client disconnects, and an attempt running on that fiber
 would take the other waiters' answer with it and leave a half-started child that
 nothing holds a handle to. So the attempt is forked into the service scope and
 every caller, including the one that installed it, is only ever a waiter.
-Cancelling a waiter cancels that waiter.
+Cancelling a waiter cancels that waiter. Installing the claim and forking the
+runner are one uninterruptible handoff — a cancellation landing between them
+would leave a deferred in the ref with nobody to complete it, and every later
+caller would park on it. Only the wait afterwards is interruptible, which is
+exactly the part a disconnecting client should be able to abandon.
+
+**The connection, its handshake and "this service has stopped" are one value
+under one mutex.** Adoption writes state and publishes a transport status, and
+those have to look like one event to everybody else: with three separate refs,
+shutdown landing between them would release what it found and then let the
+attempt publish a `connected` status and a health snapshot describing a child
+that had already been killed. Adoption refuses outright once the layer has
+stopped, and the caller closes the provisional scope instead — so whichever of
+the two runs second sees the other's work, and every interleaving ends with no
+live entry, no health, a stopped transport and a dead child.
 
 The provisional scope holding the child is closed on every exit that is not an
 adoption — typed failure, defect, rejected handshake, interruption, or the layer
@@ -193,9 +207,14 @@ and then fail to be recorded, so a skip is ordinary data. Nothing in T3 Code may
 infer loss from a gap — doing so would cry wolf on a healthy run and stay silent
 on a real drop.
 
-- Each subscriber has its own **bounded** feed and its own cursor, and forwards
-  only `seq > cursor`. A second client attaching makes Peer Loop replay for
-  _it_; everyone else drops those as duplicates.
+- Each subscriber has its own **bounded, run-filtered** feed and its own cursor,
+  and forwards only `seq > cursor`. A second client attaching makes Peer Loop
+  replay for _it_; everyone else drops those as duplicates.
+- **The run filter is upstream of the bound.** A feed that accepted every run
+  and filtered on the way out would let one busy run fill a quiet run's thousand
+  slots and then tell that client to re-attach over activity it was never
+  watching. Only the four run notifications carrying the subscribed `runId` are
+  retained; transport termination still arrives.
 - Loss is a fact, never an inference. A bounded queue _refuses_ an offer when it
   is full, and that refusal is recorded on the feed. The subscription then emits
   one `run-resync` carrying the last cursor it can vouch for and ends, so the
@@ -205,11 +224,11 @@ on a real drop.
   nobody can account for.
 - **Attaches are serialised per run.** Peer Loop keeps one attachment per run, so
   a second `run.attach` mid-replay supersedes the first and leaves that
-  subscriber silent. A per-run gate is held for the attach and for the replay it
-  starts, released when the stream reaches the `eventHighWaterMark` the attach
-  itself reported — authoritative, unlike counting events, which is not possible
-  when sequences can skip. The gate is reference-counted and disappears with its
-  last user, so arbitrary run ids cannot grow a map.
+  subscriber silent. A per-run gate is taken before the attach and held until the
+  replay reaches the `eventHighWaterMark` the attach itself reported —
+  authoritative, unlike counting events, which is not possible when sequences can
+  skip. The gate is reference-counted and disappears with its last user, so
+  arbitrary run ids cannot grow a map.
 - **Finding or creating that gate is one synchronous step.** Building the
   semaphore with an effect meant a lookup miss, a yield, and only then the write,
   so two first attachments for the same run could each miss and each build a gate
@@ -217,15 +236,75 @@ on a real drop.
   uninterruptibly and returned against the exact slot it was taken from, so a
   caller cancelled mid-attach can neither leak a reference nor hand back one it
   never held.
-- A subscription whose bridge dies ends with `interrupted` (or `stopped` on a
-  clean server shutdown), never with the stale `connected` a plain read of the
-  transport ref would still be showing. The transport end arrives as an item on
-  the feed rather than as a closed queue, because ending a queue does not wake a
-  consumer already parked on it.
+- A subscription whose bridge dies **after** it reached its boundary ends with
+  `interrupted` (or `stopped` on a clean server shutdown), never with the stale
+  `connected` a plain read of the transport ref would still be showing. One that
+  dies before its boundary ends with a resync instead: nothing was completed,
+  and saying only "the connection went away" would leave the client believing it
+  had the whole story. The transport end arrives as an item on the feed rather
+  than as a closed queue, because ending a queue does not wake a consumer
+  already parked on it.
 
 The server keeps transport state and cursors, and nothing else. There is no event
 history here: Peer Loop's log is the durable record, and a client that missed
 activity re-attaches from its own `afterSeq`.
+
+### Delivery starts when Peer Loop answers, not when the replay ends
+
+The order inside one attach is the design, and it used to be wrong in a way that
+made large backlogs undeliverable:
+
+1. take a reference to the run's gate and then its single permit;
+2. **only then** create the boundary watcher and the client's feed. Creating
+   them earlier makes a subscriber queued behind another attach bank the
+   _previous_ subscriber's replay and spend its whole bound on events it will
+   drop as duplicates;
+3. send `run.attach`, validate the answer;
+4. **return.** The stream is available before a single backlog notification has
+   been read. The old ordering awaited the whole replay first, so any backlog
+   larger than one feed's bound overflowed unread — the client could not consume
+   until the thing filling its queue had finished;
+5. the permit stays with a bounded, service-owned guard fiber until the replay
+   reaches its boundary. The guard has its own run-filtered feed and drains as
+   fast as the bridge writes, so holding a run's attachment never depends on how
+   fast a phone is reading.
+
+`peerLoop.attachRun` uses the same path with no client feed: it returns its
+validated snapshot at once, and its guard still holds the permit so the next
+attach cannot supersede a replay that is still running. It has no subscription
+to tell, so its boundary outcome goes to a bounded local record rather than
+being dropped.
+
+### Every boundary outcome is acted on
+
+Success is only two things: the attach reported a boundary the client is already
+past, or an event for that run arrived with a sequence at or beyond it. Never a
+count — sequences skip, so the length of a replay is not knowable in advance.
+
+Everything else is a distinct failure and is kept apart, because they call for
+different words and collapsing them would make "we stopped waiting" and "Peer
+Loop said its own stream had a hole" the same sentence: `peer-resync`,
+`boundary-overflow` (the guard's feed), `transport-ended`, `timeout` and
+`cancelled`. On any of them the permit is released and each affected
+subscription ends with exactly **one** `run-resync`, at a cursor it has actually
+delivered. Nothing follows it. The timeout is a recovery threshold, not a way to
+let the next attach in quietly.
+
+### `run-synced`
+
+A T3 transport fact, not a Peer Loop one — it says nothing about the run. It
+exists because "the backlog is behind you" is otherwise unknowable to a client:
+sequences skip, so a client cannot compute it, and the first replayed event
+certainly does not prove it. Without it a `needsResync` set by a resync could
+never be cleared, and a reattachment that legitimately had nothing to replay
+would look permanently incomplete.
+
+Emitted at most once per subscription, only after that subscriber has delivered
+through its own attach's `eventHighWaterMark`, or immediately when its opening
+cursor was already past it. Never after a resync, an overflow, a timeout or a
+transport interruption. The client reducer treats it as an acknowledgement: it
+clears `needsResync` and does not touch the cursor, and it ignores a fact
+claiming a cursor the client never reached or a boundary it has not got to.
 
 ## What a client is allowed to read
 
@@ -285,9 +364,16 @@ staggering them. Injected durations keep the stop and replay bounds measurable i
 milliseconds, and a bridge-side `beforeRegisterRequest` seam parks a request in
 the one window where it could have registered after a shutdown.
 
-The bridge's `pendingRequestCount` and the service's `replaySlotCount` and
-`peakConcurrentReplays` are inspection seams for tests only — none is an RPC or
-part of the product API.
+The bridge's `pendingRequestCount` and the service's `replaySlotCount`,
+`peakSameRunReplays` and `recentBoundaryOutcomes` are inspection seams for tests
+only — none is an RPC or part of the product API. `peakSameRunReplays` counts
+inside **one run's** gate: a global count would read 2 for two different runs
+replaying at once, which is correct behaviour, and would therefore say nothing
+about the invariant that matters.
+
+Two service seams, `beforeForkAttempt` and `beforeAdoptConnection`, park an
+attempt in the two windows where a cancellation or a shutdown would otherwise be
+a matter of scheduler luck.
 
 These tests need real timers — they wait on an actual subprocess — so they run
 under `it.layer(..., { excludeTestServices: true })`. The default `it.effect`

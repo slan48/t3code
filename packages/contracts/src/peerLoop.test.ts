@@ -30,6 +30,7 @@ import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
 const decodeOutbound = Schema.decodeUnknownSync(PeerLoopBridgeOutbound);
 const decodeEvent = Schema.decodeUnknownSync(PeerLoopEvent);
 const decodeRunState = Schema.decodeUnknownSync(PeerLoopRunStateFile);
+const decodeSubscriptionEvent = Schema.decodeUnknownSync(PeerLoopSubscriptionEvent);
 
 const adapters = {
   reviewer: "codex",
@@ -335,10 +336,42 @@ describe("Peer Loop T3 surface", () => {
         reason: "terminal",
       },
       { kind: "run-resync", runId: "run-1", afterSeq: 3, reason: "re-attach" },
+      { kind: "run-synced", runId: "run-1", afterSeq: 5, eventHighWaterMark: 5 },
     ];
     for (const wire of kinds) {
       expect(Schema.decodeUnknownSync(PeerLoopSubscriptionEvent)(wire).kind).toBe(wire.kind);
     }
+  });
+
+  it("carries both cursors on the catch-up fact, and nothing else", () => {
+    // A T3 transport fact. Anything resembling a run decision here would be
+    // this server deciding something on Peer Loop's behalf.
+    const decoded = decodeSubscriptionEvent({
+      kind: "run-synced",
+      runId: "run-1",
+      afterSeq: 12,
+      eventHighWaterMark: 12,
+    });
+    expect(decoded).toStrictEqual({
+      kind: "run-synced",
+      runId: "run-1",
+      afterSeq: 12,
+      eventHighWaterMark: 12,
+    });
+  });
+
+  it("refuses a catch-up fact with a negative or missing cursor", () => {
+    expect(() =>
+      decodeSubscriptionEvent({
+        kind: "run-synced",
+        runId: "run-1",
+        afterSeq: -1,
+        eventHighWaterMark: 5,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeSubscriptionEvent({ kind: "run-synced", runId: "run-1", afterSeq: 5 }),
+    ).toThrow();
   });
 
   it("carries a refusal code through the typed T3 error", () => {

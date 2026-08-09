@@ -145,6 +145,18 @@ export interface PeerLoopBridgeConnection {
    * queue so one slow client cannot stall the reader or another client.
    */
   readonly subscribe: Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope>;
+  /**
+   * The same, restricted to one run before the bound is applied.
+   *
+   * THE FILTER IS UPSTREAM OF THE QUEUE, WHICH IS THE WHOLE POINT. A feed that
+   * accepted every run and filtered on the way out would let a busy run fill a
+   * quiet run's thousand slots and force that subscriber to resync over
+   * activity it was never watching. Only the four run notifications carrying
+   * this `runId` are retained; transport termination still arrives.
+   */
+  readonly subscribeRun: (
+    runId: string,
+  ) => Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope>;
   /** Resolves with the reason the transport ended. Never resolves while healthy. */
   readonly closed: Effect.Effect<PeerLoopTransportError | PeerLoopProtocolError>;
   /** Bounded local diagnostics tail, newest last. Never sent to a client. */
@@ -190,8 +202,14 @@ interface PendingRequest {
 
 interface SubscriberFeed {
   readonly queue: Queue.Queue<PeerLoopFeedItem, Cause.Done>;
+  /** Retain only this run's notifications, or everything when null. */
+  readonly runId: string | null;
   overflowed: boolean;
 }
+
+/** Every notification a subscriber can be offered carries the run it is about. */
+const notificationRunId = (message: PeerLoopBridgeNotification): string | null =>
+  message.method === "bridge.ready" ? null : message.params.runId;
 
 /** Hoisted: `Schema.is` compiles a checker, and this runs on every read error. */
 const isProtocolError = Schema.is(PeerLoopProtocolError);
@@ -404,12 +422,14 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     yield* Deferred.succeed(closed, reason);
   }, Effect.uninterruptible);
 
-  const subscribe: Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope> = Effect.gen(
-    function* () {
+  const subscribeFiltered = (
+    runId: string | null,
+  ): Effect.Effect<PeerLoopNotificationFeed, never, Scope.Scope> =>
+    Effect.gen(function* () {
       const queue = yield* Queue.bounded<PeerLoopFeedItem, Cause.Done>(
         PEER_LOOP_NOTIFICATION_BUFFER,
       );
-      const feed: SubscriberFeed = { queue, overflowed: false };
+      const feed: SubscriberFeed = { queue, runId, overflowed: false };
       const handle: PeerLoopNotificationFeed = {
         queue,
         overflowed: Effect.sync(() => feed.overflowed),
@@ -431,8 +451,10 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
         }).pipe(Effect.andThen(Queue.end(queue)), Effect.ignore),
       );
       return handle;
-    },
-  );
+    });
+
+  const subscribe = subscribeFiltered(null);
+  const subscribeRun = (runId: string) => subscribeFiltered(runId);
 
   const handleMessage = Effect.fn("peerLoop.bridge.handleMessage")(function* (line: string) {
     const message = yield* decodeOutboundLine(line).pipe(
@@ -470,8 +492,14 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
       // Never waits, and never drops silently. A refused offer means this
       // subscriber's feed is full; it is marked and ended so the layer above
       // can tell the client to re-attach from a cursor it can still trust.
+      //
+      // The run filter is applied HERE, before the bound: a subscriber watching
+      // one run must not spend its capacity on another run's activity, and must
+      // certainly not be told to resync because of it.
+      const runId = notificationRunId(message);
       for (const feed of subscribers) {
         if (feed.overflowed) continue;
+        if (feed.runId !== null && feed.runId !== runId) continue;
         if (Queue.offerUnsafe(feed.queue, { kind: "notification", message })) continue;
         feed.overflowed = true;
         subscribers.delete(feed);
@@ -730,6 +758,7 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     health,
     request,
     subscribe,
+    subscribeRun,
     closed: Deferred.await(closed),
     stderrTail,
     pendingRequestCount: Effect.sync(() => pending.size),

@@ -185,6 +185,114 @@ describe("Peer Loop activity", () => {
   });
 });
 
+const synced = (afterSeq: number, eventHighWaterMark: number): PeerLoopSubscriptionEvent => ({
+  kind: "run-synced",
+  runId,
+  afterSeq,
+  eventHighWaterMark,
+});
+
+describe("Peer Loop catch-up", () => {
+  it("clears nothing on a fresh view: there was nothing to clear", () => {
+    const view = applyAll(emptyPeerLoopRunView(runId), [synced(0, 0)]);
+    expect(view.needsResync).toBe(false);
+    expect(view.afterSeq).toBe(0);
+  });
+
+  it("clears the flag when a reattachment had nothing to replay", () => {
+    const resynced = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 2, reason: "overflow" },
+    ]);
+    expect(resynced.needsResync).toBe(true);
+
+    // Reattached at 2 with the boundary already at 2. Nothing arrives, and the
+    // client must not be left believing its view is incomplete for ever.
+    const caughtUp = applyAll(resynced, [synced(2, 2)]);
+    expect(caughtUp.needsResync).toBe(false);
+    expect(caughtUp.afterSeq).toBe(2);
+  });
+
+  it("keeps the flag set throughout a partial replay", () => {
+    const resynced = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      runEvent(3),
+      { kind: "run-resync", runId, afterSeq: 1, reason: "server could not keep up" },
+    ]);
+
+    // Events arriving is not the same as the replay having finished, and the
+    // first replayed event proves nothing at all about the rest.
+    const partway = applyAll(resynced, [runEvent(2, true), runEvent(3, true)]);
+    expect(partway.needsResync).toBe(true);
+    expect(partway.afterSeq).toBe(3);
+
+    const finished = applyAll(partway, [runEvent(5, true), synced(5, 5)]);
+    expect(finished.needsResync).toBe(false);
+    expect(finished.afterSeq).toBe(5);
+    expect(finished.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 5]);
+  });
+
+  it("ignores a premature or overreaching catch-up fact", () => {
+    const partway = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 2, reason: "overflow" },
+      runEvent(3, true),
+    ]);
+    expect(partway.needsResync).toBe(true);
+
+    // The boundary is at 9 and this client has delivered 3. Believing it would
+    // clear the one flag telling the owner the view is incomplete.
+    expect(applyAll(partway, [synced(3, 9)]).needsResync).toBe(true);
+    // And a fact claiming a cursor this client never reached is not evidence
+    // about this client at all.
+    expect(applyAll(partway, [synced(9, 3)]).needsResync).toBe(true);
+    // Neither may move the cursor.
+    expect(applyAll(partway, [synced(3, 9), synced(9, 3)]).afterSeq).toBe(3);
+  });
+
+  it("ignores a catch-up fact for another run", () => {
+    const resynced = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      { kind: "run-resync", runId, afterSeq: 1, reason: "overflow" },
+    ]);
+    const other = applyPeerLoopSubscriptionEvent(resynced, {
+      kind: "run-synced",
+      runId: "other",
+      afterSeq: 1,
+      eventHighWaterMark: 1,
+    });
+    expect(other).toBe(resynced);
+  });
+
+  it("sets the flag again on a later resync, and trims to the new safe cursor", () => {
+    const caughtUp = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 2, reason: "first" },
+      runEvent(4, true),
+      runEvent(6, true),
+      synced(6, 6),
+    ]);
+    expect(caughtUp.needsResync).toBe(false);
+    expect(caughtUp.afterSeq).toBe(6);
+
+    const again = applyAll(caughtUp, [
+      { kind: "run-resync", runId, afterSeq: 4, reason: "second" },
+    ]);
+    expect(again.needsResync).toBe(true);
+    expect(again.afterSeq).toBe(4);
+    expect(peerLoopResumeCursor(again)).toBe(4);
+    expect(again.activity.map((entry) => entry.seq)).toEqual([1, 2, 4]);
+
+    // And it stays set until the next replay actually reaches its boundary.
+    expect(applyAll(again, [runEvent(6, true)]).needsResync).toBe(true);
+    expect(applyAll(again, [runEvent(6, true), synced(6, 6)]).needsResync).toBe(false);
+  });
+});
+
 const connected = (changedAt: string) =>
   ({ state: "connected", changedAt, detail: null, protocolVersion: 1 }) as const;
 

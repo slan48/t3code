@@ -139,9 +139,43 @@ const runEvent = (runId, seq, replay) => ({
  * the hole as lost data would be wrong about a perfectly healthy run.
  */
 const LOG_SEQUENCES = scenario === "sequence-gap" ? [1, 2, 4, 5] : [1, 2, 3, 4, 5];
-const HIGH_WATER_MARK = LOG_SEQUENCES[LOG_SEQUENCES.length - 1];
 
-/** Replay everything after `afterSeq`, then one live event at 6. */
+/** More events than one subscriber's feed can hold, by a clear margin. */
+const BIG_BACKLOG = 2_500;
+const FLOOD_FIRST_SEQ = 100;
+const FLOOD_COUNT = 6_000;
+
+/**
+ * The boundary each scenario reports on `run.attach`.
+ *
+ * Scenario-specific because it is the thing the server coordinates on: a flood
+ * that ends at 6099 has to say so, or a subscriber would be declared caught up
+ * on its very first event and the overflow that follows would look like a
+ * success followed by a mystery.
+ */
+const HIGH_WATER_MARK = (() => {
+  switch (scenario) {
+    case "overflow":
+      return FLOOD_FIRST_SEQ + FLOOD_COUNT - 1;
+    case "big-backlog":
+      return BIG_BACKLOG;
+    // Reports a boundary its replay never reaches: the server must give up on a
+    // bound rather than hold this run's attachment for ever.
+    case "never-reaches-boundary":
+      return 9;
+    default:
+      return LOG_SEQUENCES[LOG_SEQUENCES.length - 1];
+  }
+})();
+
+/**
+ * Replay everything after `afterSeq`, then one live event at 6.
+ *
+ * `slow-replay` paces the backlog and emits NO live event. The pacing is what
+ * makes two attaches genuinely overlap; a live event during that window would
+ * be a fixture artefact rather than anything a real bridge does — Peer Loop
+ * writes a replay to stdout in one go, so nothing interleaves with it.
+ */
 const emitBacklogAndLive = (runId, afterSeq) => {
   const backlog = LOG_SEQUENCES.filter((seq) => seq > afterSeq);
   const step = scenario === "slow-replay" ? 25 : 0;
@@ -151,7 +185,9 @@ const emitBacklogAndLive = (runId, afterSeq) => {
     else setTimeout(() => write(runEvent(runId, seq, true)), step * (index + 1));
   });
 
-  const liveAt = step === 0 ? 5 : step * (backlog.length + 1);
+  if (step !== 0) return;
+
+  const liveAt = 5;
   setTimeout(() => {
     write(runEvent(runId, 6, false));
     if (scenario === "resync") {
@@ -168,7 +204,9 @@ const emitBacklogAndLive = (runId, afterSeq) => {
 
 /** Floods one run with more notifications than a subscriber's feed can hold. */
 const flood = (runId, count) => {
-  for (let index = 0; index < count; index += 1) write(runEvent(runId, 100 + index, false));
+  for (let index = 0; index < count; index += 1) {
+    write(runEvent(runId, FLOOD_FIRST_SEQ + index, false));
+  }
 };
 
 const respond = (id, method, result) => {
@@ -227,12 +265,50 @@ const handle = (request) => {
         live: true,
       });
       if (scenario === "overflow") {
-        setTimeout(() => flood(runId, 6_000), 5);
+        setTimeout(() => flood(runId, FLOOD_COUNT), 5);
+        return;
+      }
+      if (scenario === "big-backlog") {
+        // More than the server's per-subscriber bound, written at once. A
+        // subscription that only starts consuming after the replay is over
+        // cannot possibly keep this.
+        for (let seq = afterSeq + 1; seq <= BIG_BACKLOG; seq += 1) {
+          write(runEvent(runId, seq, true));
+        }
+        return;
+      }
+      if (scenario === "never-reaches-boundary") {
+        // Announces a boundary at 9 and stops at 3. The replay is real; it just
+        // never arrives, which is what the bound exists for.
+        for (const seq of [1, 2, 3]) write(runEvent(runId, seq, true));
+        return;
+      }
+      if (scenario === "cross-run-flood") {
+        // One busy run and one quiet one on the same bridge. The quiet run's
+        // subscriber stays open long past the flood, so a feed that accepted
+        // everything and filtered later would be full of the busy run's
+        // activity by the time the quiet run moved again.
+        if (runId === "run-busy") {
+          setTimeout(() => flood(runId, FLOOD_COUNT), 5);
+        } else {
+          for (const seq of LOG_SEQUENCES.filter((value) => value > afterSeq)) {
+            write(runEvent(runId, seq, true));
+          }
+          setTimeout(() => write(runEvent(runId, 6, false)), 400);
+        }
         return;
       }
       if (scenario === "dies-mid-stream") {
         write(runEvent(runId, 1, true));
         write(runEvent(runId, 5, true));
+        setTimeout(() => process.exit(9), 40);
+        return;
+      }
+      if (scenario === "dies-before-boundary") {
+        // Exits partway through a replay: the boundary is never reached and the
+        // subscriber has to be told, not left looking caught up.
+        write(runEvent(runId, 1, true));
+        write(runEvent(runId, 2, true));
         setTimeout(() => process.exit(9), 40);
         return;
       }

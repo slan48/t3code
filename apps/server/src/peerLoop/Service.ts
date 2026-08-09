@@ -39,7 +39,6 @@ import {
   PeerLoopUnavailableError,
   type PeerLoopAttachRunInput,
   type PeerLoopBridgeMethod,
-  type PeerLoopBridgeNotification,
   type PeerLoopError,
   type PeerLoopHealth,
   type PeerLoopListRunsInput,
@@ -62,6 +61,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -73,7 +73,12 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import * as ServerConfig from "../config.ts";
 
-import { connect, type PeerLoopBridgeConnection } from "./Bridge.ts";
+import {
+  connect,
+  type PeerLoopBridgeConnection,
+  type PeerLoopFeedItem,
+  type PeerLoopNotificationFeed,
+} from "./Bridge.ts";
 import { resolvePeerLoopCommand } from "./Command.ts";
 
 /* ------------------------------------------------------------------ types */
@@ -117,14 +122,24 @@ export class PeerLoopService extends Context.Service<
      */
     readonly replaySlotCount: Effect.Effect<number>;
     /**
-     * The most attaches ever inside a per-run replay gate at the same time.
+     * The most attaches ever inside ONE run's replay gate at the same time.
      *
      * The other half of the same inspection seam: `replaySlotCount` proves the
      * coordination map is bounded, this proves the gate in it actually
-     * excludes. Two simultaneous first attachments building two different gates
-     * would show as 2 here and as nothing at all anywhere else. Not an RPC.
+     * excludes. Per run, deliberately — a global count would read 2 for two
+     * different runs replaying at once, which is correct behaviour, and would
+     * therefore say nothing about the invariant that matters. Not an RPC.
      */
-    readonly peakConcurrentReplays: Effect.Effect<number>;
+    readonly peakSameRunReplays: Effect.Effect<number>;
+    /**
+     * How each recent replay boundary ended, newest last and bounded.
+     *
+     * A snapshot-only attach has no subscription to tell, so its boundary
+     * outcome would otherwise be unobservable — including the failures. Local
+     * diagnostics: run id and outcome kind, never a cursor's contents, never
+     * reachable from an RPC.
+     */
+    readonly recentBoundaryOutcomes: Effect.Effect<readonly string[]>;
   }
 >()("t3/peerLoop/Service/PeerLoopService") {}
 
@@ -132,6 +147,27 @@ interface LiveConnection {
   readonly connection: PeerLoopBridgeConnection;
   readonly scope: Scope.Closeable;
 }
+
+/**
+ * The connection, its handshake and whether this service is finished — one
+ * value, changed under one mutex.
+ *
+ * Three separate refs could not express "adopted" as a single event. The layer
+ * finalizer could land between writing `live` and writing `health`, release
+ * what it found, and let the attempt go on to publish a `connected` transport
+ * and a health snapshot for a child that had already been killed. Every
+ * transition here is taken under `lifecycleGate`, so adoption and shutdown are
+ * ordered rather than interleaved: whichever runs second sees the other's work.
+ */
+type PeerLoopLifecycle =
+  | { readonly kind: "idle" }
+  | {
+      readonly kind: "live";
+      readonly entry: LiveConnection;
+      readonly health: PeerLoopHealth;
+    }
+  /** The layer finalizer ran. Terminal: nothing spawns or adopts again. */
+  | { readonly kind: "stopped" };
 
 /**
  * The one attachment Peer Loop keeps per run, guarded on this side.
@@ -152,11 +188,74 @@ interface ConnectionClaim {
 
 interface RunReplaySlot {
   readonly gate: Semaphore.Semaphore;
+  /** Live references to this slot. The entry disappears with the last one. */
   users: number;
+  /** Attaches inside the gate right now. The invariant is that this stays 1. */
+  active: number;
 }
 
 /** How long a replay may hold its run's slot before it is assumed finished. */
 export const PEER_LOOP_REPLAY_BOUNDARY_TIMEOUT = Duration.seconds(30);
+
+/** Recent boundary outcomes retained for local diagnostics. A tail, not a log. */
+export const PEER_LOOP_BOUNDARY_OUTCOME_TAIL = 20;
+
+/**
+ * How a replay boundary ended. Every one of these is acted on.
+ *
+ * Only `synced` means the replay actually reached the high-water mark the
+ * attach reported. The rest are the ways it did not, and they are kept apart
+ * because they call for different words to the owner and because collapsing
+ * them would make "we stopped waiting" indistinguishable from "Peer Loop said
+ * its own stream had a hole".
+ */
+export type PeerLoopBoundaryKind =
+  | "synced"
+  /** Peer Loop said its stream is incomplete. Its cursor wins. */
+  | "peer-resync"
+  /** The service-owned watcher could not keep up. Ours, not Peer Loop's. */
+  | "boundary-overflow"
+  | "transport-ended"
+  | "timeout"
+  /** The service stopped, or the guard was cancelled, before the boundary. */
+  | "cancelled";
+
+export interface PeerLoopBoundaryResult {
+  readonly kind: PeerLoopBoundaryKind;
+  /** Category only. Safe to hand a client verbatim. */
+  readonly reason: string;
+}
+
+const BOUNDARY_REASON: Readonly<Record<Exclude<PeerLoopBoundaryKind, "synced">, string>> = {
+  "peer-resync": "Peer Loop reported that this run's event stream was incomplete",
+  "boundary-overflow":
+    "this server could not follow the replay for this run; re-subscribe from afterSeq",
+  "transport-ended": "the Peer Loop bridge stopped before this replay finished",
+  timeout: "this run's replay did not reach its reported boundary in time",
+  cancelled: "this server stopped following the replay before it finished",
+};
+
+const BOUNDARY_SYNCED: PeerLoopBoundaryResult = { kind: "synced", reason: "" };
+
+const boundaryFailed = (kind: Exclude<PeerLoopBoundaryKind, "synced">): PeerLoopBoundaryResult => ({
+  kind,
+  reason: BOUNDARY_REASON[kind],
+});
+
+/**
+ * The two things a subscription reacts to, in one stream.
+ *
+ * Merging rather than sequencing: the boundary verdict must be able to arrive
+ * while the client is still draining its backlog, and the backlog must keep
+ * flowing while the boundary is still undecided.
+ */
+type ReplayInput =
+  | { readonly source: "feed"; readonly item: PeerLoopFeedItem }
+  | { readonly source: "boundary"; readonly result: PeerLoopBoundaryResult };
+
+/** What a subscriber is told when its own feed could not be kept complete. */
+export const PEER_LOOP_CLIENT_FEED_OVERFLOW =
+  "this server could not retain the event stream for this client; re-subscribe from afterSeq";
 
 /**
  * What a waiter is told when its shared connection attempt did not finish.
@@ -186,6 +285,18 @@ export interface PeerLoopServiceSeams {
     readonly stopTimeout?: Duration.Duration;
   };
   readonly replayBoundaryTimeout?: Duration.Duration;
+  /**
+   * Test-only injection points. Nothing in the product supplies these.
+   *
+   * Both sit in windows that are otherwise a matter of scheduler luck:
+   * `beforeForkAttempt` between installing a connection claim and forking the
+   * runner that has to complete it, and `beforeAdoptConnection` between a
+   * finished handshake and the adoption that publishes it.
+   */
+  readonly testSeams?: {
+    readonly beforeForkAttempt?: Effect.Effect<void>;
+    readonly beforeAdoptConnection?: Effect.Effect<void>;
+  };
 }
 
 export const make = Effect.fn("peerLoop.Service.make")(function* (
@@ -199,10 +310,27 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
   const path = yield* Path.Path;
   const serviceScope = yield* Effect.scope;
 
-  const live = yield* Ref.make<LiveConnection | null>(null);
-  const health = yield* Ref.make<PeerLoopHealth | null>(null);
-  /** Set by the layer finalizer. A stopped service never spawns again. */
-  const stopped = yield* Ref.make(false);
+  const testSeams = seams.testSeams ?? {};
+
+  const lifecycle = yield* Ref.make<PeerLoopLifecycle>({ kind: "idle" });
+  /**
+   * The one mutex every lifecycle transition passes through.
+   *
+   * Adoption, release and shutdown all write the connection state AND publish a
+   * transport status, and those two writes have to look like one event to
+   * everybody else. Without the mutex, shutdown landing between them leaves a
+   * `connected` status describing a child that has already been killed — a
+   * client would be told the bridge is up and every call would fail.
+   */
+  const lifecycleGate = Semaphore.makeUnsafe(1);
+
+  const currentEntry = Effect.map(Ref.get(lifecycle), (state) =>
+    state.kind === "live" ? state.entry : null,
+  );
+  const currentHealth = Effect.map(Ref.get(lifecycle), (state) =>
+    state.kind === "live" ? state.health : null,
+  );
+  const isStopped = Effect.map(Ref.get(lifecycle), (state) => state.kind === "stopped");
   /**
    * The connection attempt in flight, if any.
    *
@@ -242,24 +370,48 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
   });
 
   /**
+   * Publish a finished handshake as the live connection. One transition.
+   *
+   * Refuses, rather than adopting, once the layer has stopped: there would be
+   * no finalizer left to release what it adopted. The caller closes the
+   * provisional scope in that case, which is what makes every interleaving end
+   * with no live entry, no health and a dead child.
+   */
+  const adoptConnection = (entry: LiveConnection, announced: PeerLoopHealth) =>
+    lifecycleGate.withPermits(1)(
+      Effect.gen(function* () {
+        const state = yield* Ref.get(lifecycle);
+        if (state.kind === "stopped") return false;
+        yield* Ref.set(lifecycle, { kind: "live", entry, health: announced });
+        yield* setTransport("connected", null, announced.protocolVersion);
+        return true;
+      }).pipe(Effect.uninterruptible),
+    );
+
+  /**
    * Tear a connection down and say so.
    *
    * Deliberately does not reconnect. Peer Loop's durable state is untouched by
    * its bridge exiting, and reattaching would be T3Code deciding that a run
    * should keep going — which is Peer Loop's call and the owner's, not ours.
+   *
+   * A no-op once the layer has stopped, so a dying bridge cannot overwrite the
+   * terminal state with `interrupted` after shutdown already said `stopped`.
    */
-  const releaseConnection = Effect.fn("peerLoop.releaseConnection")(function* (
+  const releaseConnection = (
     entry: LiveConnection,
     state: "interrupted" | "stopped",
     detail: string | null,
-  ) {
-    const current = yield* Ref.get(live);
-    if (current !== entry) return;
-    yield* Ref.set(live, null);
-    yield* Ref.set(health, null);
-    yield* setTransport(state, detail, null);
-    yield* Scope.close(entry.scope, Exit.void).pipe(Effect.ignore);
-  });
+  ) =>
+    lifecycleGate.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(lifecycle);
+        if (current.kind !== "live" || current.entry !== entry) return;
+        yield* Ref.set(lifecycle, { kind: "idle" });
+        yield* setTransport(state, detail, null);
+        yield* Scope.close(entry.scope, Exit.void).pipe(Effect.ignore);
+      }).pipe(Effect.uninterruptible),
+    );
 
   /**
    * The machine-local executable, resolved once for the life of the service.
@@ -288,7 +440,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
   const openConnection = Effect.gen(function* () {
     // After shutdown there is no scope left to own a child, so a late call
     // must refuse rather than leave an orphan bridge holding project leases.
-    if (yield* Ref.get(stopped)) {
+    if (yield* isStopped) {
       return yield* new PeerLoopUnavailableError({
         reason: "this server is shutting down",
       });
@@ -310,6 +462,16 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         ? undefined
         : Duration.seconds(resolution.stopTimeoutSeconds));
 
+    /**
+     * True once the lifecycle owns this scope, so nothing else may close it.
+     *
+     * Set inside the same uninterruptible step as the adoption. A flag written
+     * afterwards could be skipped by an interrupt landing in between, and the
+     * `onExit` below would then close a scope the lifecycle was still pointing
+     * at — a live entry wrapping a dead child.
+     */
+    let adopted = false;
+
     const adoptable = Effect.gen(function* () {
       const connection = yield* connect(resolution.command, {
         ...connectOptions,
@@ -320,17 +482,22 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         Effect.tapError((error) => setTransport("unavailable", error.message, null)),
       );
 
-      const entry: LiveConnection = { connection, scope };
-      yield* Ref.set(live, entry);
-      yield* Ref.set(health, connection.health);
-      yield* setTransport("connected", null, connection.health.protocolVersion);
+      if (testSeams.beforeAdoptConnection !== undefined) {
+        yield* testSeams.beforeAdoptConnection;
+      }
 
-      // Re-checked AFTER adoption, and the order is what makes it total. The
-      // layer finalizer sets `stopped` and then reads `live`; whichever of the
-      // two runs first, exactly one of them sees the other's write, so a bridge
-      // that finished handshaking during shutdown is always released.
-      if (yield* Ref.get(stopped)) {
-        yield* releaseConnection(entry, "stopped", null);
+      const entry: LiveConnection = { connection, scope };
+      const accepted = yield* adoptConnection(entry, connection.health).pipe(
+        Effect.tap((ok) =>
+          Effect.sync(() => {
+            if (ok) adopted = true;
+          }),
+        ),
+        Effect.uninterruptible,
+      );
+
+      // The layer stopped first. Nothing will release this child but us.
+      if (!accepted) {
         return yield* new PeerLoopUnavailableError({ reason: "this server is shutting down" });
       }
 
@@ -351,7 +518,9 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
 
     return yield* adoptable.pipe(
       Effect.onExit((exit) =>
-        Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, Exit.void).pipe(Effect.ignore),
+        Exit.isSuccess(exit) || adopted
+          ? Effect.void
+          : Scope.close(scope, Exit.void).pipe(Effect.ignore),
       ),
     );
   });
@@ -387,9 +556,9 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     target: Deferred.Deferred<PeerLoopBridgeConnection, PeerLoopError>,
   ) =>
     Effect.gen(function* () {
-      // A connection may have completed between another caller's read of `live`
-      // and this claim being installed.
-      const settled = yield* Ref.get(live);
+      // A connection may have completed between another caller's read of the
+      // lifecycle and this claim being installed.
+      const settled = yield* currentEntry;
       const outcome =
         settled === null
           ? yield* Effect.exit(openConnection)
@@ -425,41 +594,61 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
    *
    * The caller that installs the attempt does not run it; it waits on the
    * result exactly like everyone else.
+   *
+   * INSTALLING AND FORKING ARE ONE UNINTERRUPTIBLE HANDOFF. Cancellation
+   * landing between them would leave a claim in the ref with nobody to complete
+   * it, and every later caller would park on that deferred until the layer went
+   * down. Only the wait afterwards is interruptible — which is the part a
+   * disconnecting client should be able to abandon.
    */
+  const claimConnection = Effect.gen(function* () {
+    const candidate = yield* Deferred.make<PeerLoopBridgeConnection, PeerLoopError>();
+    const claim = yield* Ref.modify(
+      connecting,
+      (
+        current,
+      ): readonly [ConnectionClaim, Deferred.Deferred<PeerLoopBridgeConnection, PeerLoopError>] =>
+        current === null
+          ? [{ opener: true, deferred: candidate }, candidate]
+          : [{ opener: false, deferred: current }, current],
+    );
+
+    if (claim.opener) {
+      if (testSeams.beforeForkAttempt !== undefined) yield* testSeams.beforeForkAttempt;
+      yield* Effect.forkIn(runConnectionAttempt(candidate), serviceScope);
+    }
+
+    return claim.deferred;
+  }).pipe(Effect.uninterruptible);
+
   const ensureConnection: Effect.Effect<PeerLoopBridgeConnection, PeerLoopError> = Effect.gen(
     function* () {
-      const existing = yield* Ref.get(live);
+      const existing = yield* currentEntry;
       if (existing !== null) return existing.connection;
 
       // No claim is installed after shutdown: there is no scope left to own a
       // child, and an orphan bridge would keep holding Peer Loop's leases.
-      if (yield* Ref.get(stopped)) {
+      if (yield* isStopped) {
         return yield* new PeerLoopUnavailableError({ reason: "this server is shutting down" });
       }
 
-      const candidate = yield* Deferred.make<PeerLoopBridgeConnection, PeerLoopError>();
-      const claim = yield* Ref.modify(
-        connecting,
-        (
-          current,
-        ): readonly [ConnectionClaim, Deferred.Deferred<PeerLoopBridgeConnection, PeerLoopError>] =>
-          current === null
-            ? [{ opener: true, deferred: candidate }, candidate]
-            : [{ opener: false, deferred: current }, current],
-      );
-
-      if (claim.opener) yield* Effect.forkIn(runConnectionAttempt(candidate), serviceScope);
-
-      return yield* Deferred.await(claim.deferred);
+      const shared = yield* claimConnection;
+      return yield* Deferred.await(shared);
     },
   );
 
   /* ------------------------------------------------------ replay slots */
 
   const replaySlots = new Map<string, RunReplaySlot>();
-  /** Test seam: the most attaches ever inside a gate at once. Must stay 1. */
-  let concurrentReplays = 0;
-  let peakConcurrentReplays = 0;
+  /** Test seam: the most attaches ever inside ONE run's gate. Must stay 1. */
+  let peakSameRunReplays = 0;
+  /** Bounded local record of how replays ended. Diagnostics; never an RPC. */
+  const boundaryOutcomes: string[] = [];
+
+  const recordBoundaryOutcome = (runId: string, kind: PeerLoopBoundaryKind): void => {
+    boundaryOutcomes.push(`${runId}: ${kind}`);
+    if (boundaryOutcomes.length > PEER_LOOP_BOUNDARY_OUTCOME_TAIL) boundaryOutcomes.shift();
+  };
 
   /**
    * Find or create this run's gate, and take a reference to it.
@@ -477,7 +666,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         existing.users += 1;
         return existing;
       }
-      const slot: RunReplaySlot = { gate: Semaphore.makeUnsafe(1), users: 1 };
+      const slot: RunReplaySlot = { gate: Semaphore.makeUnsafe(1), users: 1, active: 0 };
       replaySlots.set(runId, slot);
       return slot;
     });
@@ -496,86 +685,201 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     });
 
   /**
-   * Attach to a run without cutting anyone else's replay short.
+   * What one attach reached before its guard let the next one in.
    *
-   * The slot is held for the attach AND for the replay it starts, because Peer
-   * Loop keeps one attachment per run: a second attach mid-replay supersedes
-   * the first and leaves whoever asked for it with a stream that simply stops.
-   * The boundary is the `eventHighWaterMark` the attach itself reported —
-   * authoritative, unlike counting events, because Peer Loop's sequences are
-   * strictly increasing but not contiguous and the count is not knowable.
-   *
-   * `acquireUseRelease` rather than a hand-rolled `ensuring`: it takes the
-   * reference uninterruptibly and pairs the release with the exact slot it
-   * took, so a caller cancelled in the window between the two — a client that
-   * disconnected mid-attach — can neither leak a reference nor return one it
-   * never held.
+   * `boundary` is completed exactly once, by the guard, with one of the kinds
+   * above. A subscription races it: on anything other than `synced` it stops at
+   * the cursor it had actually delivered and says so.
    */
-  const attachAndAwaitBoundary = (
-    connection: PeerLoopBridgeConnection,
+  interface AttachHandle {
+    readonly result: PeerLoopAttachResult;
+    readonly clientFeed: PeerLoopNotificationFeed | null;
+    readonly boundary: Deferred.Deferred<PeerLoopBoundaryResult>;
+  }
+
+  /** What a boundary watcher can conclude from one item on its feed. */
+  type BoundarySignal = "reached" | "peer-resync" | "ended";
+
+  /**
+   * Follow one replay to its boundary, then let the next attach in.
+   *
+   * SERVICE-OWNED AND FAST. It has its own run-filtered feed and drains it as
+   * quickly as the bridge produces, so holding the run's permit never depends
+   * on how fast a phone is reading. The subscriber's own feed is untouched by
+   * this, which is what lets delivery start the moment Peer Loop answers.
+   *
+   * Success is only ever one of two things: the attach reported a boundary the
+   * client is already past, or an event for THIS run arrived with a sequence at
+   * or beyond it. Never a count — sequences skip legitimately, so the number of
+   * events in a replay is not knowable in advance.
+   */
+  const runBoundaryGuard = (
     runId: string,
     afterSeq: number,
-  ) =>
+    highWaterMark: number,
+    watcher: PeerLoopNotificationFeed,
+  ): Effect.Effect<PeerLoopBoundaryResult> =>
     Effect.gen(function* () {
-      const watcher = yield* connection.subscribe;
-      const raw = yield* connection.request("run.attach", { runId, afterSeq });
-      const result = yield* decodeAttach(raw).pipe(
-        Effect.mapError(
-          () =>
-            new PeerLoopProtocolError({
-              detail: "the bridge returned a run.attach result this build cannot read",
-            }),
-        ),
+      if (highWaterMark <= afterSeq) return BOUNDARY_SYNCED;
+
+      const signals = yield* Stream.fromQueue(watcher.queue).pipe(
+        Stream.map((item): readonly BoundarySignal[] => {
+          if (item.kind === "ended") return ["ended"];
+          const message = item.message;
+          if (message.method === "run.resync") return ["peer-resync"];
+          if (message.method === "run.event" && message.params.event.seq >= highWaterMark) {
+            return ["reached"];
+          }
+          return [];
+        }),
+        Stream.flattenIterable,
+        Stream.take(1),
+        Stream.runCollect,
+        // Never discarded: `None` here is the timeout, and it is a distinct
+        // outcome from every other way this can end.
+        Effect.timeoutOption(replayBoundaryTimeout),
       );
 
-      if (result.eventHighWaterMark > afterSeq) {
-        // Wait for the replay to reach its own boundary before letting the next
-        // attach for this run supersede it. Bounded, because a run that never
-        // emits again must not hold the slot forever.
-        yield* Stream.fromQueue(watcher.queue).pipe(
-          Stream.takeWhile((item) => item.kind === "notification"),
-          Stream.filter((item) => {
-            const message = (item as { readonly message: PeerLoopBridgeNotification }).message;
-            return (
-              message.method === "run.event" &&
-              message.params.runId === runId &&
-              message.params.event.seq >= result.eventHighWaterMark
-            );
-          }),
-          Stream.take(1),
-          Stream.runDrain,
-          Effect.timeoutOption(replayBoundaryTimeout),
+      if (Option.isNone(signals)) return boundaryFailed("timeout");
+
+      const signal = signals.value[0];
+      if (signal === undefined) {
+        // The feed ended without a verdict. Either this server could not follow
+        // the replay, or the bridge went away; those are not the same thing.
+        return boundaryFailed(
+          (yield* watcher.overflowed) ? "boundary-overflow" : "transport-ended",
         );
       }
+      if (signal === "reached") return BOUNDARY_SYNCED;
+      return boundaryFailed(signal === "peer-resync" ? "peer-resync" : "transport-ended");
+    }).pipe(Effect.withSpan("peerLoop.replayBoundary", { attributes: { runId } }));
 
-      return result;
-    }).pipe(Effect.scoped);
+  /**
+   * Attach to a run, and hand the run's replay permit to a service-owned guard.
+   *
+   * THE ORDER IS THE DESIGN.
+   *
+   *   1. take a reference to the run's gate, then its single permit — so no two
+   *      attaches for one run are ever outstanding at once. Peer Loop keeps one
+   *      attachment per run, and a second `run.attach` mid-replay supersedes the
+   *      first, leaving whoever asked for it with a stream that simply stops;
+   *   2. only THEN create the boundary watcher and, when there is one, the
+   *      client's feed. Creating them earlier would make a queued subscriber
+   *      bank the *previous* subscriber's replay and spend its whole bound on
+   *      events it will drop as duplicates;
+   *   3. send `run.attach` and validate the answer;
+   *   4. return. The caller gets its stream immediately, before a single
+   *      backlog notification has been consumed — which is the difference
+   *      between a large backlog being delivered and it overflowing unread;
+   *   5. the permit stays held by a bounded guard fiber until the replay
+   *      reaches the boundary the attach itself reported, or explicitly fails
+   *      to. It is always released, and the outcome is always recorded.
+   */
+  interface AttachOwnership {
+    readonly slot: RunReplaySlot;
+    readonly guardScope: Scope.Closeable;
+    /** True once the guard fiber owns the permit, the reference and the scope. */
+    handedOff: boolean;
+    /** True once the permit is held, so it is only ever given back once. */
+    holdsPermit: boolean;
+  }
 
-  const attachSerialized = (
+  /** Give back everything an attach took. Runs once: here, or in the guard. */
+  const standDown = (runId: string, owned: AttachOwnership) =>
+    Scope.close(owned.guardScope, Exit.void).pipe(
+      Effect.ignore,
+      Effect.andThen(
+        Effect.suspend(() => {
+          if (!owned.holdsPermit) return Effect.void;
+          owned.holdsPermit = false;
+          owned.slot.active -= 1;
+          return owned.slot.gate.release(1);
+        }),
+      ),
+      Effect.andThen(releaseReplaySlot(runId, owned.slot)),
+    );
+
+  const attachCoordinated = (
     connection: PeerLoopBridgeConnection,
     runId: string,
     afterSeq: number,
-  ) =>
+    wantsClientFeed: boolean,
+  ): Effect.Effect<AttachHandle, PeerLoopError, Scope.Scope> =>
     Effect.acquireUseRelease(
-      acquireReplaySlot(runId),
-      (slot) =>
-        slot.gate.withPermits(1)(
-          // The counters are a test seam and are paired the same way, so an
-          // interrupted attach cannot drift them.
-          Effect.acquireUseRelease(
-            Effect.sync(() => {
-              concurrentReplays += 1;
-              peakConcurrentReplays = Math.max(peakConcurrentReplays, concurrentReplays);
+      // Uninterruptibly, and paired with the release below: a caller cancelled
+      // between taking the reference and installing the cleanup would leak an
+      // entry in the coordination map for a run nobody is watching.
+      Effect.gen(function* () {
+        const slot = yield* acquireReplaySlot(runId);
+        const guardScope = yield* Scope.make();
+        const owned: AttachOwnership = { slot, guardScope, handedOff: false, holdsPermit: false };
+        return owned;
+      }),
+      (owned) =>
+        Effect.gen(function* () {
+          // The wait for the permit stays interruptible — a client queued
+          // behind another replay must be able to disconnect — but taking it
+          // and recording that we hold it are one step, so an interrupt can
+          // never land between them and lose the permit.
+          yield* Effect.uninterruptibleMask((restore) =>
+            restore(owned.slot.gate.take(1)).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  owned.holdsPermit = true;
+                  owned.slot.active += 1;
+                  peakSameRunReplays = Math.max(peakSameRunReplays, owned.slot.active);
+                }),
+              ),
+            ),
+          );
+
+          // Created only now: a subscriber queued behind another attach must
+          // not bank the earlier replay on a feed it opened too early.
+          const watcher = yield* connection
+            .subscribeRun(runId)
+            .pipe(Scope.provide(owned.guardScope));
+          const clientFeed = wantsClientFeed ? yield* connection.subscribeRun(runId) : null;
+
+          const raw = yield* connection.request("run.attach", { runId, afterSeq });
+          const result = yield* decodeAttach(raw).pipe(
+            Effect.mapError(
+              () =>
+                new PeerLoopProtocolError({
+                  detail: "the bridge returned a run.attach result this build cannot read",
+                }),
+            ),
+          );
+
+          const boundary = yield* Deferred.make<PeerLoopBoundaryResult>();
+          const guard = runBoundaryGuard(runId, afterSeq, result.eventHighWaterMark, watcher).pipe(
+            // Cancellation — the layer going down mid-replay — is an outcome
+            // like any other, and the waiting subscription has to hear it.
+            Effect.onExit((exit) => {
+              const settled: PeerLoopBoundaryResult = Exit.isSuccess(exit)
+                ? exit.value
+                : boundaryFailed("cancelled");
+              recordBoundaryOutcome(runId, settled.kind);
+              return Deferred.succeed(boundary, settled);
             }),
-            () => attachAndAwaitBoundary(connection, runId, afterSeq),
-            () =>
+            Effect.ensuring(standDown(runId, owned)),
+            Effect.asVoid,
+          );
+
+          // The handoff, uninterruptible so the permit is never owned by
+          // nobody: either this fiber still holds it, or the guard does.
+          yield* Effect.forkIn(guard, serviceScope).pipe(
+            Effect.andThen(
               Effect.sync(() => {
-                concurrentReplays -= 1;
+                owned.handedOff = true;
               }),
-          ),
-        ),
-      (slot) => releaseReplaySlot(runId, slot),
-    ).pipe(Effect.withSpan("peerLoop.attach"));
+            ),
+            Effect.uninterruptible,
+          );
+
+          return { result, clientFeed, boundary } satisfies AttachHandle;
+        }),
+      (owned) => (owned.handedOff ? Effect.void : standDown(runId, owned)),
+    ).pipe(Effect.withSpan("peerLoop.attach", { attributes: { runId } }));
 
   /** One bridge call, with its result validated against the contract. */
   const call = <A>(
@@ -610,7 +914,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
       configured,
       executableSource: source,
       transport: yield* SubscriptionRef.get(transport),
-      health: yield* Ref.get(health),
+      health: yield* currentHealth,
     } satisfies PeerLoopStatusResult;
   });
 
@@ -623,9 +927,24 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     return { runs: result.runs, unreadable: result.unreadable } satisfies PeerLoopListRunsResult;
   });
 
+  /**
+   * A snapshot, back as soon as Peer Loop has answered.
+   *
+   * The guard keeps the run's permit until the replay this attach started
+   * reaches its boundary, so the next attach cannot supersede it — but no
+   * caller waits for that. There is no subscription here to tell about the
+   * boundary, so its outcome goes to the bounded local record instead of being
+   * dropped.
+   */
   const attachRun = Effect.fn("peerLoop.attachRun")(function* (input: PeerLoopAttachRunInput) {
     const connection = yield* ensureConnection;
-    return yield* attachSerialized(connection, input.runId, input.afterSeq ?? 0);
+    const handle = yield* attachCoordinated(
+      connection,
+      input.runId,
+      input.afterSeq ?? 0,
+      false,
+    ).pipe(Effect.scoped);
+    return handle.result;
   });
 
   const startRun = (input: PeerLoopStartRunInput) =>
@@ -674,84 +993,141 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     Stream.unwrap(
       Effect.gen(function* () {
         const connection = yield* ensureConnection;
-        // Subscribed BEFORE the attach, so the replay it triggers cannot start
-        // before this subscriber is listening.
-        const feed = yield* connection.subscribe;
         const opening = yield* SubscriptionRef.get(transport);
-
-        yield* attachSerialized(connection, input.runId, input.afterSeq ?? 0);
-
         const startCursor = input.afterSeq ?? 0;
+
+        // The feed is created INSIDE the attach coordination, after this run's
+        // permit is held and before `run.attach` goes out, and this returns as
+        // soon as Peer Loop has answered — before a single backlog notification
+        // has been read. That is what lets a backlog larger than one feed's
+        // bound be delivered instead of overflowing unread.
+        const handle = yield* attachCoordinated(connection, input.runId, startCursor, true);
+        const feed = handle.clientFeed;
+        if (feed === null) {
+          return yield* new PeerLoopProtocolError({
+            detail: "the Peer Loop subscription could not be opened",
+          });
+        }
+        const highWaterMark = handle.result.eventHighWaterMark;
+
         let cursor = startCursor;
         /** Set when this stream must stop advancing: it is no longer complete. */
         let frozen = false;
+        /** At most one catch-up fact per subscription, and never after a resync. */
+        let synced = false;
 
-        const projected = Stream.fromQueue(feed.queue).pipe(
-          // The feed says when the transport ended; a queue that merely stops
-          // producing would leave this parked on a dead connection.
-          Stream.takeWhile((item) => item.kind === "notification"),
-          Stream.map((item): readonly PeerLoopSubscriptionEvent[] => {
-            const message = (item as { readonly message: PeerLoopBridgeNotification }).message;
-            if (frozen) return [];
-            switch (message.method) {
-              case "run.event": {
-                if (message.params.runId !== input.runId) return [];
-                const seq = message.params.event.seq;
-                if (seq <= cursor) return [];
-                cursor = seq;
-                return [
-                  {
-                    kind: "run-event",
-                    runId: input.runId,
-                    event: message.params.event,
-                    replay: message.params.replay,
-                  },
-                ];
-              }
-              case "run.outcome":
-                return message.params.runId === input.runId
-                  ? [
-                      {
-                        kind: "run-outcome",
-                        runId: input.runId,
-                        outcome: message.params.outcome,
-                        state: message.params.state,
-                      },
-                    ]
-                  : [];
-              case "run.finished":
-                return message.params.runId === input.runId
-                  ? [
-                      {
-                        kind: "run-finished",
-                        runId: input.runId,
-                        outcome: message.params.outcome,
-                        state: message.params.state,
-                        reason: message.params.reason,
-                      },
-                    ]
-                  : [];
-              case "run.resync": {
-                if (message.params.runId !== input.runId) return [];
-                // Peer Loop says its own stream is incomplete. Freeze here: the
-                // safe cursor is whichever of the two is lower, and advancing
-                // past it would carry the client over a known missing range.
-                frozen = true;
-                const safe = Math.min(cursor, message.params.afterSeq);
-                cursor = safe;
-                return [
-                  {
-                    kind: "run-resync",
-                    runId: input.runId,
-                    afterSeq: safe,
-                    reason: message.params.reason,
-                  },
-                ];
-              }
-              case "bridge.ready":
-                return [];
+        /** The catch-up fact, if this delivery has just crossed the boundary. */
+        const syncedIfCaughtUp = (): readonly PeerLoopSubscriptionEvent[] => {
+          if (synced || frozen || cursor < highWaterMark) return [];
+          synced = true;
+          return [
+            {
+              kind: "run-synced",
+              runId: input.runId,
+              afterSeq: cursor,
+              eventHighWaterMark: highWaterMark,
+            },
+          ];
+        };
+
+        const project = (input_: ReplayInput): readonly PeerLoopSubscriptionEvent[] => {
+          if (frozen) return [];
+
+          if (input_.source === "boundary") {
+            // Success needs no announcement here: the cursor logic above emits
+            // the catch-up fact when this subscriber has actually delivered
+            // through the boundary, which is a stronger statement.
+            if (input_.result.kind === "synced") return [];
+            frozen = true;
+            return [
+              {
+                kind: "run-resync",
+                runId: input.runId,
+                afterSeq: cursor,
+                reason: input_.result.reason,
+              },
+            ];
+          }
+
+          const item = input_.item;
+          // The transport ended. `closing` decides what that means for this
+          // subscriber, which depends on whether it reached its boundary first.
+          if (item.kind === "ended") return [];
+
+          const message = item.message;
+          switch (message.method) {
+            case "run.event": {
+              const seq = message.params.event.seq;
+              if (seq <= cursor) return [];
+              cursor = seq;
+              return [
+                {
+                  kind: "run-event",
+                  runId: input.runId,
+                  event: message.params.event,
+                  replay: message.params.replay,
+                },
+                ...syncedIfCaughtUp(),
+              ];
             }
-          }),
+            case "run.outcome":
+              return [
+                {
+                  kind: "run-outcome",
+                  runId: input.runId,
+                  outcome: message.params.outcome,
+                  state: message.params.state,
+                },
+              ];
+            case "run.finished":
+              return [
+                {
+                  kind: "run-finished",
+                  runId: input.runId,
+                  outcome: message.params.outcome,
+                  state: message.params.state,
+                  reason: message.params.reason,
+                },
+              ];
+            case "run.resync": {
+              // Peer Loop says its own stream is incomplete. Freeze here: the
+              // safe cursor is whichever of the two is lower, and advancing
+              // past it would carry the client over a known missing range.
+              frozen = true;
+              const safe = Math.min(cursor, message.params.afterSeq);
+              cursor = safe;
+              return [
+                {
+                  kind: "run-resync",
+                  runId: input.runId,
+                  afterSeq: safe,
+                  reason: message.params.reason,
+                },
+              ];
+            }
+            case "bridge.ready":
+              return [];
+          }
+        };
+
+        // The boundary rides alongside the feed rather than in front of it. The
+        // feed decides when this stream ends (`haltStrategy: "left"`), so a
+        // client whose own queue overflowed hears about it at once instead of
+        // waiting out the guard's bound.
+        const merged = Stream.merge(
+          Stream.map(
+            Stream.fromQueue(feed.queue),
+            (item): ReplayInput => ({ source: "feed", item }),
+          ),
+          Stream.map(
+            Stream.fromEffect(Deferred.await(handle.boundary)),
+            (result): ReplayInput => ({ source: "boundary", result }),
+          ),
+          { haltStrategy: "left" },
+        );
+
+        const projected = merged.pipe(
+          Stream.map(project),
           Stream.flattenIterable,
           // A resync is the last thing this subscription says. Continuing would
           // mean advancing across a range nobody can vouch for.
@@ -761,28 +1137,36 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         /**
          * How the stream ends, decided when it ends rather than in advance.
          *
-         * Three ways out, and they are not interchangeable: this subscriber's
-         * feed overflowed, Peer Loop already told us to resync, or the bridge
-         * went away. The last one must not report the stale `connected` status
-         * a naive read of the transport ref would still be showing, so the
-         * state comes from what actually happened to the connection.
+         * Four ways out and they are not interchangeable: a resync already went
+         * out, this subscriber's own feed overflowed, its replay never reached
+         * the boundary, or the bridge went away. The last must not report the
+         * stale `connected` a naive read of the transport ref would still be
+         * showing, so the state comes from what happened to the connection.
          */
+        const resyncing = (reason: string): readonly PeerLoopSubscriptionEvent[] => [
+          { kind: "run-resync", runId: input.runId, afterSeq: cursor, reason },
+        ];
+
         const closing = Effect.gen(function* () {
+          // A resync already went out, from Peer Loop or from the boundary.
           if (frozen) return [] as readonly PeerLoopSubscriptionEvent[];
 
-          if (yield* feed.overflowed) {
-            return [
-              {
-                kind: "run-resync",
-                runId: input.runId,
-                afterSeq: cursor,
-                reason:
-                  "this server could not retain the event stream for this client; re-subscribe from afterSeq",
-              },
-            ] satisfies readonly PeerLoopSubscriptionEvent[];
+          if (yield* feed.overflowed) return resyncing(PEER_LOOP_CLIENT_FEED_OVERFLOW);
+
+          // Whichever of the feed and the boundary got here first, the answer
+          // is the same, so the outcome does not depend on the race. Polled
+          // rather than awaited: a client that overflowed must not wait out the
+          // guard's bound to be told.
+          if (yield* Deferred.isDone(handle.boundary)) {
+            const settled = yield* Deferred.await(handle.boundary);
+            if (settled.kind !== "synced") return resyncing(settled.reason);
           }
 
-          const stoppedByUs = yield* Ref.get(stopped);
+          // The feed ended before this subscriber reached its boundary. The
+          // replay is incomplete however the guard eventually rules.
+          if (!synced) return resyncing(BOUNDARY_REASON["transport-ended"]);
+
+          const stoppedByUs = yield* isStopped;
           const latest = yield* SubscriptionRef.get(transport);
           const state = stoppedByUs ? "stopped" : "interrupted";
           return [
@@ -796,30 +1180,43 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
           ] satisfies readonly PeerLoopSubscriptionEvent[];
         });
 
-        const openingEvent: PeerLoopSubscriptionEvent = { kind: "transport", transport: opening };
+        const head: readonly PeerLoopSubscriptionEvent[] = [
+          { kind: "transport", transport: opening },
+          // Already past the boundary this attach reported: there is nothing to
+          // wait for, and saying so at once is what stops a client sitting on
+          // `needsResync` forever after an uneventful reattachment.
+          ...syncedIfCaughtUp(),
+        ];
+
         return Stream.concat(
-          Stream.succeed(openingEvent),
+          Stream.fromIterable(head),
           Stream.concat(projected, Stream.flattenIterable(Stream.fromEffect(closing))),
         );
       }),
     );
 
   const diagnostics = Effect.gen(function* () {
-    const entry = yield* Ref.get(live);
+    const entry = yield* currentEntry;
     return entry === null ? [] : yield* entry.connection.stderrTail;
   });
 
   // A normal server shutdown closes stdin and lets Peer Loop reach its own safe
   // boundary. It is not killed here; the bridge's own finalizer holds the only
-  // handle that could, and only after waiting.
+  // handle that could, and only after waiting. One gated transition, so an
+  // adoption racing this either loses and cleans up after itself, or wins and
+  // is released right here.
   yield* Effect.addFinalizer(() =>
-    Ref.set(stopped, true).pipe(
-      Effect.andThen(Ref.get(live)),
-      Effect.flatMap((entry) =>
-        entry === null ? Effect.void : releaseConnection(entry, "stopped", null),
-      ),
-      Effect.ignore,
-    ),
+    lifecycleGate
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(lifecycle);
+          yield* Ref.set(lifecycle, { kind: "stopped" });
+          if (current.kind !== "live") return;
+          yield* setTransport("stopped", null, null);
+          yield* Scope.close(current.entry.scope, Exit.void).pipe(Effect.ignore);
+        }).pipe(Effect.uninterruptible),
+      )
+      .pipe(Effect.ignore),
   );
 
   return PeerLoopService.of({
@@ -834,7 +1231,8 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     subscribeEvents,
     diagnostics,
     replaySlotCount: Effect.sync(() => replaySlots.size),
-    peakConcurrentReplays: Effect.sync(() => peakConcurrentReplays),
+    peakSameRunReplays: Effect.sync(() => peakSameRunReplays),
+    recentBoundaryOutcomes: Effect.sync(() => [...boundaryOutcomes]),
   });
 });
 

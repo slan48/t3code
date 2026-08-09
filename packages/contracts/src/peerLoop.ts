@@ -1045,6 +1045,26 @@ export const PeerLoopSubscriptionEvent = Schema.Union([
     afterSeq: NonNegativeInt,
     reason: Schema.String,
   }),
+  /**
+   * This subscriber has caught up: it has been delivered every event through
+   * the high-water mark its own `run.attach` reported.
+   *
+   * A T3 TRANSPORT FACT, NOT A PEER LOOP ONE. It says nothing about the run —
+   * not that it finished, not that it is idle, not that anything was decided.
+   * It exists because "the backlog is behind you" is otherwise unknowable to a
+   * client: sequences skip legitimately, so a client cannot compute it, and the
+   * first replayed event certainly does not prove it. Emitted at most once per
+   * subscription and never after a resync, an overflow, a replay that did not
+   * reach its boundary, or a transport that ended.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("run-synced"),
+    runId: TrimmedNonEmptyString,
+    /** The cursor actually delivered. Never ahead of a real event. */
+    afterSeq: NonNegativeInt,
+    /** The boundary this attach reported, and which `afterSeq` has reached. */
+    eventHighWaterMark: NonNegativeInt,
+  }),
 ]);
 export type PeerLoopSubscriptionEvent = typeof PeerLoopSubscriptionEvent.Type;
 

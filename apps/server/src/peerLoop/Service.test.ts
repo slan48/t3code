@@ -18,10 +18,11 @@ import * as Path from "effect/Path";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as Clock from "effect/Clock";
 
 import * as ServerConfig from "../config.ts";
 
-import { make } from "./Service.ts";
+import { make, PeerLoopService } from "./Service.ts";
 import { PEER_LOOP_NODE_ENTRY_ENV } from "./Command.ts";
 
 const fixtureEntry = Effect.map(Effect.service(Path.Path), (path) =>
@@ -216,6 +217,52 @@ const isProcessAlive = (pid: number): boolean => {
 /** Sequence numbers of the run events in a collected subscription stream. */
 const seqsOf = (events: readonly PeerLoopSubscriptionEvent[]): readonly number[] =>
   events.flatMap((event) => (event.kind === "run-event" ? [event.event.seq] : []));
+
+const assertOrderedAndUnique = (seqs: readonly number[]): void => {
+  assert.deepStrictEqual(
+    [...seqs].sort((a, b) => a - b),
+    seqs,
+  );
+  assert.strictEqual(new Set(seqs).size, seqs.length);
+};
+
+/**
+ * Read one subscription until it says it has caught up.
+ *
+ * A fixed `take` cannot be used any more and should not be: the point of the
+ * catch-up fact is that the client no longer has to guess how many events a
+ * replay contains, which it never could — sequences skip.
+ */
+const collectUntilSynced = (
+  service: PeerLoopService["Service"],
+  runId: string,
+  afterSeq: number,
+  gate: Effect.Effect<void> = Effect.void,
+) =>
+  Stream.runCollect(
+    Stream.takeUntil(
+      Stream.unwrap(Effect.as(gate, service.subscribeEvents({ runId, afterSeq }))),
+      (event) => event.kind === "run-synced" || event.kind === "run-resync",
+    ),
+  );
+
+/**
+ * Wait for every replay guard to let go.
+ *
+ * An attach now returns before its boundary — that is the whole point — so the
+ * coordination map empties a moment later. Bounded, so a leak fails the test
+ * rather than hanging it.
+ */
+const awaitNoReplaySlots = (service: PeerLoopService["Service"]) =>
+  Effect.gen(function* () {
+    const drained = yield* Effect.timeoutOption(
+      Effect.andThen(Effect.sleep(Duration.millis(10)), service.replaySlotCount).pipe(
+        Effect.repeat({ until: (count: number) => count === 0 }),
+      ),
+      Duration.seconds(8),
+    );
+    assert.isTrue(drained._tag === "Some", "replay coordination never returned to zero");
+  });
 
 /** Message plus every own field, so a leak cannot hide in an unasserted detail. */
 const renderPublicError = (error: object): string =>
@@ -520,7 +567,97 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
       }),
     );
 
-    it.effect("gives two simultaneous first attachments one gate, not two", () =>
+    it.effect("cannot be cancelled between installing a claim and forking its runner", () =>
+      Effect.gen(function* () {
+        // The narrowest window in the connection path: the claim is in the ref
+        // and nothing is running it yet. An interrupt landing here leaves a
+        // deferred nobody will ever complete, and every later caller parks on
+        // it until the layer goes down.
+        yield* useFakeBridge("ready");
+        const arrived = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real);
+
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          ...TEST_SEAMS,
+          testSeams: {
+            beforeForkAttempt: Deferred.succeed(arrived, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+            ),
+          },
+        }).pipe(Effect.provide(spawner.layer), Scope.provide(scope));
+
+        const winner = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.listRuns({}))));
+        yield* Deferred.await(arrived);
+
+        // Forked and started at once, so the interrupt is genuinely delivered
+        // while the winner is inside the handoff — the handoff being
+        // uninterruptible is what makes that a request rather than an effect.
+        const interrupting = yield* Effect.forkChild(Fiber.interrupt(winner), {
+          startImmediately: true,
+        });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.await(interrupting);
+
+        // A caller arriving afterwards still gets a connection, which is only
+        // true if the claim was completed rather than abandoned.
+        const runs = yield* service.listRuns({});
+        assert.strictEqual(runs.runs.length, 1);
+        assert.strictEqual(spawner.spawned(), 1);
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("leaves nothing behind when shutdown races the adoption", () =>
+      Effect.gen(function* () {
+        // The handshake is finished and the connection is about to be
+        // published. If the layer stops now, every interleaving still has to
+        // end the same way: no live entry, no health, a stopped transport and
+        // a dead child.
+        yield* useFakeBridge("ready");
+        const arrived = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real);
+
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          ...TEST_SEAMS,
+          testSeams: {
+            // Uninterruptible, so the layer genuinely races the adoption
+            // instead of simply cancelling the attempt before it.
+            beforeAdoptConnection: Deferred.succeed(arrived, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.uninterruptible,
+            ),
+          },
+        }).pipe(Effect.provide(spawner.layer), Scope.provide(scope));
+
+        const caller = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.listRuns({}))));
+        yield* Deferred.await(arrived);
+
+        const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.await(closing);
+        yield* Fiber.await(caller);
+
+        const status = yield* service.status({});
+        assert.notStrictEqual(status.transport.state, "connected");
+        assert.strictEqual(status.health, null);
+
+        const pid = spawner.pids()[0] ?? 0;
+        assert.isAbove(pid, 0);
+        assert.isFalse(isProcessAlive(pid));
+
+        const error = yield* Effect.flip(Effect.asVoid(service.listRuns({})));
+        assert.strictEqual(error._tag, "PeerLoopUnavailableError");
+      }),
+    );
+
+    it.effect("gives two simultaneous same-run attachments one gate, not two", () =>
       Effect.gen(function* () {
         // Every replay here is paced, so the two genuinely overlap. Peer Loop
         // keeps one attachment per run: two gates would mean the second attach
@@ -533,38 +670,53 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         yield* service.status({});
 
         const barrier = yield* makeBarrier(2);
-        const collect = (afterSeq: number, take: number) =>
-          Stream.runCollect(
-            Stream.take(
-              Stream.unwrap(
-                Effect.as(
-                  barrier.arrive,
-                  service.subscribeEvents({ runId: "run-unseen", afterSeq }),
-                ),
-              ),
-              take,
-            ),
-          );
-
-        // No stagger: both are released by the last one to arrive.
-        const [fromZero, fromThree] = yield* Effect.all([collect(0, 7), collect(3, 4)], {
-          concurrency: "unbounded",
-        });
+        // No stagger: both are released by the last one to arrive, and each
+        // reads until it is told it has caught up.
+        const [fromZero, fromThree] = yield* Effect.all(
+          [
+            collectUntilSynced(service, "run-unseen", 0, barrier.arrive),
+            collectUntilSynced(service, "run-unseen", 3, barrier.arrive),
+          ],
+          { concurrency: "unbounded" },
+        );
 
         // Two gates would have let both replays run at once.
-        assert.strictEqual(yield* service.peakConcurrentReplays, 1);
-        assert.strictEqual(yield* service.replaySlotCount, 0);
+        assert.strictEqual(yield* service.peakSameRunReplays, 1);
+        yield* awaitNoReplaySlots(service);
 
-        assert.deepStrictEqual(seqsOf(fromZero), [1, 2, 3, 4, 5, 6]);
-        assert.deepStrictEqual(seqsOf(fromThree), [4, 5, 6]);
+        assert.deepStrictEqual(seqsOf(fromZero), [1, 2, 3, 4, 5]);
+        assert.deepStrictEqual(seqsOf(fromThree), [4, 5]);
         for (const stream of [fromZero, fromThree]) {
-          const seqs = seqsOf(stream);
-          assert.deepStrictEqual(
-            [...seqs].sort((a, b) => a - b),
-            seqs,
-          );
-          assert.strictEqual(new Set(seqs).size, seqs.length);
+          assertOrderedAndUnique(seqsOf(stream));
+          assert.strictEqual(stream[stream.length - 1]?.kind, "run-synced");
         }
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("lets different runs replay at once without tripping the same-run gate", () =>
+      Effect.gen(function* () {
+        yield* useFakeBridge("slow-replay");
+        const { service, scope } = yield* makeService;
+        yield* service.status({});
+
+        const barrier = yield* makeBarrier(2);
+        const [first, second] = yield* Effect.all(
+          [
+            collectUntilSynced(service, "run-a", 0, barrier.arrive),
+            collectUntilSynced(service, "run-b", 0, barrier.arrive),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        // Two runs replaying together is correct, and the per-run invariant is
+        // the one that has to hold. A global counter would read 2 here and call
+        // healthy behaviour a bug.
+        assert.strictEqual(yield* service.peakSameRunReplays, 1);
+        assert.deepStrictEqual(seqsOf(first), [1, 2, 3, 4, 5]);
+        assert.deepStrictEqual(seqsOf(second), [1, 2, 3, 4, 5]);
+        yield* awaitNoReplaySlots(service);
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -576,41 +728,46 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         const { service, scope } = yield* makeService;
 
         const events = yield* Stream.runCollect(
-          service.subscribeEvents({ runId: "run-1", afterSeq: 3 }).pipe(Stream.take(4)),
+          service.subscribeEvents({ runId: "run-1", afterSeq: 3 }).pipe(Stream.take(5)),
         );
 
         // Opening transport fact first, then only what this client is missing.
         assert.strictEqual(events[0]?.kind, "transport");
-        const runEvents = events.slice(1);
-        assert.deepStrictEqual(
-          runEvents.map((event) => (event.kind === "run-event" ? event.event.seq : -1)),
-          [4, 5, 6],
-        );
+        assert.deepStrictEqual(seqsOf(events), [4, 5, 6]);
         // The durable backlog is flagged as such; the tail is live.
         assert.deepStrictEqual(
-          runEvents.map((event) => (event.kind === "run-event" ? event.replay : null)),
+          events.flatMap((event) => (event.kind === "run-event" ? [event.replay] : [])),
           [true, true, false],
         );
+        // Caught up is announced once the boundary has actually been delivered,
+        // which is after 5 and before the live 6.
+        const synced = events.find((event) => event.kind === "run-synced");
+        assert.strictEqual(synced?.kind, "run-synced");
+        if (synced?.kind !== "run-synced") throw new Error("unreachable");
+        assert.strictEqual(synced.afterSeq, 5);
+        assert.strictEqual(synced.eventHighWaterMark, 5);
+        assert.strictEqual(events.indexOf(synced), 3);
 
         yield* Scope.close(scope, Exit.void);
       }),
     );
 
-    it.effect("does not re-deliver events a subscriber already has", () =>
+    it.effect("tells a subscriber that is already past the boundary at once", () =>
       Effect.gen(function* () {
         yield* useFakeBridge("ready");
         const { service, scope } = yield* makeService;
 
-        // This subscriber is already past everything the fake can produce.
+        // Already past everything the fake can produce. There is nothing to
+        // replay, and a client left waiting for a catch-up fact that never
+        // came would sit on `needsResync` for ever.
         const stream = service.subscribeEvents({ runId: "run-1", afterSeq: 6 });
 
         const [collected] = yield* Effect.all(
           [
-            // Two events would mean a duplicate arrived: only the opening
-            // transport fact is legitimate here.
-            Effect.timeoutOption(Stream.runCollect(Stream.take(stream, 2)), "400 millis"),
+            // A third event would mean a duplicate arrived.
+            Effect.timeoutOption(Stream.runCollect(Stream.take(stream, 3)), "500 millis"),
             // Meanwhile another client attaches from scratch, which makes Peer
-            // Loop replay the whole backlog onto the shared feed.
+            // Loop replay the whole backlog for it.
             Effect.andThen(
               Effect.sleep("60 millis"),
               service.attachRun({ runId: "run-1", afterSeq: 0 }),
@@ -620,6 +777,14 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         );
 
         assert.strictEqual(collected._tag, "None");
+
+        const head = yield* Stream.runCollect(
+          Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq: 6 }), 2),
+        );
+        assert.strictEqual(head[0]?.kind, "transport");
+        assert.strictEqual(head[1]?.kind, "run-synced");
+        if (head[1]?.kind !== "run-synced") throw new Error("unreachable");
+        assert.strictEqual(head[1].afterSeq, 6);
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -728,41 +893,29 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
       }),
     );
 
-    it.effect("serialises overlapping attaches instead of stranding a subscriber", () =>
+    it.effect("starts delivering a backlog larger than one feed can hold", () =>
       Effect.gen(function* () {
-        // Every replay in this scenario is paced, so two attaches genuinely
-        // overlap. Peer Loop keeps one attachment per run, so an uncoordinated
-        // second attach would supersede the first and leave it silent.
-        yield* useFakeBridge("slow-replay");
+        // Two and a half thousand events against a bound of a thousand. Under
+        // the old ordering the subscription was only returned once the replay
+        // was over, so this backlog could not be delivered at all — the feed
+        // filled up with nobody reading it.
+        yield* useFakeBridge("big-backlog");
         const { service, scope } = yield* makeService;
 
-        const collect = (afterSeq: number, take: number) =>
-          Stream.runCollect(
-            Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq }), take),
-          );
+        const events = yield* collectUntilSynced(service, "run-1", 0);
 
-        const [fromZero, fromThree] = yield* Effect.all(
-          [
-            // transport + 1..5 + 6
-            collect(0, 7),
-            // transport + 4,5 + 6
-            Effect.andThen(Effect.sleep(Duration.millis(30)), collect(3, 4)),
-          ],
-          { concurrency: "unbounded" },
-        );
+        const seqs = seqsOf(events);
+        assertOrderedAndUnique(seqs);
+        assert.strictEqual(seqs.length, 2_500);
+        assert.strictEqual(seqs[seqs.length - 1], 2_500);
 
-        assert.deepStrictEqual(seqsOf(fromZero), [1, 2, 3, 4, 5, 6]);
-        assert.deepStrictEqual(seqsOf(fromThree), [4, 5, 6]);
-        // Each surviving stream is ordered and free of duplicates.
-        for (const stream of [fromZero, fromThree]) {
-          const seqs = seqsOf(stream);
-          assert.deepStrictEqual(
-            [...seqs].sort((a, b) => a - b),
-            seqs,
-          );
-          assert.strictEqual(new Set(seqs).size, seqs.length);
-        }
+        const last = events[events.length - 1];
+        assert.strictEqual(last?.kind, "run-synced");
+        if (last?.kind !== "run-synced") throw new Error("unreachable");
+        assert.strictEqual(last.eventHighWaterMark, 2_500);
+        assert.strictEqual(last.afterSeq, 2_500);
 
+        yield* awaitNoReplaySlots(service);
         yield* Scope.close(scope, Exit.void);
       }),
     );
@@ -771,24 +924,28 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
       Effect.gen(function* () {
         // This run's durable log has no seq 3: Peer Loop numbered an event and
         // then failed to record it. Nothing was lost in transit, so nothing may
-        // be reported as lost.
+        // be reported as lost — and the catch-up fact still arrives, at the
+        // real high-water mark rather than at a count nobody could compute.
         yield* useFakeBridge("sequence-gap");
         const { service, scope } = yield* makeService;
 
-        const events = yield* Stream.runCollect(
-          Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq: 0 }), 6),
-        );
+        const events = yield* collectUntilSynced(service, "run-1", 0);
 
-        assert.deepStrictEqual(seqsOf(events), [1, 2, 4, 5, 6]);
+        assert.deepStrictEqual(seqsOf(events), [1, 2, 4, 5]);
         assert.isFalse(events.some((event) => event.kind === "run-resync"));
+        const last = events[events.length - 1];
+        assert.strictEqual(last?.kind, "run-synced");
+        if (last?.kind !== "run-synced") throw new Error("unreachable");
+        assert.strictEqual(last.eventHighWaterMark, 5);
+        assert.strictEqual(last.afterSeq, 5);
 
         yield* Scope.close(scope, Exit.void);
       }),
     );
 
-    it.effect("reports a real overflow explicitly and stops at the last safe cursor", () =>
+    it.effect("reports a real overflow explicitly and makes progress on reconnect", () =>
       Effect.gen(function* () {
-        // Four thousand notifications against a feed that holds a thousand:
+        // Six thousand notifications against a feed that holds a thousand:
         // this server genuinely could not retain them, which is a fact rather
         // than something to infer from a sequence number.
         yield* useFakeBridge("overflow");
@@ -797,27 +954,146 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         // Consumed deliberately slowly, so the feed genuinely cannot keep up.
         // A subscriber that drains as fast as the child writes would never
         // overflow, and would prove nothing.
-        const events = yield* Stream.runCollect(
-          Stream.tap(service.subscribeEvents({ runId: "run-1", afterSeq: 0 }), () =>
-            Effect.sleep(Duration.millis(2)),
-          ),
-        );
+        const slowly = (afterSeq: number) =>
+          Stream.runCollect(
+            Stream.tap(service.subscribeEvents({ runId: "run-1", afterSeq }), () =>
+              Effect.sleep(Duration.millis(2)),
+            ),
+          );
+
+        const events = yield* slowly(0);
 
         const last = events[events.length - 1];
         assert.strictEqual(last?.kind, "run-resync");
         if (last?.kind !== "run-resync") throw new Error("unreachable");
         assert.include(last.reason, "re-subscribe");
+        // Overflow is not being caught up, and must never be dressed as it.
+        assert.isFalse(events.some((event) => event.kind === "run-synced"));
 
         // Everything delivered before the resync is ordered, unique, and at or
         // below the cursor the client is told to resume from.
         const seqs = seqsOf(events);
-        assert.deepStrictEqual(
-          [...seqs].sort((a, b) => a - b),
-          seqs,
-        );
-        assert.strictEqual(new Set(seqs).size, seqs.length);
+        assertOrderedAndUnique(seqs);
         assert.strictEqual(last.afterSeq, seqs[seqs.length - 1] ?? 0);
+        // The cursor moved: a resync back to where it started would be a loop
+        // that never finishes, however many times the client tried.
+        assert.isAbove(last.afterSeq, 0);
 
+        // And reconnecting from it continues rather than repeating.
+        const again = yield* slowly(last.afterSeq);
+        const resumed = seqsOf(again);
+        assertOrderedAndUnique(resumed);
+        assert.isTrue(resumed.every((seq) => seq > last.afterSeq));
+        assert.isAbove(resumed.length, 0);
+
+        yield* awaitNoReplaySlots(service);
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("gives up on a replay that never reaches its boundary, and says so once", () =>
+      Effect.gen(function* () {
+        // The attach announces a boundary at 9 and the replay stops at 3. The
+        // permit cannot be held for ever, and the subscriber must not be left
+        // looking complete.
+        yield* useFakeBridge("never-reaches-boundary");
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          ...TEST_SEAMS,
+          replayBoundaryTimeout: Duration.millis(300),
+        }).pipe(Scope.provide(scope));
+
+        const events = yield* Stream.runCollect(
+          Stream.takeUntil(
+            service.subscribeEvents({ runId: "run-1", afterSeq: 0 }),
+            (event) => event.kind === "run-resync",
+          ),
+        );
+
+        assert.deepStrictEqual(seqsOf(events), [1, 2, 3]);
+        const resyncs = events.filter((event) => event.kind === "run-resync");
+        assert.strictEqual(resyncs.length, 1);
+        const last = resyncs[0];
+        if (last?.kind !== "run-resync") throw new Error("unreachable");
+        assert.strictEqual(last.afterSeq, 3);
+        assert.include(last.reason, "did not reach its reported boundary");
+        // Never caught up, and nothing after the resync.
+        assert.isFalse(events.some((event) => event.kind === "run-synced"));
+        assert.strictEqual(events[events.length - 1]?.kind, "run-resync");
+
+        yield* awaitNoReplaySlots(service);
+        const outcomes = yield* service.recentBoundaryOutcomes;
+        assert.include(outcomes.join(" | "), "run-1: timeout");
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("does not let a busy run overflow a quiet one's subscriber", () =>
+      Effect.gen(function* () {
+        // Six thousand notifications for `run-busy` while `run-quiet` watches.
+        // A feed that accepted everything and filtered on the way out would
+        // spend the quiet run's whole bound on the busy one's activity and then
+        // tell that client to resync over a run that never moved.
+        yield* useFakeBridge("cross-run-flood");
+        const { service, scope } = yield* makeService;
+        yield* service.status({});
+
+        // Deliberately unhurried, and it stays open until the quiet run's late
+        // event at 400ms — well past the flood. A subscriber that could drain
+        // six thousand notifications faster than they are written would prove
+        // nothing about the bound.
+        const quietStream = service.subscribeEvents({ runId: "run-quiet", afterSeq: 0 }).pipe(
+          Stream.tap(() => Effect.sleep(Duration.millis(2))),
+          Stream.takeUntil(
+            (event) =>
+              event.kind === "run-resync" || (event.kind === "run-event" && event.event.seq === 6),
+          ),
+        );
+
+        const [quiet] = yield* Effect.all(
+          [
+            Stream.runCollect(quietStream),
+            Effect.andThen(
+              Effect.sleep(Duration.millis(50)),
+              Effect.asVoid(service.attachRun({ runId: "run-busy", afterSeq: 0 })),
+            ),
+          ],
+          { concurrency: "unbounded" },
+        );
+
+        assert.deepStrictEqual(seqsOf(quiet), [1, 2, 3, 4, 5, 6]);
+        assert.isFalse(quiet.some((event) => event.kind === "run-resync"));
+        assert.isTrue(quiet.some((event) => event.kind === "run-synced"));
+
+        yield* awaitNoReplaySlots(service);
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("returns a snapshot attach at once while the next one waits for its guard", () =>
+      Effect.gen(function* () {
+        // The replay is paced over more than a hundred milliseconds. A snapshot
+        // caller must not wait for it — but the next attach for the same run
+        // must, or Peer Loop would supersede a replay that is still running.
+        yield* useFakeBridge("slow-replay");
+        const { service, scope } = yield* makeService;
+        yield* service.status({});
+
+        const started = yield* Clock.currentTimeMillis;
+        const first = yield* service.attachRun({ runId: "run-1", afterSeq: 0 });
+        const afterFirst = yield* Clock.currentTimeMillis;
+        assert.strictEqual(first.runId, "run-1");
+        // Back before the replay it started could possibly have finished.
+        assert.isBelow(afterFirst - started, 100);
+
+        yield* service.attachRun({ runId: "run-1", afterSeq: 0 });
+        const afterSecond = yield* Clock.currentTimeMillis;
+        // The second one waited for the first replay's guard.
+        assert.isAbove(afterSecond - started, 100);
+        assert.strictEqual(yield* service.peakSameRunReplays, 1);
+
+        yield* awaitNoReplaySlots(service);
         yield* Scope.close(scope, Exit.void);
       }),
     );
@@ -839,16 +1115,26 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         assert.strictEqual(last.afterSeq, 4);
         assert.notInclude(seqsOf(events), 7);
 
+        // This subscriber genuinely did reach its attach boundary at 5 before
+        // Peer Loop reported the hole, so the catch-up fact is legitimate — but
+        // nothing may follow the resync, least of all a second one.
+        const syncedAt = events.findIndex((event) => event.kind === "run-synced");
+        assert.isAbove(syncedAt, 0);
+        assert.isBelow(syncedAt, events.length - 1);
+        assert.strictEqual(events.lastIndexOf(last), events.length - 1);
+
         // Reconnecting from the safe cursor picks up cleanly.
         const again = yield* Stream.runCollect(
           Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq: last.afterSeq }), 3),
         );
         const resumed = seqsOf(again);
         assert.isTrue(resumed.every((seq) => seq > last.afterSeq));
-        assert.deepStrictEqual(
-          [...resumed].sort((a, b) => a - b),
-          resumed,
-        );
+        assertOrderedAndUnique(resumed);
+
+        // The replay itself did reach its boundary — Peer Loop's hole is later,
+        // and the two facts are recorded as the different things they are.
+        const outcomes = yield* service.recentBoundaryOutcomes;
+        assert.include(outcomes.join(" | "), "run-1: synced");
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -856,8 +1142,10 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
 
     it.effect("ends a subscription with the transport that actually happened", () =>
       Effect.gen(function* () {
-        // The bridge dies mid-subscription. The closing event must say so, not
-        // repeat the `connected` the transport ref was still showing.
+        // The bridge dies after this subscriber has already reached its
+        // boundary. Nothing was lost, so the closing fact is the transport
+        // ending — not a resync, and not the stale `connected` the transport
+        // ref was still showing.
         yield* useFakeBridge("dies-mid-stream");
         const { service, scope } = yield* makeService;
 
@@ -865,10 +1153,35 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
           service.subscribeEvents({ runId: "run-1", afterSeq: 0 }),
         );
 
+        assert.isTrue(events.some((event) => event.kind === "run-synced"));
         const last = events[events.length - 1];
         assert.strictEqual(last?.kind, "transport");
         if (last?.kind !== "transport") throw new Error("unreachable");
         assert.oneOf(last.transport.state, ["interrupted", "stopped"]);
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("resyncs a subscription whose bridge died before its boundary", () =>
+      Effect.gen(function* () {
+        // Same death, earlier: the replay was still running. This client did
+        // not catch up, and telling it the transport ended without telling it
+        // to re-attach would leave it believing it has the whole story.
+        yield* useFakeBridge("dies-before-boundary");
+        const { service, scope } = yield* makeService;
+
+        const events = yield* Stream.runCollect(
+          service.subscribeEvents({ runId: "run-1", afterSeq: 0 }),
+        );
+
+        assert.deepStrictEqual(seqsOf(events), [1, 2]);
+        assert.isFalse(events.some((event) => event.kind === "run-synced"));
+        const last = events[events.length - 1];
+        assert.strictEqual(last?.kind, "run-resync");
+        if (last?.kind !== "run-resync") throw new Error("unreachable");
+        assert.strictEqual(last.afterSeq, 2);
+        assert.include(last.reason, "stopped before this replay finished");
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -887,9 +1200,12 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
           { discard: true },
         );
 
-        assert.strictEqual(yield* service.replaySlotCount, 0);
-        // Every one of those attaches held the gate alone.
-        assert.strictEqual(yield* service.peakConcurrentReplays, 1);
+        yield* awaitNoReplaySlots(service);
+        // Every one of those attaches held its run's gate alone.
+        assert.strictEqual(yield* service.peakSameRunReplays, 1);
+        // The boundary record is a tail, not a log: 25 attaches, 20 kept.
+        const outcomes = yield* service.recentBoundaryOutcomes;
+        assert.strictEqual(outcomes.length, 20);
 
         yield* Scope.close(scope, Exit.void);
       }),

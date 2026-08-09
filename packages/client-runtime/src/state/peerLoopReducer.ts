@@ -44,8 +44,11 @@ export interface PeerLoopRunView {
   /**
    * The stream is known to be incomplete. Re-subscribe from `afterSeq`.
    *
-   * Set only by an explicit `run-resync`. Never inferred from a sequence skip,
-   * which is legitimate, and never from a quiet connection.
+   * Set only by an explicit `run-resync`, and cleared only by a `run-synced`
+   * whose boundary this cursor has actually reached. Never inferred from a
+   * sequence skip, which is legitimate, and never from a quiet connection —
+   * and never cleared by the arrival of a replayed event, which proves that a
+   * replay started and nothing about whether it finished.
    */
   readonly needsResync: boolean;
   /** Recent activity, oldest first, bounded for a phone's sake. */
@@ -148,6 +151,20 @@ export function applyPeerLoopSubscriptionEvent(
         afterSeq: safe,
         activity: view.activity.filter((entry) => entry.seq <= safe),
       };
+    }
+
+    case "run-synced": {
+      if (event.runId !== view.runId) return view;
+      // Two ways this can be wrong, and both are ignored rather than trusted.
+      // A fact claiming a cursor beyond what was delivered would be the server
+      // asserting on this client's behalf; a fact whose boundary this cursor has
+      // not reached is premature, and acting on it would clear the one flag
+      // telling the owner the view is incomplete.
+      if (event.afterSeq > view.afterSeq) return view;
+      if (view.afterSeq < event.eventHighWaterMark) return view;
+      // Caught up. The cursor is untouched: this is an acknowledgement of what
+      // has already arrived, never a way to skip ahead of it.
+      return view.needsResync ? { ...view, needsResync: false } : view;
     }
   }
 }
