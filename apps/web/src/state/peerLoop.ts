@@ -204,13 +204,23 @@ export const peerLoopRunCursorAtom = Atom.family((key: string) =>
     // Idle-collected like the rest of this app's per-entity atoms. The family
     // holds weak references, but a cursor that nothing has read for minutes is
     // not worth keeping around either.
-    Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
+    Atom.setIdleTTL(PEER_LOOP_CURSOR_IDLE_TTL_MS),
     Atom.withLabel(`web-peer-loop-run-cursor:${key}`),
   ),
 );
 
-/** Long enough to survive a route change, short enough not to accumulate. */
-export const PEER_LOOP_OBSERVATION_IDLE_TTL_MS = 5 * 60_000;
+/**
+ * How long the *scalar* per-pair state lingers with nothing reading it.
+ *
+ * Cursor and generation only: two numbers, and `disposePeerLoopRun` resets them
+ * explicitly when a pair stops being observed, so the TTL is a backstop rather
+ * than the mechanism. NOTHING THAT HOLDS A SUBSCRIPTION USES THIS. The
+ * observation atom is disposed immediately, because keeping it alive would keep
+ * the run's `run.attach` open on the server for a page nobody has in front of
+ * them — and would hand a returning visitor the last event of the stream they
+ * had left instead of a fresh one.
+ */
+export const PEER_LOOP_CURSOR_IDLE_TTL_MS = 5 * 60_000;
 
 /**
  * Bumped when a pair is disposed, and read by its observation.
@@ -223,7 +233,7 @@ export const PEER_LOOP_OBSERVATION_IDLE_TTL_MS = 5 * 60_000;
  */
 const peerLoopRunGenerationAtom = Atom.family((key: string) =>
   Atom.make(0).pipe(
-    Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
+    Atom.setIdleTTL(PEER_LOOP_CURSOR_IDLE_TTL_MS),
     Atom.withLabel(`web-peer-loop-run-generation:${key}`),
   ),
 );
@@ -352,7 +362,10 @@ export function createPeerLoopRunObservationAtoms(deps: {
         observable: true,
       };
     }).pipe(
-      Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
+      // Released as soon as the route stops reading it. This atom is what holds
+      // the event subscription open, so a TTL here would keep a `run.attach`
+      // live on the server for a page nobody is looking at.
+      Atom.setIdleTTL(0),
       Atom.withLabel(`web-peer-loop-run-observation:${runId}`),
     ),
   );

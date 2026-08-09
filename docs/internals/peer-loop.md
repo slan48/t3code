@@ -450,6 +450,17 @@ left is never refreshed. If the target is unchanged, refreshing that exact atom
 is the restart. Doing both, as the first version did, issued a second attach at
 the cursor it had already abandoned.
 
+**A subscription is a resource, not a cache.** An open `peerLoop.subscribeEvents`
+is a live `run.attach` on the machine running Peer Loop: it holds that run's
+single attachment and occupies its replay coordination. So the events family is
+created with `idleTtlMs: 0` and the web observation atom that reads it is
+disposed the moment nothing renders it — the shared five-minute default is right
+for a poll whose answer is worth keeping and wrong for this. It would also hand
+a returning visitor the last event of a stream they had already left, which is
+not what a fresh visit means. Only the two per-pair _scalars_, the cursor and
+the generation, keep a bounded idle TTL, and `disposePeerLoopRun` resets them
+explicitly anyway, so the TTL is a backstop rather than the mechanism.
+
 **Leaving a pair disposes both halves of it.** The retained view and the cursor
 are one thing: forgetting the view while leaving the cursor at 100 makes the
 next visit open at 100 against a view that no longer holds 1–100, omitting them

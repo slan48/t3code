@@ -31,6 +31,16 @@ import {
 export const PEER_LOOP_STATUS_POLL_MS = 5_000;
 export const PEER_LOOP_RUNS_POLL_MS = 5_000;
 
+/**
+ * How long an unobserved run subscription lingers. It does not.
+ *
+ * An open subscription is a live `run.attach` on the machine running Peer Loop,
+ * not a cached answer: leaving it up for five minutes after the last viewer
+ * closed the page keeps that run's attachment held and its replay coordination
+ * occupied for nobody.
+ */
+export const PEER_LOOP_EVENTS_IDLE_TTL_MS = 0;
+
 export function createPeerLoopEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
@@ -57,10 +67,19 @@ export function createPeerLoopEnvironmentAtoms<R, E>(
      *
      * Re-subscribing with a newer cursor is how a reconnecting client catches
      * up; the server replays the durable backlog and then continues live.
+     *
+     * DISPOSED THE MOMENT NOTHING IS WATCHING IT. The family's five-minute
+     * default is right for a poll whose answer is worth caching; it is wrong
+     * for an open `run.attach`, which holds a per-run attachment on the server
+     * and keeps replay coordination busy for a run nobody is looking at. It
+     * would also hand a returning visitor the last event of a stream they had
+     * left, which is not what a fresh visit means. Same reasoning as the other
+     * owner-scoped streams in this app.
      */
     events: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:peer-loop:events",
       tag: WS_METHODS.peerLoopSubscribeEvents,
+      idleTtlMs: PEER_LOOP_EVENTS_IDLE_TTL_MS,
     }),
   };
 }

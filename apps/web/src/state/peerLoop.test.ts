@@ -317,11 +317,21 @@ function makeFakeEvents() {
       }
       emitters.set(key, (event) => get.setSelf(AsyncResult.success(event)));
       return AsyncResult.initial<PeerLoopSubscriptionEvent, unknown>(true);
-    }).pipe(Atom.withLabel(`fake-peer-loop-events:${key}`)),
+    }).pipe(
+      // Mirrors the production `idleTtlMs: 0` on `peerLoopEnvironment.events`.
+      // A fake that lingered would prove the opposite of what these assert; the
+      // production atom's own lifetime is checked in the client-runtime suite.
+      Atom.setIdleTTL(0),
+      Atom.withLabel(`fake-peer-loop-events:${key}`),
+    ),
   );
 
   const id = (environmentId: unknown, run: string, afterSeq: number) =>
     `${String(environmentId)}|${run}|${afterSeq}`;
+
+  /** Streams opened and not yet finalized. The real resource, counted. */
+  const active = (): number =>
+    [...stats.values()].reduce((total, entry) => total + entry.opened - entry.disposed, 0);
 
   return {
     atom: (environmentId: unknown, run: string, afterSeq: number) =>
@@ -334,6 +344,7 @@ function makeFakeEvents() {
       afterSeq: number,
       event: PeerLoopSubscriptionEvent,
     ) => emitters.get(id(environmentId, run, afterSeq))?.(event),
+    active,
     setFailing: (value: boolean) => {
       failing = value;
     },
@@ -643,6 +654,8 @@ describe("Peer Loop observation disposal", () => {
     // A's stream is gone, A's view is gone, and A's cursor is back to 0 — so a
     // later visit cannot resume from a position whose events were discarded.
     await vi.waitFor(() => expect(events.stats(ENV_A, run, 0).disposed).toBe(1));
+    // Promptly, and without disposing the registry to get there.
+    expect(events.active()).toBe(1);
     expect(peerLoopRunStore.read(keyA)).toBe(undefined);
     expect(registry.get(atoms.cursor(keyA))).toBe(0);
 
@@ -691,11 +704,13 @@ describe("Peer Loop observation disposal", () => {
     expect(peerLoopRunStore.read(keyB)).toBe(undefined);
     expect(peerLoopRunStateCount()).toBe(0);
     expect(registry.get(atoms.cursor(keyB))).toBe(0);
-    // Disposal reopens nothing: leaving is when the stream stops.
+    // Disposal reopens nothing: leaving is when the stream stops. And it stops
+    // now, not in five minutes — asserted before the registry is torn down, so
+    // this cannot pass on registry-wide cleanup.
     expect(events.stats(ENV_B, run, 0).opened).toBe(1);
+    await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).disposed).toBe(1));
 
     registry.dispose();
-    await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).disposed).toBe(1));
   });
 
   it("reopens a disposed pair at afterSeq 0, with none of its old state", async () => {
@@ -715,20 +730,35 @@ describe("Peer Loop observation disposal", () => {
     route.leave();
     unmount();
     expect(peerLoopRunStore.read(keyA)).toBe(undefined);
+    // The stream goes now, not on a five-minute timer and not with the
+    // registry: nothing is left holding a `run.attach` for a page that closed.
+    await vi.waitFor(() => expect(events.active()).toBe(0));
 
     // A genuinely fresh visit. Without the cursor reset this would open at 100
     // and silently omit the hundred events the client had just thrown away.
     const remount = registry.mount(atoms.observation(run));
     route.observe();
-    // The cursor is what the next attach is made with, and it is 0 — the defect
-    // this closes is opening at 100 against a view that no longer holds 1..100,
-    // which would omit them for ever.
+    // A second, genuinely new stream: opened twice in total, both times at 0,
+    // never at the cursor that was discarded.
     expect(registry.get(atoms.cursor(keyA))).toBe(0);
-    expect(read().cursor).toBe(0);
-    expect(events.stats(ENV_A, run, 0).opened).toBe(1);
+    const reopened = read();
+    expect(reopened.cursor).toBe(0);
+    expect(events.stats(ENV_A, run, 0).opened).toBe(2);
     expect(events.stats(ENV_A, run, 100).opened).toBe(0);
-    // The retained view was dropped, so nothing folds on top of it.
-    expect(peerLoopRunStore.read(keyA)?.view.afterSeq).not.toBe(100);
+
+    // And nothing of the old stream is cached: no snapshot, no event, no
+    // control, so nothing a control could be derived from.
+    expect(reopened.view.state).toBe(null);
+    expect(reopened.view.control).toBe(null);
+    expect(reopened.view.activity).toEqual([]);
+    expect(reopened.view.afterSeq).toBe(0);
+    expect(reopened.empty).toBe(true);
+    expect(describeControls(reopened.view)).toMatchObject({
+      canSendOwnerMessage: false,
+      canPause: false,
+      canResume: false,
+      canRecover: false,
+    });
 
     remount();
     registry.dispose();
@@ -799,11 +829,12 @@ describe("Peer Loop observation disposal", () => {
       unmount();
 
       expect(peerLoopRunStateCount()).toBe(0);
-      // A's stream goes the moment B becomes the observed pair; B's goes with
-      // the registry. Nothing is left mounted either way.
+      // Both streams are gone before the registry is touched: A the moment B
+      // became the observed pair, B the moment the route left.
       await vi.waitFor(() => expect(events.stats(ENV_A, run, 0).disposed).toBe(1));
-      registry.dispose();
       await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).disposed).toBe(1));
+      expect(events.active()).toBe(0);
+      registry.dispose();
     }
   });
 });
