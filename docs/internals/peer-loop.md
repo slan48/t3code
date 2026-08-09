@@ -450,6 +450,18 @@ left is never refreshed. If the target is unchanged, refreshing that exact atom
 is the restart. Doing both, as the first version did, issued a second attach at
 the cursor it had already abandoned.
 
+**Leaving a pair disposes both halves of it.** The retained view and the cursor
+are one thing: forgetting the view while leaving the cursor at 100 makes the
+next visit open at 100 against a view that no longer holds 1–100, omitting them
+for ever. `disposePeerLoopRun` resets the cursor through the registry, bumps a
+generation so a still-cached observation cannot serve the view it just dropped,
+and forgets the view last — because either write can make a mounted observation
+recompute, and a recompute holding the subscription's last event would retain
+the pair again on the way out. It refreshes nothing: leaving is when the stream
+stops, not when it restarts. The route runs it from an effect keyed by the
+actual `(environmentId, runId)` pair, so switching primary environment disposes
+the pair that stopped being observed rather than whichever one is current.
+
 **Observation state is keyed by `(environmentId, runId)`.** Run ids are Peer
 Loop's and two machines can hold the same one; keyed by run alone, a change of
 primary environment would attach the second machine's run from the first

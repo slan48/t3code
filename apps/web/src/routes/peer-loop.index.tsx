@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { Atom } from "effect/unstable/reactivity";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 
@@ -14,6 +15,26 @@ import { usePeerLoopStartRun, useRefreshPeerLoopRuns } from "../state/peerLoopCo
 import { environmentProjects } from "../state/projects";
 import { primaryEnvironmentIdAtom } from "../state/primaryEnvironment";
 
+/** Read while disconnected. Local, constant, and attached to no environment. */
+export const NO_PROJECTS_ATOM = Atom.make(
+  [] as ReadonlyArray<import("@t3tools/contracts").OrchestrationProjectShell>,
+).pipe(Atom.withLabel("web-peer-loop-projects:none"));
+
+/**
+ * Which atom the project picker reads.
+ *
+ * A real environment's projects, or a local empty value — never a project
+ * query built from an invented id. `""` is not an environment, and asking one
+ * for its projects is a request to a machine that does not exist.
+ */
+export function peerLoopProjectsAtomFor(
+  environmentId: import("@t3tools/contracts").EnvironmentId | null,
+) {
+  return environmentId === null
+    ? NO_PROJECTS_ATOM
+    : environmentProjects.environmentProjectsAtom(environmentId);
+}
+
 /**
  * The Peer Loop index.
  *
@@ -26,9 +47,7 @@ function PeerLoopIndexRoute() {
   const status = useAtomValue(peerLoopStatusAtom);
   const runs = useAtomValue(peerLoopRunsAtom);
   const environmentId = useAtomValue(primaryEnvironmentIdAtom);
-  const shells = useAtomValue(
-    environmentProjects.environmentProjectsAtom(environmentId ?? ("" as never)),
-  );
+  const shells = useAtomValue(peerLoopProjectsAtomFor(environmentId));
   const start = usePeerLoopStartRun();
   const refreshRuns = useRefreshPeerLoopRuns();
 

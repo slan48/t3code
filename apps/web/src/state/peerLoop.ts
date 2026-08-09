@@ -201,7 +201,30 @@ function resolveFoldBase(
  */
 export const peerLoopRunCursorAtom = Atom.family((key: string) =>
   Atom.make(runStates.get(key)?.cursor ?? 0).pipe(
+    // Idle-collected like the rest of this app's per-entity atoms. The family
+    // holds weak references, but a cursor that nothing has read for minutes is
+    // not worth keeping around either.
+    Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
     Atom.withLabel(`web-peer-loop-run-cursor:${key}`),
+  ),
+);
+
+/** Long enough to survive a route change, short enough not to accumulate. */
+export const PEER_LOOP_OBSERVATION_IDLE_TTL_MS = 5 * 60_000;
+
+/**
+ * Bumped when a pair is disposed, and read by its observation.
+ *
+ * The retained view lives in a plain map, which nothing reactive watches. An
+ * observation atom that was still cached would go on serving the view it had —
+ * so leaving a run and coming straight back would show the state that was just
+ * thrown away, with a cursor that no longer matches it. Changing this is what
+ * tells the derived atom to fold again from nothing.
+ */
+const peerLoopRunGenerationAtom = Atom.family((key: string) =>
+  Atom.make(0).pipe(
+    Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
+    Atom.withLabel(`web-peer-loop-run-generation:${key}`),
   ),
 );
 
@@ -293,6 +316,7 @@ export function createPeerLoopRunObservationAtoms(deps: {
   ) => Atom.Atom<AsyncResult.AsyncResult<PeerLoopSubscriptionEvent, unknown>>;
 }) {
   const cursor = (key: PeerLoopRunKey) => peerLoopRunCursorAtom(peerLoopRunKey(key));
+  const generation = (key: PeerLoopRunKey) => peerLoopRunGenerationAtom(peerLoopRunKey(key));
   const events = (key: PeerLoopRunKey, afterSeq: number) =>
     deps.eventsAtom(key.environmentId, key.runId, afterSeq);
 
@@ -306,12 +330,18 @@ export function createPeerLoopRunObservationAtoms(deps: {
       }
 
       const key: PeerLoopRunKey = { environmentId, runId };
+      // Read so disposal can invalidate this fold; the value itself is not used.
+      get(generation(key));
       const existing = peerLoopRunStore.read(key);
       const at = get(cursor(key));
       const result = get(events(key, at));
       const event = Option.getOrNull(AsyncResult.value(result));
       const next = advancePeerLoopRun(runId, existing, at, event);
-      peerLoopRunStore.write(key, next);
+      // Only retain something there is something to retain. A recompute right
+      // after disposal — the environment changed, or the route left — has no
+      // previous entry and no event, and writing an empty one back would undo
+      // the disposal that just happened.
+      if (existing !== undefined || event !== null) peerLoopRunStore.write(key, next);
 
       return {
         view: next.view,
@@ -321,12 +351,16 @@ export function createPeerLoopRunObservationAtoms(deps: {
         empty: next.view.state === null && next.view.activity.length === 0,
         observable: true,
       };
-    }).pipe(Atom.withLabel(`web-peer-loop-run-observation:${runId}`)),
+    }).pipe(
+      Atom.setIdleTTL(PEER_LOOP_OBSERVATION_IDLE_TTL_MS),
+      Atom.withLabel(`web-peer-loop-run-observation:${runId}`),
+    ),
   );
 
   return {
     observation,
     cursor,
+    generation,
     events,
     /** The view alone, for callers that do not care why observation stopped. */
     view: Atom.family((runId: string) =>
@@ -360,6 +394,35 @@ export function rewindPeerLoopRun(key: PeerLoopRunKey): number {
   const cursor = peerLoopResumeCursor(existing.view);
   peerLoopRunStore.write(key, { cursor, view: existing.view });
   return cursor;
+}
+
+/**
+ * Stop observing one environment/run pair, completely.
+ *
+ * BOTH HALVES, OR NEITHER. Forgetting the bounded view while leaving the cursor
+ * atom at its last value is the worst of both: a later visit to the same pair
+ * opens at cursor 100 with an empty view, and events 1–100 — which this client
+ * discarded — are never replayed. The cursor is reset through the registry, so
+ * the family's own entry is the thing that changes rather than some cache
+ * beside it.
+ *
+ * Disposal only. Nothing is refreshed and no subscription is reopened: leaving
+ * the pair is exactly when the stream should stop, not restart.
+ */
+export function disposePeerLoopRun(
+  registry: Pick<PeerLoopRestartRegistry, "get" | "set">,
+  atoms: PeerLoopRunObservationAtoms,
+  key: PeerLoopRunKey,
+): void {
+  registry.set(atoms.cursor(key), 0);
+  // Always changes, so a still-cached observation cannot go on serving the view
+  // this just discarded. Setting the cursor alone would be a no-op whenever it
+  // was already 0 — which is most of the time.
+  registry.set(atoms.generation(key), registry.get(atoms.generation(key)) + 1);
+  // Forgotten LAST. Either of those writes can make a still-mounted observation
+  // recompute synchronously, and a recompute that still had the subscription's
+  // last event would retain the pair again on the way out.
+  peerLoopRunStore.forget(key);
 }
 
 /** The registry operations a restart needs. Narrow, so a test can supply them. */

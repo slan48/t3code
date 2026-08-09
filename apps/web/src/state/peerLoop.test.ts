@@ -20,6 +20,7 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   advancePeerLoopRun,
   createPeerLoopRunObservationAtoms,
+  disposePeerLoopRun,
   forgetPeerLoopRun,
   peerLoopRunKey,
   peerLoopRunStateCount,
@@ -28,6 +29,7 @@ import {
   type PeerLoopRunSubscriptionState,
 } from "./peerLoop";
 import { peerLoopFailure } from "./peerLoopCommands";
+import { NO_PROJECTS_ATOM, peerLoopProjectsAtomFor } from "../routes/peer-loop.index";
 import { describeControls } from "~/peerLoopPresentation";
 
 const runId = "run-1";
@@ -564,14 +566,262 @@ describe("Peer Loop environment scoping", () => {
       canRecover: false,
     });
 
-    // A's retained view is untouched and still its own.
+    // A's retained view is untouched and still its own; B has nothing yet.
     expect(peerLoopRunStore.read(keyA)?.view.afterSeq).toBe(100);
-    expect(peerLoopRunStore.read(keyB)?.view.afterSeq).toBe(0);
+    expect(peerLoopRunStore.read(keyB)).toBe(undefined);
     await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).opened).toBe(1));
     await vi.waitFor(() => expect(events.stats(ENV_A, run, 0).disposed).toBe(1));
     // And A is never reopened by B's observation.
     expect(events.stats(ENV_A, run, 0).opened).toBe(1);
 
     registry.dispose();
+  });
+});
+
+describe("Peer Loop observation disposal", () => {
+  /**
+   * The route's own lifecycle, without React.
+   *
+   * `observe` is the effect body and the returned function is its cleanup, so a
+   * switch is cleanup-then-observe exactly as an effect keyed by the pair runs
+   * it. That is what makes "A is disposed when B becomes the observed one"
+   * something this can assert rather than assume.
+   */
+  const mountRoute = (
+    harnessed: ReturnType<typeof harness>,
+    environmentAtom: Atom.Writable<typeof ENV_A | null, typeof ENV_A | null>,
+  ) => {
+    const { atoms, registry, run } = harnessed;
+    let dispose: (() => void) | null = null;
+    const observe = () => {
+      const environmentId = registry.get(environmentAtom);
+      if (environmentId === null) return;
+      const key = { environmentId, runId: run } as const;
+      dispose = () => disposePeerLoopRun(registry, atoms, key);
+    };
+    return {
+      observe,
+      leave: () => {
+        dispose?.();
+        dispose = null;
+      },
+      // React's order: the state changes, then the previous effect's cleanup
+      // runs, then the new effect body does.
+      switchTo: (next: typeof ENV_A | null) => {
+        registry.set(environmentAtom, next);
+        dispose?.();
+        dispose = null;
+        observe();
+      },
+    } as const;
+  };
+
+  const writableEnvironment = () =>
+    Atom.writable(
+      () => ENV_A as typeof ENV_A | null,
+      (ctx, value: typeof ENV_A | null) => ctx.setSelf(value),
+    );
+
+  it("disposes A when B becomes the observed pair on one mounted route", async () => {
+    const environmentAtom = writableEnvironment();
+    const harnessed = harness(environmentAtom);
+    const { events, atoms, registry, run, keyA, keyB, read } = harnessed;
+    const route = mountRoute(harnessed, environmentAtom);
+
+    registry.mount(atoms.observation(run));
+    route.observe();
+    read();
+    events.emit(ENV_A, run, 0, attached(5, run));
+    read();
+    events.emit(ENV_A, run, 0, runEvent(100, true, run));
+    expect(read().view.afterSeq).toBe(100);
+    expect(read().view.control?.available).toBe(true);
+
+    route.switchTo(ENV_B);
+    const onB = read();
+
+    // A's stream is gone, A's view is gone, and A's cursor is back to 0 — so a
+    // later visit cannot resume from a position whose events were discarded.
+    await vi.waitFor(() => expect(events.stats(ENV_A, run, 0).disposed).toBe(1));
+    expect(peerLoopRunStore.read(keyA)).toBe(undefined);
+    expect(registry.get(atoms.cursor(keyA))).toBe(0);
+
+    // Only B is retained, opened at 0, with nothing of A's on it.
+    expect(onB.cursor).toBe(0);
+    expect(onB.view.state).toBe(null);
+    expect(onB.view.control).toBe(null);
+    expect(onB.view.activity).toEqual([]);
+    expect(describeControls(onB.view)).toMatchObject({
+      canSendOwnerMessage: false,
+      canPause: false,
+      canResume: false,
+      canRecover: false,
+    });
+    // Nothing is retained for B until it actually produces something, and when
+    // it does it is B's own.
+    expect(peerLoopRunStateCount()).toBe(0);
+    await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).opened).toBe(1));
+    events.emit(ENV_B, run, 0, attached(5, run));
+    read();
+    expect(peerLoopRunStore.read(keyB)?.view.afterSeq).toBe(0);
+    expect(peerLoopRunStore.read(keyA)).toBe(undefined);
+    expect(peerLoopRunStateCount()).toBe(1);
+    expect(events.stats(ENV_A, run, 0).opened).toBe(1);
+
+    registry.dispose();
+  });
+
+  it("removes B and resets its cursor on unmount, reopening nothing", async () => {
+    const environmentAtom = writableEnvironment();
+    const harnessed = harness(environmentAtom);
+    const { events, atoms, registry, run, keyB } = harnessed;
+    const route = mountRoute(harnessed, environmentAtom);
+
+    const unmount = registry.mount(atoms.observation(run));
+    route.observe();
+    route.switchTo(ENV_B);
+    registry.get(atoms.observation(run));
+    events.emit(ENV_B, run, 0, attached(5, run));
+    events.emit(ENV_B, run, 0, runEvent(7, true, run));
+    expect(registry.get(atoms.observation(run)).view.afterSeq).toBe(7);
+
+    route.leave();
+    unmount();
+
+    expect(peerLoopRunStore.read(keyB)).toBe(undefined);
+    expect(peerLoopRunStateCount()).toBe(0);
+    expect(registry.get(atoms.cursor(keyB))).toBe(0);
+    // Disposal reopens nothing: leaving is when the stream stops.
+    expect(events.stats(ENV_B, run, 0).opened).toBe(1);
+
+    registry.dispose();
+    await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).disposed).toBe(1));
+  });
+
+  it("reopens a disposed pair at afterSeq 0, with none of its old state", async () => {
+    const environmentAtom = writableEnvironment();
+    const harnessed = harness(environmentAtom);
+    const { events, atoms, registry, run, keyA, read } = harnessed;
+    const route = mountRoute(harnessed, environmentAtom);
+
+    const unmount = registry.mount(atoms.observation(run));
+    route.observe();
+    read();
+    events.emit(ENV_A, run, 0, attached(5, run));
+    read();
+    events.emit(ENV_A, run, 0, runEvent(100, true, run));
+    expect(read().view.afterSeq).toBe(100);
+
+    route.leave();
+    unmount();
+    expect(peerLoopRunStore.read(keyA)).toBe(undefined);
+
+    // A genuinely fresh visit. Without the cursor reset this would open at 100
+    // and silently omit the hundred events the client had just thrown away.
+    const remount = registry.mount(atoms.observation(run));
+    route.observe();
+    // The cursor is what the next attach is made with, and it is 0 — the defect
+    // this closes is opening at 100 against a view that no longer holds 1..100,
+    // which would omit them for ever.
+    expect(registry.get(atoms.cursor(keyA))).toBe(0);
+    expect(read().cursor).toBe(0);
+    expect(events.stats(ENV_A, run, 0).opened).toBe(1);
+    expect(events.stats(ENV_A, run, 100).opened).toBe(0);
+    // The retained view was dropped, so nothing folds on top of it.
+    expect(peerLoopRunStore.read(keyA)?.view.afterSeq).not.toBe(100);
+
+    remount();
+    registry.dispose();
+  });
+
+  it("still restarts from a nonzero safe cursor while the pair is retained", async () => {
+    const environmentAtom = writableEnvironment();
+    const harnessed = harness(environmentAtom);
+    const { events, atoms, registry, run, keyA, read } = harnessed;
+    const route = mountRoute(harnessed, environmentAtom);
+
+    registry.mount(atoms.observation(run));
+    route.observe();
+    read();
+    for (const event of [
+      attached(5, run),
+      runEvent(1, true, run),
+      runEvent(2, true, run),
+      { kind: "run-resync", runId: run, afterSeq: 1, reason: "could not retain" } as const,
+    ]) {
+      events.emit(ENV_A, run, 0, event);
+      read();
+    }
+    expect(read().view.needsResync).toBe(true);
+
+    // Disposal is not involved: this is the ordinary in-route reattachment.
+    expect(restartPeerLoopObservation(registry, atoms, keyA)).toEqual({
+      cursor: 1,
+      switched: true,
+    });
+    read();
+    await vi.waitFor(() => expect(events.stats(ENV_A, run, 1).opened).toBe(1));
+
+    events.emit(ENV_A, run, 1, attached(5, run));
+    read();
+    expect(read().view.needsResync).toBe(true);
+    expect(read().view.activity.map((entry) => entry.seq)).toEqual([1]);
+
+    events.emit(ENV_A, run, 1, runEvent(5, true, run));
+    read();
+    events.emit(ENV_A, run, 1, {
+      kind: "run-synced",
+      runId: run,
+      afterSeq: 5,
+      eventHighWaterMark: 5,
+    });
+    expect(read().view.needsResync).toBe(false);
+
+    registry.dispose();
+  });
+
+  it("leaves nothing retained after repeated mount, switch and unmount cycles", async () => {
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const environmentAtom = writableEnvironment();
+      const harnessed = harness(environmentAtom);
+      const { events, atoms, registry, run } = harnessed;
+      const route = mountRoute(harnessed, environmentAtom);
+
+      const unmount = registry.mount(atoms.observation(run));
+      route.observe();
+      registry.get(atoms.observation(run));
+      events.emit(ENV_A, run, 0, attached(5, run));
+      registry.get(atoms.observation(run));
+
+      route.switchTo(ENV_B);
+      registry.get(atoms.observation(run));
+      route.leave();
+      unmount();
+
+      expect(peerLoopRunStateCount()).toBe(0);
+      // A's stream goes the moment B becomes the observed pair; B's goes with
+      // the registry. Nothing is left mounted either way.
+      await vi.waitFor(() => expect(events.stats(ENV_A, run, 0).disposed).toBe(1));
+      registry.dispose();
+      await vi.waitFor(() => expect(events.stats(ENV_B, run, 0).disposed).toBe(1));
+    }
+  });
+});
+
+describe("Peer Loop index while disconnected", () => {
+  it("reads projects from a local empty atom, never from an invented environment", () => {
+    const registry = AtomRegistry.make();
+    // The index selects this when there is no primary environment. It is a
+    // plain local value: no environment id, and so no environment RPC — asking
+    // for `""` would query a machine that does not exist.
+    expect(registry.get(NO_PROJECTS_ATOM)).toEqual([]);
+    registry.dispose();
+  });
+
+  it("selects the local empty atom rather than a project query", () => {
+    // Identity, not shape: the point is that no environment-scoped project
+    // atom is constructed at all while disconnected.
+    expect(peerLoopProjectsAtomFor(null)).toBe(NO_PROJECTS_ATOM);
+    expect(peerLoopProjectsAtomFor(ENV_A)).not.toBe(NO_PROJECTS_ATOM);
   });
 });

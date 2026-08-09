@@ -1,11 +1,11 @@
 import type { PeerLoopRecoveryChoice } from "@t3tools/contracts";
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useContext, useEffect, useRef } from "react";
+import { useCallback, useContext, useEffect } from "react";
 
 import { PeerLoopDetailView } from "../components/peerLoop/PeerLoopDetailView";
 import {
-  forgetPeerLoopRun,
+  disposePeerLoopRun,
   peerLoopObservationAtoms,
   peerLoopRunObservationAtom,
   restartPeerLoopObservation,
@@ -44,23 +44,20 @@ function PeerLoopRunRoute() {
   const refreshRuns = useRefreshPeerLoopRuns();
 
   /**
-   * Stop observing the exact environment/run this route mounted.
+   * Stop observing exactly the pair this effect was for.
    *
-   * Held in a ref so teardown drops the pair it actually had, even if the
-   * primary environment changed while the route was open: forgetting the new
-   * one would leave the old machine's view retained.
+   * KEYED BY THE PAIR, NOT HELD IN A REF. A ref that tracked the latest value
+   * pointed at whichever environment was current at unmount, so switching
+   * primary environment A → B while the route stayed open disposed B and left A
+   * retained — a machine nobody is observing, still holding its view and its
+   * cursor. An effect keyed by both members runs its cleanup the moment either
+   * changes, which is precisely when that pair stopped being observed.
    */
-  const mounted = useRef<{ environmentId: typeof environmentId; runId: string } | null>(null);
-  if (environmentId !== null) mounted.current = { environmentId, runId };
-  useEffect(
-    () => () => {
-      const key = mounted.current;
-      if (key !== null && key.environmentId !== null) {
-        forgetPeerLoopRun({ environmentId: key.environmentId, runId: key.runId });
-      }
-    },
-    [runId],
-  );
+  useEffect(() => {
+    if (environmentId === null) return;
+    const key = { environmentId, runId };
+    return () => disposePeerLoopRun(registry, peerLoopObservationAtoms, key);
+  }, [environmentId, registry, runId]);
 
   /**
    * Observe again from the cursor this view can vouch for.
