@@ -12,7 +12,11 @@ import type {
   PeerLoopRunSummary,
   PeerLoopStatusResult,
 } from "@t3tools/contracts";
-import { PeerLoopCommandRefusedError, PeerLoopTimeoutError } from "@t3tools/contracts";
+import {
+  PeerLoopCommandRefusedError,
+  PeerLoopTimeoutError,
+  PeerLoopTransportError,
+} from "@t3tools/contracts";
 import {
   applyPeerLoopSubscriptionEvent,
   emptyPeerLoopRunView,
@@ -122,9 +126,30 @@ const runState = (overrides: Partial<PeerLoopRunStateFile> = {}): PeerLoopRunSta
     ...overrides,
   }) as PeerLoopRunStateFile;
 
+/**
+ * The three control snapshots Peer Loop actually produces.
+ *
+ * Named rather than assembled from booleans, because `available: false` means
+ * two entirely different things depending on the reason and a test that mixed
+ * them would be asserting on a state the bridge never sends.
+ */
+const LIVE = { available: true, reason: "live_in_this_bridge", resumable: false } as const;
+const LIVE_RESUMABLE = {
+  available: true,
+  reason: "live_in_this_bridge",
+  resumable: true,
+} as const;
+const HELD = { available: false, reason: "held_by_other_process", resumable: false } as const;
+const STOPPED = { available: false, reason: "not_attached", resumable: true } as const;
+const STOPPED_FINAL = { available: false, reason: "not_attached", resumable: false } as const;
+
 const attachedView = (
   state: PeerLoopRunStateFile,
-  control: { available?: boolean; resumable?: boolean } = {},
+  control: {
+    readonly available: boolean;
+    readonly reason: string;
+    readonly resumable: boolean;
+  } = LIVE,
 ): PeerLoopRunView =>
   applyPeerLoopSubscriptionEvent(emptyPeerLoopRunView("run-1"), {
     kind: "run-attached",
@@ -133,12 +158,10 @@ const attachedView = (
       runId: "run-1",
       state,
       control: {
-        available: control.available ?? true,
-        reason: ((control.available ?? true)
-          ? "live_in_this_bridge"
-          : "held_by_other_process") as never,
+        available: control.available,
+        reason: control.reason as never,
         liveWriter: null,
-        resumable: control.resumable ?? false,
+        resumable: control.resumable,
       },
       eventHighWaterMark: 5,
       replayFromSeq: 0,
@@ -165,6 +188,7 @@ const detail = (
         resume: noop,
         recover: noop,
         reattach: noop,
+        retryObservation: noop,
       }}
       {...overrides}
     />,
@@ -398,7 +422,7 @@ describe("Peer Loop detail", () => {
   });
 
   it("disables every control when another process holds the project", async () => {
-    const html = await detail(attachedView(runState(), { available: false }));
+    const html = await detail(attachedView(runState(), HELD));
     expect(html).toContain("Another Peer Loop process");
     // Pause, Resume and Send are all rendered disabled.
     expect(html.match(/disabled=""/gu)?.length ?? 0).toBeGreaterThanOrEqual(3);
@@ -411,11 +435,11 @@ describe("Peer Loop detail", () => {
     expect(html).toContain("Pausing…");
   });
 
-  it("offers recovery only for an interrupted run, with no default and a confirmation", async () => {
+  it("offers recovery only for a live interrupted run, with no default and a confirmation", async () => {
     const quiet = await detail(attachedView(runState({ state: "paused" })));
     expect(quiet).not.toContain("Choose how to continue");
 
-    const html = await detail(attachedView(runState({ state: "interrupted" })));
+    const html = await detail(attachedView(runState({ state: "interrupted" }), LIVE));
     expect(html).toContain("Choose how to continue");
     expect(html).toContain("Hand it back to the Reviewer");
     expect(html).toContain("Run the interrupted task again");
@@ -487,5 +511,284 @@ describe("Peer Loop error notice", () => {
     );
     expect(html).toContain("SOMETHING_NEWER");
     expect(html).toContain("a future build refused this");
+  });
+});
+
+describe("Peer Loop controls against real snapshots", () => {
+  it("offers Resume on a stopped run even though control is unavailable", async () => {
+    const html = await detail(attachedView(runState({ state: "paused" }), STOPPED));
+    expect(html).toContain("Peer Loop is not driving this run right now");
+    expect(html).toContain("Resume");
+    // Everything that needs a live controller is off.
+    expect(html).toContain("Send message");
+    expect(html).toContain("disabled");
+  });
+
+  it("tells an interrupted stopped run to resume first, and offers no recovery yet", async () => {
+    const html = await detail(attachedView(runState({ state: "interrupted" }), STOPPED));
+    expect(html).toContain("A turn was in flight when this run stopped");
+    expect(html).toContain("does not replay the interrupted Builder task");
+    expect(html).not.toContain("Choose how to continue");
+    expect(html).not.toContain("Run the interrupted task again");
+  });
+
+  it("exposes all three recovery choices once the run is interrupted and live", async () => {
+    const html = await detail(attachedView(runState({ state: "interrupted" }), LIVE));
+    expect(html).toContain("Hand it back to the Reviewer");
+    expect(html).toContain("Run the interrupted task again");
+    expect(html).toContain("Abandon the run");
+    expect(html).not.toContain("Resume first to take control");
+  });
+
+  it("keeps a run held by another process entirely read-only", async () => {
+    const html = await detail(attachedView(runState({ state: "paused" }), HELD));
+    expect(html).toContain("Another Peer Loop process");
+    expect(html).not.toContain("Peer Loop is not driving this run right now");
+  });
+
+  it("says a live pause lands at the next boundary while an agent is working", async () => {
+    expect(await detail(attachedView(runState({ state: "builder_working" }), LIVE))).toContain(
+      "Pause at the next boundary",
+    );
+    expect(await detail(attachedView(runState({ state: "idle" }), LIVE))).toContain(">Pause<");
+  });
+
+  it("offers Resume on a live paused run only when Peer Loop says it is resumable", async () => {
+    const resumable = await detail(attachedView(runState({ state: "paused" }), LIVE_RESUMABLE));
+    expect(resumable).toContain("Resume");
+    const notResumable = await detail(attachedView(runState({ state: "paused" }), LIVE));
+    expect(notResumable).toContain("Resume");
+    // Rendered either way; what changes is whether it can be pressed.
+    expect(notResumable.match(/disabled=""/gu)?.length ?? 0).toBeGreaterThan(
+      resumable.match(/disabled=""/gu)?.length ?? 0,
+    );
+  });
+
+  it("offers nothing that changes a finished run", async () => {
+    for (const control of [LIVE, STOPPED_FINAL]) {
+      const html = await detail(attachedView(runState({ state: "done" }), control));
+      expect(html).not.toContain("Choose how to continue");
+      expect(html).not.toContain("Resume first to take control");
+      // Send, Pause and Resume all rendered disabled.
+      expect(html.match(/disabled=""/gu)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    }
+  });
+});
+
+describe("Peer Loop owner-facing structure", () => {
+  const ownerRequiredState = runState({
+    state: "owner_required",
+    lastReviewerDecision: {
+      decision: "OWNER_REQUIRED",
+      summary: "Needs a product call.",
+      ownerQuestion: "Should the export include archived threads?",
+      whyOwnerIsRequired: "It changes what leaves the machine and I cannot decide that.",
+      options: ["Include them", "Exclude them", "Ask me per thread"],
+    },
+  } as Partial<PeerLoopRunStateFile>);
+
+  it("shows the question, why it needs you, and every option", async () => {
+    const html = await detail(attachedView(ownerRequiredState, LIVE));
+    expect(html).toContain("Should the export include archived threads?");
+    expect(html).toContain("Why it needs you");
+    expect(html).toContain("It changes what leaves the machine");
+    expect(html).toContain("Include them");
+    expect(html).toContain("Exclude them");
+    expect(html).toContain("Ask me per thread");
+  });
+
+  it("prefers the outcome Peer Loop reported over the durable decision", async () => {
+    const view = applyPeerLoopSubscriptionEvent(attachedView(ownerRequiredState, LIVE), {
+      kind: "run-outcome",
+      runId: "run-1",
+      outcome: {
+        kind: "owner_required",
+        question: "Ship it behind a flag?",
+        why: "The rollout is not mine to choose.",
+        options: ["Yes, flagged", "No, wait"],
+      },
+      state: null,
+    });
+    const html = await detail(view);
+    expect(html).toContain("Ship it behind a flag?");
+    expect(html).toContain("Yes, flagged");
+    expect(html).not.toContain("Should the export include archived threads?");
+  });
+
+  it("offers each option as something to send, and does not send it by rendering", async () => {
+    let sent: string | null = null;
+    const html = await detail(attachedView(ownerRequiredState, LIVE), {
+      actions: {
+        sendOwnerMessage: (text: string) => {
+          sent = text;
+        },
+        pause: noop,
+        resume: noop,
+        recover: noop,
+        reattach: noop,
+        retryObservation: noop,
+      },
+    });
+    expect(html).toContain("Send");
+    expect(sent).toBe(null);
+  });
+
+  it("disables the option buttons while an owner message is in flight", async () => {
+    const html = await detail(attachedView(ownerRequiredState, LIVE), {
+      ownerMessage: { pending: true, error: null, success: null },
+    });
+    expect(html).toContain("Sending…");
+    expect(html.match(/disabled=""/gu)?.length ?? 0).toBeGreaterThanOrEqual(4);
+  });
+
+  it("shows capacity evidence with its reset time when the CLI gave one", async () => {
+    const html = await detail(
+      attachedView(
+        runState({
+          state: "paused",
+          haltReason: { kind: "CAPACITY_EXHAUSTED", message: "Out of capacity." },
+          lastBuilderFailure: {
+            kind: "CAPACITY_EXHAUSTED",
+            source: "result",
+            evidence: "usage limit reached",
+            resetAt: "2026-08-09T04:00:00.000Z",
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+    );
+    expect(html).toContain("capacity ran out");
+    expect(html).toContain("usage limit reached");
+    expect(html).toContain("from result");
+    expect(html).toContain("Resets at 2026-08-09T04:00:00.000Z");
+  });
+
+  it("says no reset time was given rather than inventing one", async () => {
+    const html = await detail(
+      attachedView(
+        runState({
+          state: "paused",
+          lastBuilderFailure: {
+            kind: "CAPACITY_EXHAUSTED",
+            source: "stderr",
+            evidence: "quota",
+            resetAt: null,
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+    );
+    expect(html).toContain("No reset time was given.");
+    expect(html).not.toContain("Resets at");
+  });
+
+  it("shows auth and transport evidence in their own words", async () => {
+    const auth = await detail(
+      attachedView(
+        runState({
+          lastBuilderFailure: {
+            kind: "AUTH_REQUIRED",
+            source: "stderr",
+            evidence: "run `claude login`",
+            resetAt: null,
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+    );
+    expect(auth).toContain("needs signing in");
+    expect(auth).toContain("run `claude login`");
+
+    const transport = await detail(
+      attachedView(
+        runState({
+          lastBuilderFailure: {
+            kind: "TRANSPORT_INTERRUPTED",
+            source: "transport",
+            evidence: "stream ended",
+            resetAt: null,
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+    );
+    expect(transport).toContain("was cut off");
+    expect(transport).toContain("stream ended");
+  });
+
+  it("shows the final state of a finished run", async () => {
+    const fromOutcome = applyPeerLoopSubscriptionEvent(
+      attachedView(runState({ state: "done" }), LIVE),
+      {
+        kind: "run-finished",
+        runId: "run-1",
+        outcome: { kind: "done", finalState: "clean worktree, all tests green", summary: "Done." },
+        state: null,
+        reason: "terminal",
+      },
+    );
+    expect(await detail(fromOutcome)).toContain("clean worktree, all tests green");
+
+    const fromDecision = await detail(
+      attachedView(
+        runState({
+          state: "done",
+          lastReviewerDecision: {
+            decision: "DONE",
+            summary: "Objective met.",
+            finalState: "documented and merged",
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        STOPPED_FINAL,
+      ),
+    );
+    expect(fromDecision).toContain("documented and merged");
+  });
+});
+
+describe("Peer Loop observation failures", () => {
+  it("says a run could not be observed instead of rendering an empty run", async () => {
+    const html = await detail(emptyPeerLoopRunView("run-1"), {
+      observation: {
+        waiting: false,
+        empty: true,
+        error: describeError(
+          new PeerLoopCommandRefusedError({
+            code: "RUN_NOT_FOUND",
+            detail: "Peer Loop has no run with that id.",
+            data: null,
+          }),
+        ),
+      },
+    });
+    expect(html).toContain("RUN_NOT_FOUND");
+    expect(html).toContain("Try to observe this run again");
+    expect(html).toContain("only reads");
+    // Nothing that could change the run is on the page.
+    expect(html).not.toContain("Send message");
+    expect(html).not.toContain("Choose how to continue");
+  });
+
+  it("keeps a run readable when observation fails after it had already loaded", async () => {
+    const html = await detail(attachedView(runState(), LIVE), {
+      observation: {
+        waiting: false,
+        empty: false,
+        error: describeError(
+          new PeerLoopTransportError({ detail: "the Peer Loop bridge stopped", exitCode: null }),
+        ),
+      },
+    });
+    expect(html).toContain("connection to Peer Loop ended");
+    expect(html).toContain("Try to observe this run again");
+    // The snapshot it already had is still shown.
+    expect(html).toContain("builder_working");
+  });
+
+  it("says it is still reading before anything has arrived", async () => {
+    const html = await detail(emptyPeerLoopRunView("run-1"), {
+      observation: { waiting: true, empty: true, error: null },
+    });
+    expect(html).toContain("Reading this run from Peer Loop…");
   });
 });

@@ -9,7 +9,11 @@ import {
   describeControls,
   describeDetail,
   describeEvent,
+  describeFailureEvidence,
+  describeFinalState,
+  describeOwnerDecision,
   describeViewAttention,
+  pauseTakesEffectLater,
   projectLabel,
   RECOVERY_CHOICES,
   type PeerLoopErrorPresentation,
@@ -25,12 +29,27 @@ export interface PeerLoopCommandState {
 
 export const IDLE_COMMAND: PeerLoopCommandState = { pending: false, error: null, success: null };
 
+export interface PeerLoopObservationState {
+  readonly waiting: boolean;
+  readonly error: PeerLoopErrorPresentation | null;
+  /** True before this subscription has produced anything at all. */
+  readonly empty: boolean;
+}
+
+export const LIVE_OBSERVATION: PeerLoopObservationState = {
+  waiting: false,
+  error: null,
+  empty: false,
+};
+
 export interface PeerLoopDetailActions {
   readonly sendOwnerMessage: (text: string) => void;
   readonly pause: () => void;
   readonly resume: () => void;
   readonly recover: (choice: PeerLoopRecoveryChoice) => void;
   readonly reattach: () => void;
+  /** Reads again. Sends no command of any kind. */
+  readonly retryObservation: () => void;
 }
 
 /**
@@ -43,6 +62,7 @@ export interface PeerLoopDetailActions {
  */
 export const PeerLoopDetailView = memo(function PeerLoopDetailView({
   view,
+  observation = LIVE_OBSERVATION,
   ownerMessage,
   pauseState,
   resumeState,
@@ -50,6 +70,7 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
   actions,
 }: {
   readonly view: PeerLoopRunView;
+  readonly observation?: PeerLoopObservationState;
   readonly ownerMessage: PeerLoopCommandState;
   readonly pauseState: PeerLoopCommandState;
   readonly resumeState: PeerLoopCommandState;
@@ -59,10 +80,43 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
   const attention = describeViewAttention(view);
   const detail = describeDetail(view);
   const controls = describeControls(view);
+  const ownerDecision = describeOwnerDecision(view);
+  const failure = describeFailureEvidence(view);
+  const finalState = describeFinalState(view);
   const nowMs = Date.now();
+
+  // A subscription that failed must not render as a run with nothing in it: a
+  // missing run and a dropped connection look identical from an empty page.
+  if (observation.error !== null && observation.empty) {
+    return (
+      <div className="flex min-w-0 flex-col gap-3">
+        <p className="font-mono text-xs break-all text-muted-foreground">{view.runId}</p>
+        <PeerLoopErrorNotice error={observation.error}>
+          <Button size="xs" variant="outline" onClick={actions.retryObservation}>
+            Try to observe this run again
+          </Button>
+        </PeerLoopErrorNotice>
+        <p className="text-xs text-muted-foreground">
+          Looking again only reads. Nothing about the run is started, resumed or resolved.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
+      {observation.error === null ? null : (
+        <PeerLoopErrorNotice error={observation.error}>
+          <Button size="xs" variant="outline" onClick={actions.retryObservation}>
+            Try to observe this run again
+          </Button>
+        </PeerLoopErrorNotice>
+      )}
+      {observation.waiting && observation.empty ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          Reading this run from Peer Loop…
+        </p>
+      ) : null}
       <header className="flex min-w-0 flex-col gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h1 className="truncate text-base font-semibold text-foreground">
@@ -128,6 +182,70 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         )}
       </PeerLoopSection>
 
+      {ownerDecision === null ? null : (
+        <PeerLoopSection title="The Reviewer needs a decision">
+          <div className="flex min-w-0 flex-col gap-2 rounded-md border border-warning/40 px-3 py-2">
+            <p className="text-sm break-words text-foreground">{ownerDecision.question}</p>
+            <div className="flex min-w-0 flex-col gap-0.5">
+              <span className="text-xs font-medium text-muted-foreground">Why it needs you</span>
+              <p className="text-xs break-words text-muted-foreground">{ownerDecision.why}</p>
+            </div>
+            {ownerDecision.options.length === 0 ? null : (
+              <div className="flex min-w-0 flex-col gap-1">
+                <span className="text-xs font-medium text-muted-foreground">
+                  The options the Reviewer offered
+                </span>
+                {/*
+                  Rendering an option does not send it. Each one is a button the
+                  owner presses, and it goes out as an ordinary owner message —
+                  queued for the next Reviewer turn like anything else typed.
+                */}
+                {ownerDecision.options.map((option) => (
+                  <div key={option} className="flex min-w-0 items-start gap-2">
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      disabled={!controls.canSendOwnerMessage || ownerMessage.pending}
+                      onClick={() => actions.sendOwnerMessage(option)}
+                    >
+                      Send
+                    </Button>
+                    <span className="min-w-0 text-xs break-words text-foreground">{option}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </PeerLoopSection>
+      )}
+
+      {failure === null ? null : (
+        <PeerLoopSection title="What the Builder reported">
+          <div className="flex min-w-0 flex-col gap-1 rounded-md border px-3 py-2">
+            <span className="text-sm font-medium text-foreground">{failure.title}</span>
+            <p className="text-xs break-words whitespace-pre-wrap text-muted-foreground">
+              {failure.evidence}
+            </p>
+            <span className="text-[0.6875rem] text-muted-foreground">from {failure.source}</span>
+            {/*
+              Peer Loop reports a reset time only when the CLI actually stated
+              one. Its absence is said plainly rather than shown as "no limit".
+            */}
+            <span className="text-xs text-muted-foreground">
+              {failure.resetAt === null
+                ? "No reset time was given."
+                : `Resets at ${failure.resetAt}.`}
+            </span>
+          </div>
+        </PeerLoopSection>
+      )}
+
+      {finalState === null ? null : (
+        <PeerLoopSection title="How it finished">
+          <p className="text-sm break-words text-foreground">{finalState}</p>
+        </PeerLoopSection>
+      )}
+
       <PeerLoopSection title="Controls">
         <OwnerMessageForm
           disabled={!controls.canSendOwnerMessage}
@@ -142,7 +260,11 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
             disabled={!controls.canPause || pauseState.pending}
             onClick={actions.pause}
           >
-            {pauseState.pending ? "Pausing…" : "Pause"}
+            {pauseState.pending
+              ? "Pausing…"
+              : pauseTakesEffectLater(view)
+                ? "Pause at the next boundary"
+                : "Pause"}
           </Button>
           <Button
             size="sm"
@@ -161,6 +283,24 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         {resumeState.success === null ? null : (
           <p className="text-xs text-success">{resumeState.success}</p>
         )}
+
+        {controls.resumeBeforeRecover ? (
+          <div className="flex min-w-0 flex-col gap-1 rounded-md border border-warning/40 px-3 py-2">
+            <p className="text-sm font-medium text-foreground">
+              A turn was in flight when this run stopped.
+            </p>
+            {/*
+              Recovery is a live command and nobody is driving this run, so a
+              Recover button here would be refused. Resuming takes control
+              first — and it does not replay the interrupted task; that stays an
+              explicit choice, offered once Peer Loop is driving again.
+            */}
+            <p className="text-xs text-muted-foreground">
+              Resume first to take control. Resuming runs a Reviewer turn and does not replay the
+              interrupted Builder task; you choose what happens to that afterwards.
+            </p>
+          </div>
+        ) : null}
 
         {controls.canRecover ? (
           <RecoveryControls state={recoverState} onRecover={actions.recover} />

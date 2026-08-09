@@ -14,13 +14,17 @@ import { PeerLoopCommandRefusedError } from "@t3tools/contracts";
 import { peerLoopResumeCursor } from "@t3tools/client-runtime/state/peer-loop-reducer";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { AtomRegistry, Atom } from "effect/unstable/reactivity";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   advancePeerLoopRun,
+  createPeerLoopRunObservationAtoms,
   forgetPeerLoopRun,
+  peerLoopRunCursorAtom,
   peerLoopRunStateCount,
   peerLoopRunStore,
+  rewindPeerLoopRun,
   type PeerLoopRunSubscriptionState,
 } from "./peerLoop";
 import { peerLoopFailure } from "./peerLoopCommands";
@@ -151,35 +155,47 @@ describe("Peer Loop run subscription fold", () => {
     expect(peerLoopResumeCursor(resynced.view)).toBe(1);
     expect(resynced.view.activity.map((entry) => entry.seq)).toEqual([1]);
 
-    // A new subscription from the safe cursor. The replay alone does not clear
-    // the flag — only reaching the boundary does.
+    // A new subscription from the safe cursor keeps the view it was trimmed to.
+    // Neither the snapshot nor a partial replay clears the flag: only reaching
+    // the boundary does.
     const partway = fold(1, [attached(), runEvent(2)], resynced);
     expect(partway.cursor).toBe(1);
-    expect(partway.view.needsResync).toBe(false);
+    expect(partway.view.needsResync).toBe(true);
+    expect(partway.view.activity.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(partway.view.state).not.toBe(null);
 
     const caughtUp = fold(
       1,
-      [
-        attached(),
-        runEvent(2),
-        runEvent(5),
-        { kind: "run-synced", runId, afterSeq: 5, eventHighWaterMark: 5 },
-      ],
-      { cursor: 1, view: { ...resynced.view, afterSeq: 1 } },
+      [runEvent(5), { kind: "run-synced", runId, afterSeq: 5, eventHighWaterMark: 5 }],
+      partway,
     );
     expect(caughtUp.view.needsResync).toBe(false);
     expect(caughtUp.view.afterSeq).toBe(5);
+    // Duplicate-free across the reattachment.
+    const seqs = caughtUp.view.activity.map((entry) => entry.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect(seqs).toEqual([1, 2, 5]);
   });
 
-  it("restarts the fold when the cursor changes, which is what a reattach is", () => {
+  it("keeps the view when the new cursor is the one it was trimmed to", () => {
     const before = fold(0, [attached(), runEvent(1), runEvent(2)]);
     const after = advancePeerLoopRun(runId, before, 2, null);
     expect(after.cursor).toBe(2);
-    // A new subscription starts from the safe cursor with nothing retained: the
-    // replay that follows is what fills it, and keeping the old slice would
-    // show the same events twice.
+    // A reattachment, not a different subscription: the snapshot and the
+    // activity at or below the safe cursor are exactly what the client can
+    // still vouch for.
     expect(after.view.afterSeq).toBe(2);
+    expect(after.view.activity.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(after.view.state).not.toBe(null);
+  });
+
+  it("starts from nothing when the cursor is not the view's own position", () => {
+    const before = fold(0, [attached(), runEvent(1), runEvent(2)]);
+    // Not a reattachment of this view: a different subscription entirely.
+    const after = advancePeerLoopRun(runId, before, 7, null);
+    expect(after.view.afterSeq).toBe(7);
     expect(after.view.activity).toEqual([]);
+    expect(after.view.state).toBe(null);
   });
 
   it("keeps retained activity bounded however long the run is watched", () => {
@@ -242,5 +258,196 @@ describe("Peer Loop command failures", () => {
 
   it("has nothing to unwrap from a success", () => {
     expect(peerLoopFailure(AsyncResult.success(1))).toBe(null);
+  });
+});
+
+/* ------------------------------------------------ registry-driven behaviour */
+
+interface FakeSubscription {
+  readonly opened: number;
+  readonly disposed: number;
+}
+
+/**
+ * A subscription source the test owns.
+ *
+ * Counting opens and disposals is the only way to prove that restarting
+ * observation genuinely tears one stream down and starts one replacement,
+ * rather than reusing a cached value or leaving the old listener attached.
+ */
+function makeFakeEvents() {
+  const stats = new Map<string, FakeSubscription>();
+  const emitters = new Map<string, (event: PeerLoopSubscriptionEvent) => void>();
+  let failNext = false;
+
+  const family = Atom.family((key: string) =>
+    Atom.make<AsyncResult.AsyncResult<PeerLoopSubscriptionEvent, unknown>>((get) => {
+      const current = stats.get(key) ?? { opened: 0, disposed: 0 };
+      stats.set(key, { ...current, opened: current.opened + 1 });
+      get.addFinalizer(() => {
+        const at = stats.get(key) ?? { opened: 0, disposed: 0 };
+        stats.set(key, { ...at, disposed: at.disposed + 1 });
+        emitters.delete(key);
+      });
+      if (failNext) {
+        return AsyncResult.failure(
+          Cause.fail(
+            new PeerLoopCommandRefusedError({
+              code: "RUN_NOT_FOUND",
+              detail: "Peer Loop has no run with that id.",
+              data: null,
+            }),
+          ),
+        );
+      }
+      emitters.set(key, (event) => get.setSelf(AsyncResult.success(event)));
+      return AsyncResult.initial<PeerLoopSubscriptionEvent, unknown>(true);
+    }).pipe(Atom.withLabel(`fake-peer-loop-events:${key}`)),
+  );
+
+  return {
+    atom: (environmentId: string, run: string, afterSeq: number) =>
+      family(`${environmentId}|${run}|${afterSeq}`),
+    stats: (environmentId: string, run: string, afterSeq: number) =>
+      stats.get(`${environmentId}|${run}|${afterSeq}`) ?? { opened: 0, disposed: 0 },
+    emit: (
+      environmentId: string,
+      run: string,
+      afterSeq: number,
+      event: PeerLoopSubscriptionEvent,
+    ) => emitters.get(`${environmentId}|${run}|${afterSeq}`)?.(event),
+    setFailing: (value: boolean) => {
+      failNext = value;
+    },
+  } as const;
+}
+
+const ENVIRONMENT = "env-1" as never;
+/** Typed once, so each harness gets the same shape the real atom has. */
+const environmentAtom = Atom.make<typeof ENVIRONMENT | null>(ENVIRONMENT);
+const disconnectedAtom = Atom.make<typeof ENVIRONMENT | null>(null);
+
+describe("Peer Loop run observation", () => {
+  it("restarts the stream at the same cursor and disposes the old one", async () => {
+    const events = makeFakeEvents();
+    const atoms = createPeerLoopRunObservationAtoms({
+      environmentIdAtom: environmentAtom,
+      eventsAtom: (environmentId, run, afterSeq) =>
+        events.atom(String(environmentId), run, afterSeq),
+    });
+    const registry = AtomRegistry.make();
+    const unmount = registry.mount(atoms.observation(runId));
+
+    registry.get(atoms.observation(runId));
+    expect(events.stats("env-1", runId, 0).opened).toBe(1);
+
+    // The same afterSeq. Setting the cursor atom would change nothing at all;
+    // refreshing the subscription is what opens a replacement.
+    registry.refresh(events.atom("env-1", runId, 0));
+    await vi.waitFor(() => expect(events.stats("env-1", runId, 0).opened).toBe(2));
+    expect(events.stats("env-1", runId, 0).disposed).toBe(1);
+
+    unmount();
+    await vi.waitFor(() => expect(events.stats("env-1", runId, 0).disposed).toBe(2));
+    registry.dispose();
+  });
+
+  it("keeps needsResync through the snapshot and a partial replay of a restart", async () => {
+    const events = makeFakeEvents();
+    const atoms = createPeerLoopRunObservationAtoms({
+      environmentIdAtom: environmentAtom,
+      eventsAtom: (environmentId, run, afterSeq) =>
+        events.atom(String(environmentId), run, afterSeq),
+    });
+    const registry = AtomRegistry.make();
+    registry.mount(atoms.observation(runId));
+    registry.get(atoms.observation(runId));
+
+    for (const event of [
+      attached(),
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 1, reason: "could not retain" } as const,
+    ]) {
+      events.emit("env-1", runId, 0, event);
+      registry.get(atoms.observation(runId));
+    }
+    expect(registry.get(atoms.observation(runId)).view.needsResync).toBe(true);
+
+    // Reattach: rewind to the safe cursor, then restart the stream there.
+    const cursor = rewindPeerLoopRun(runId);
+    expect(cursor).toBe(1);
+    registry.set(peerLoopRunCursorAtom(runId), cursor);
+    registry.get(atoms.observation(runId));
+
+    events.emit("env-1", runId, 1, attached());
+    registry.get(atoms.observation(runId));
+    expect(registry.get(atoms.observation(runId)).view.needsResync).toBe(true);
+    expect(registry.get(atoms.observation(runId)).view.state).not.toBe(null);
+
+    events.emit("env-1", runId, 1, runEvent(2));
+    registry.get(atoms.observation(runId));
+    expect(registry.get(atoms.observation(runId)).view.needsResync).toBe(true);
+
+    events.emit("env-1", runId, 1, runEvent(5));
+    registry.get(atoms.observation(runId));
+    events.emit("env-1", runId, 1, {
+      kind: "run-synced",
+      runId,
+      afterSeq: 5,
+      eventHighWaterMark: 5,
+    });
+    const settled = registry.get(atoms.observation(runId));
+    expect(settled.view.needsResync).toBe(false);
+
+    // Retained activity is duplicate-free across the reattachment.
+    const seqs = settled.view.activity.map((entry) => entry.seq);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect(seqs).toEqual([1, 2, 5]);
+
+    registry.dispose();
+  });
+
+  it("surfaces a subscription failure and is retryable without sending anything", async () => {
+    const events = makeFakeEvents();
+    events.setFailing(true);
+    const atoms = createPeerLoopRunObservationAtoms({
+      environmentIdAtom: environmentAtom,
+      eventsAtom: (environmentId, run, afterSeq) =>
+        events.atom(String(environmentId), run, afterSeq),
+    });
+    const registry = AtomRegistry.make();
+    registry.mount(atoms.observation(runId));
+
+    const failed = registry.get(atoms.observation(runId));
+    expect(failed.error?.code).toBe("RUN_NOT_FOUND");
+    expect(failed.empty).toBe(true);
+
+    // The retry is a refresh of the same subscription. It is the only thing the
+    // page does: no command of any kind is available from this state.
+    events.setFailing(false);
+    registry.refresh(events.atom("env-1", runId, 0));
+    await vi.waitFor(() => expect(events.stats("env-1", runId, 0).opened).toBe(2));
+
+    events.emit("env-1", runId, 0, attached());
+    const recovered = registry.get(atoms.observation(runId));
+    expect(recovered.error).toBe(null);
+    expect(recovered.view.state).not.toBe(null);
+
+    registry.dispose();
+  });
+
+  it("says it is not connected rather than pretending the run is empty", () => {
+    const events = makeFakeEvents();
+    const atoms = createPeerLoopRunObservationAtoms({
+      environmentIdAtom: disconnectedAtom,
+      eventsAtom: (environmentId, run, afterSeq) =>
+        events.atom(String(environmentId), run, afterSeq),
+    });
+    const registry = AtomRegistry.make();
+    const observation = registry.get(atoms.observation(runId));
+    expect(observation.error?.title).toContain("Not connected");
+    expect(events.stats("", runId, 0).opened).toBe(0);
+    registry.dispose();
   });
 });

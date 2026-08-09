@@ -21,15 +21,22 @@ import {
   describeDetail,
   describeError,
   describeEvent,
+  describeFailureEvidence,
+  describeFinalState,
+  describeOwnerDecision,
   describeRunAttention,
   describeTransport,
   describeViewAttention,
   existingRunIdFromRefusal,
   groupRuns,
   parseSafetyLimit,
+  pauseTakesEffectLater,
   projectLabel,
   validateStartRun,
   PEER_LOOP_EVENT_DETAIL_CHARS,
+  PEER_LOOP_EVIDENCE_CHARS,
+  PEER_LOOP_OWNER_OPTION_LIMIT,
+  PEER_LOOP_OWNER_TEXT_CHARS,
 } from "./peerLoopPresentation";
 
 const adapters = {
@@ -97,10 +104,11 @@ const event = (kind: string, payload: Record<string, unknown> = {}): PeerLoopEve
 
 const viewWith = (
   state: PeerLoopRunStateFile,
-  control: { available: boolean; resumable: boolean; reason?: string } = {
-    available: true,
-    resumable: false,
-  },
+  control: {
+    readonly available: boolean;
+    readonly resumable: boolean;
+    readonly reason?: string;
+  } = { available: true, resumable: false },
 ): PeerLoopRunView =>
   applyPeerLoopSubscriptionEvent(emptyPeerLoopRunView("run-1"), {
     kind: "run-attached",
@@ -330,50 +338,239 @@ describe("Peer Loop event rendering", () => {
   });
 });
 
+/** The three control snapshots Peer Loop actually produces, named. */
+const LIVE = { available: true, reason: "live_in_this_bridge", resumable: false } as const;
+const LIVE_RESUMABLE = { available: true, reason: "live_in_this_bridge", resumable: true } as const;
+const HELD = { available: false, reason: "held_by_other_process", resumable: false } as const;
+const STOPPED = { available: false, reason: "not_attached", resumable: true } as const;
+const STOPPED_FINAL = { available: false, reason: "not_attached", resumable: false } as const;
+
 describe("Peer Loop controls", () => {
   it("offers nothing before a snapshot has arrived", () => {
-    const controls = describeControls(emptyPeerLoopRunView("run-1"));
+    expect(describeControls(emptyPeerLoopRunView("run-1"))).toMatchObject({
+      canSendOwnerMessage: false,
+      canPause: false,
+      canResume: false,
+      canRecover: false,
+      resumeBeforeRecover: false,
+    });
+  });
+
+  it("offers the live controls when this bridge is the writer", () => {
+    expect(describeControls(viewWith(runState(), LIVE))).toMatchObject({
+      canSendOwnerMessage: true,
+      canPause: true,
+      canResume: false,
+      canRecover: false,
+      unavailableReason: null,
+    });
+  });
+
+  it("keeps a run held by another process entirely read-only", () => {
+    const controls = describeControls(viewWith(runState(), HELD));
     expect(controls).toMatchObject({
       canSendOwnerMessage: false,
       canPause: false,
       canResume: false,
       canRecover: false,
     });
-  });
-
-  it("greys everything out when another process holds the project", () => {
-    const controls = describeControls(
-      viewWith(runState(), { available: false, resumable: true, reason: "held_by_other_process" }),
-    );
-    expect(controls.canSendOwnerMessage).toBe(false);
-    expect(controls.canPause).toBe(false);
-    expect(controls.canResume).toBe(false);
     expect(controls.unavailableReason).toContain("Another Peer Loop process");
   });
 
-  it("offers resume only when Peer Loop says the run is resumable", () => {
-    expect(
-      describeControls(
-        viewWith(runState({ state: "paused" }), { available: true, resumable: true }),
-      ).canResume,
-    ).toBe(true);
-    expect(
-      describeControls(
-        viewWith(runState({ state: "paused" }), { available: true, resumable: false }),
-      ).canResume,
-    ).toBe(false);
-  });
-
-  it("offers recovery only for an interrupted run", () => {
-    expect(describeControls(viewWith(runState({ state: "interrupted" }))).canRecover).toBe(true);
-    expect(describeControls(viewWith(runState({ state: "paused" }))).canRecover).toBe(false);
-  });
-
-  it("offers nothing that changes a finished run", () => {
-    const controls = describeControls(viewWith(runState({ state: "done" })));
+  it("offers Resume on a stopped resumable run even though control is unavailable", () => {
+    // `available: false` with `not_attached` is the ordinary snapshot of a run
+    // nobody is driving. Reading it as "nothing is possible" would leave every
+    // stopped run permanently unstartable.
+    const controls = describeControls(viewWith(runState({ state: "paused" }), STOPPED));
+    expect(controls.canResume).toBe(true);
     expect(controls.canSendOwnerMessage).toBe(false);
     expect(controls.canPause).toBe(false);
     expect(controls.canRecover).toBe(false);
+    expect(controls.unavailableReason).toContain("not driving this run");
+  });
+
+  it("tells an interrupted stopped run to resume before it can recover", () => {
+    const controls = describeControls(viewWith(runState({ state: "interrupted" }), STOPPED));
+    expect(controls.canResume).toBe(true);
+    expect(controls.canRecover).toBe(false);
+    expect(controls.resumeBeforeRecover).toBe(true);
+  });
+
+  it("offers recovery once the interrupted run is live", () => {
+    const controls = describeControls(viewWith(runState({ state: "interrupted" }), LIVE));
+    expect(controls.canRecover).toBe(true);
+    expect(controls.resumeBeforeRecover).toBe(false);
+    // Nothing else, because the queue is not read until the turn is resolved.
+    expect(controls.canSendOwnerMessage).toBe(false);
+    expect(controls.canPause).toBe(false);
+  });
+
+  it("offers resume on a live run only when Peer Loop says it is resumable", () => {
+    expect(
+      describeControls(viewWith(runState({ state: "paused" }), LIVE_RESUMABLE)).canResume,
+    ).toBe(true);
+    expect(describeControls(viewWith(runState({ state: "paused" }), LIVE)).canResume).toBe(false);
+  });
+
+  it("offers nothing that changes a finished run, whoever holds it", () => {
+    for (const control of [LIVE, LIVE_RESUMABLE, STOPPED, STOPPED_FINAL, HELD]) {
+      const controls = describeControls(viewWith(runState({ state: "done" }), control));
+      expect(controls.canSendOwnerMessage).toBe(false);
+      expect(controls.canPause).toBe(false);
+      expect(controls.canResume).toBe(false);
+      expect(controls.canRecover).toBe(false);
+      expect(controls.resumeBeforeRecover).toBe(false);
+    }
+  });
+
+  it("says a pause on a working run lands at a boundary", () => {
+    expect(pauseTakesEffectLater(viewWith(runState({ state: "builder_working" }), LIVE))).toBe(
+      true,
+    );
+    expect(pauseTakesEffectLater(viewWith(runState({ state: "idle" }), LIVE))).toBe(false);
+  });
+});
+
+describe("Peer Loop owner-facing structure", () => {
+  const decision = {
+    decision: "OWNER_REQUIRED",
+    summary: "Needs a product call.",
+    ownerQuestion: "Should the export include archived threads?",
+    whyOwnerIsRequired: "It changes what leaves the machine.",
+    options: ["Include them", "Exclude them"],
+  } as const;
+
+  it("reads the escalated question off the durable decision", () => {
+    const owner = describeOwnerDecision(
+      viewWith(
+        runState({ state: "owner_required", lastReviewerDecision: decision } as Partial<
+          typeof runState extends (...args: never) => infer R ? R : never
+        >),
+        LIVE,
+      ),
+    );
+    expect(owner?.question).toBe("Should the export include archived threads?");
+    expect(owner?.why).toBe("It changes what leaves the machine.");
+    expect(owner?.options).toEqual(["Include them", "Exclude them"]);
+  });
+
+  it("has nothing to show when the Reviewer did not escalate", () => {
+    expect(describeOwnerDecision(viewWith(runState(), LIVE))).toBe(null);
+    expect(describeOwnerDecision(emptyPeerLoopRunView("run-1"))).toBe(null);
+  });
+
+  it("bounds a very long question and a long option list", () => {
+    const owner = describeOwnerDecision(
+      viewWith(
+        runState({
+          state: "owner_required",
+          lastReviewerDecision: {
+            decision: "OWNER_REQUIRED",
+            summary: "s",
+            ownerQuestion: "q".repeat(5_000),
+            whyOwnerIsRequired: "w".repeat(5_000),
+            options: Array.from({ length: 30 }, (_, index) => `option ${index}`),
+          },
+        } as never),
+        LIVE,
+      ),
+    );
+    expect(owner?.question.length).toBeLessThanOrEqual(PEER_LOOP_OWNER_TEXT_CHARS);
+    expect(owner?.why.length).toBeLessThanOrEqual(PEER_LOOP_OWNER_TEXT_CHARS);
+    expect(owner?.options.length).toBe(PEER_LOOP_OWNER_OPTION_LIMIT);
+  });
+
+  it("keeps the Builder failure Peer Loop recorded, with its reset time or without", () => {
+    const withReset = describeFailureEvidence(
+      viewWith(
+        runState({
+          lastBuilderFailure: {
+            kind: "CAPACITY_EXHAUSTED",
+            source: "result",
+            evidence: "usage limit reached",
+            resetAt: "2026-08-09T04:00:00.000Z",
+          },
+        } as never),
+        LIVE,
+      ),
+    );
+    expect(withReset).toMatchObject({
+      kind: "CAPACITY_EXHAUSTED",
+      evidence: "usage limit reached",
+      source: "result",
+      resetAt: "2026-08-09T04:00:00.000Z",
+    });
+
+    const withoutReset = describeFailureEvidence(
+      viewWith(
+        runState({
+          lastBuilderFailure: {
+            kind: "AUTH_REQUIRED",
+            source: "stderr",
+            evidence: "run `claude login`",
+            resetAt: null,
+          },
+        } as never),
+        LIVE,
+      ),
+    );
+    // Never invented: the absence is the answer.
+    expect(withoutReset?.resetAt).toBe(null);
+    expect(withoutReset?.kind).toBe("AUTH_REQUIRED");
+  });
+
+  it("bounds the evidence excerpt", () => {
+    const failure = describeFailureEvidence(
+      viewWith(
+        runState({
+          lastBuilderFailure: {
+            kind: "TRANSPORT_INTERRUPTED",
+            source: "transport",
+            evidence: "z".repeat(9_000),
+            resetAt: null,
+          },
+        } as never),
+        LIVE,
+      ),
+    );
+    expect(failure?.evidence.length).toBeLessThanOrEqual(PEER_LOOP_EVIDENCE_CHARS);
+  });
+
+  it("has nothing to show when no Builder failure was recorded", () => {
+    expect(describeFailureEvidence(viewWith(runState(), LIVE))).toBe(null);
+  });
+
+  it("shows the final state from the outcome, then from the decision", () => {
+    const fromOutcome = applyPeerLoopSubscriptionEvent(
+      viewWith(runState({ state: "done" }), LIVE),
+      {
+        kind: "run-finished",
+        runId: "run-1",
+        outcome: { kind: "done", finalState: "clean worktree", summary: "Done." },
+        state: null,
+        reason: "terminal",
+      },
+    );
+    expect(describeFinalState(fromOutcome)).toBe("clean worktree");
+
+    expect(
+      describeFinalState(
+        viewWith(
+          runState({
+            state: "done",
+            lastReviewerDecision: {
+              decision: "DONE",
+              summary: "Objective met.",
+              finalState: "documented and merged",
+            },
+          } as never),
+          STOPPED_FINAL,
+        ),
+      ),
+    ).toBe("documented and merged");
+
+    // Never derived from the state alone.
+    expect(describeFinalState(viewWith(runState({ state: "done" }), LIVE))).toBe(null);
   });
 });
 

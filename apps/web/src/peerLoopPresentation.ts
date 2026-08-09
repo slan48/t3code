@@ -13,7 +13,6 @@
  * @module PeerLoopPresentation
  */
 import {
-  type PeerLoopControlAvailability,
   type PeerLoopError,
   type PeerLoopEvent,
   type PeerLoopHaltKind,
@@ -399,61 +398,94 @@ export interface PeerLoopControls {
   readonly canPause: boolean;
   readonly canResume: boolean;
   readonly canRecover: boolean;
-  /** Why every control is off, when they are. Peer Loop's reason, not ours. */
+  /**
+   * True for an interrupted run nobody is currently driving.
+   *
+   * Recovery needs a live controller, so the honest answer here is "resume
+   * first" rather than a Recover button that Peer Loop would refuse.
+   */
+  readonly resumeBeforeRecover: boolean;
+  /** Why the live controls are off, when they are. Peer Loop's reason, not ours. */
   readonly unavailableReason: string | null;
 }
 
-const CONTROL_REASON: Readonly<Record<PeerLoopControlAvailability["reason"], string>> = {
-  live_in_this_bridge: "",
-  held_by_other_process:
-    "Another Peer Loop process is driving this project. You can read the run here; nothing will be sent.",
-  not_attached: "Peer Loop is not driving this run right now.",
-};
+const HELD_BY_OTHER =
+  "Another Peer Loop process is driving this project. You can read the run here; nothing will be sent.";
+const NOT_ATTACHED =
+  "Peer Loop is not driving this run right now. Resume takes control; the other controls need it.";
+
+const NO_CONTROLS = {
+  canSendOwnerMessage: false,
+  canPause: false,
+  canResume: false,
+  canRecover: false,
+  resumeBeforeRecover: false,
+} as const;
 
 /**
- * Which controls Peer Loop will actually accept.
+ * Which controls Peer Loop will actually accept, from the snapshot it sent.
  *
- * Availability is Peer Loop's answer, forwarded. This only decides what to grey
- * out — it never enables a control Peer Loop said was unavailable, and it never
- * predicts that one would have succeeded.
+ * THE THREE COMBINATIONS THAT EXIST, AND THEY ARE NOT INTERCHANGEABLE:
+ *
+ *   - `available: true` / `live_in_this_bridge` — this bridge is the live
+ *     writer. Owner messages, pause and recovery are all live commands and are
+ *     only offered here;
+ *   - `available: false` / `held_by_other_process` — someone else holds the
+ *     project lease. Entirely read-only. T3 Code does not signal, take over or
+ *     shut down the other session;
+ *   - `available: false` / `not_attached` — the ordinary snapshot of a stopped
+ *     run. `resumable` says whether `run.resume` may take control, and that is
+ *     the *only* thing offered: reading `available: false` as "nothing is
+ *     possible" would leave every stopped run permanently unstartable.
+ *
+ * An interrupted run in that third state therefore shows Resume, not Recover.
+ * Recovery is a live command; resuming establishes control first — and it does
+ * not replay the interrupted task, which stays an explicit owner choice.
  */
 export function describeControls(view: PeerLoopRunView): PeerLoopControls {
   const control = view.control;
   const state = view.state;
-  if (control === null || state === null) {
-    return {
-      canSendOwnerMessage: false,
-      canPause: false,
-      canResume: false,
-      canRecover: false,
-      unavailableReason: null,
-    };
-  }
-
-  if (!control.available) {
-    return {
-      canSendOwnerMessage: false,
-      canPause: false,
-      canResume: false,
-      canRecover: false,
-      unavailableReason: CONTROL_REASON[control.reason] ?? null,
-    };
-  }
+  if (control === null || state === null) return { ...NO_CONTROLS, unavailableReason: null };
 
   const terminal = state.state === "done" || state.state === "error";
   const interrupted = state.state === "interrupted";
-  const working = state.state === "reviewer_working" || state.state === "builder_working";
+
+  if (!control.available) {
+    if (control.reason === "held_by_other_process") {
+      return { ...NO_CONTROLS, unavailableReason: HELD_BY_OTHER };
+    }
+    // `not_attached`: nobody is driving. Resume is the way in, when Peer Loop
+    // says the run can be resumed at all.
+    const canResume = control.resumable && !terminal;
+    return {
+      ...NO_CONTROLS,
+      canResume,
+      resumeBeforeRecover: canResume && interrupted,
+      unavailableReason: terminal ? null : NOT_ATTACHED,
+    };
+  }
+
+  if (terminal) return { ...NO_CONTROLS, unavailableReason: null };
 
   return {
-    // An owner message is queued for the next Reviewer turn, so it is
-    // legitimate whenever the run can still move.
-    canSendOwnerMessage: !terminal && !interrupted,
-    canPause: working || state.state === "idle" || state.state === "owner_required",
+    // Queued for the next Reviewer turn, so it is legitimate whenever this
+    // bridge is driving and the run can still move. Not while interrupted:
+    // nothing will read the queue until the turn is resolved.
+    canSendOwnerMessage: !interrupted,
+    // Pause is a live command against the bridge that is driving.
+    canPause: !interrupted,
     // Peer Loop says whether a run can be resumed. Nothing here infers it.
-    canResume: control.resumable && !terminal,
+    canResume: control.resumable,
     canRecover: interrupted,
+    resumeBeforeRecover: false,
     unavailableReason: null,
   };
+}
+
+/** True while the run is working, so a pause takes effect at a boundary. */
+export function pauseTakesEffectLater(view: PeerLoopRunView): boolean {
+  const state = view.state?.state;
+  return state === "reviewer_working" || state === "builder_working";
 }
 
 export const RECOVERY_CHOICES = [
@@ -671,4 +703,101 @@ export function describeDetail(view: PeerLoopRunView): PeerLoopDetailSummary {
     queuedOwnerMessages: state.queuedOwnerMessages.length,
     projectPath: state.projectPath,
   };
+}
+
+/* ------------------------------------------------- owner-facing structure */
+
+export interface PeerLoopOwnerDecision {
+  readonly question: string;
+  readonly why: string;
+  readonly options: readonly string[];
+}
+
+/**
+ * The question the Reviewer escalated, as Peer Loop recorded it.
+ *
+ * Two places carry it and they are not redundant: the run outcome is what the
+ * subscription reports the moment it happens, and `lastReviewerDecision` is what
+ * the durable state file still holds afterwards. The outcome wins when both are
+ * present; nothing is reconstructed from prose either way.
+ */
+export function describeOwnerDecision(view: PeerLoopRunView): PeerLoopOwnerDecision | null {
+  const outcome = view.outcome;
+  if (outcome?.kind === "owner_required") {
+    return {
+      question: truncate(outcome.question, PEER_LOOP_OWNER_TEXT_CHARS),
+      why: truncate(outcome.why, PEER_LOOP_OWNER_TEXT_CHARS),
+      options: boundedOptions(outcome.options),
+    };
+  }
+
+  const decision = view.state?.lastReviewerDecision ?? null;
+  if (decision === null || decision.decision !== "OWNER_REQUIRED") return null;
+  return {
+    question: truncate(decision.ownerQuestion, PEER_LOOP_OWNER_TEXT_CHARS),
+    why: truncate(decision.whyOwnerIsRequired, PEER_LOOP_OWNER_TEXT_CHARS),
+    options: boundedOptions(decision.options),
+  };
+}
+
+/** A question and its reasons get more room than a feed line, but not unbounded. */
+export const PEER_LOOP_OWNER_TEXT_CHARS = 1_000;
+/** However many options a Reviewer produced, a phone shows a workable number. */
+export const PEER_LOOP_OWNER_OPTION_LIMIT = 8;
+
+const boundedOptions = (options: readonly string[]): readonly string[] =>
+  options
+    .slice(0, PEER_LOOP_OWNER_OPTION_LIMIT)
+    .map((option) => truncate(option, 200))
+    .filter((option) => option.length > 0);
+
+export interface PeerLoopFailureEvidence {
+  readonly kind: "CAPACITY_EXHAUSTED" | "AUTH_REQUIRED" | "TRANSPORT_INTERRUPTED";
+  readonly title: string;
+  /** Peer Loop's own bounded excerpt of what the CLI said. */
+  readonly evidence: string;
+  readonly source: string;
+  /** Only when the CLI actually stated one. Never invented. */
+  readonly resetAt: string | null;
+}
+
+const FAILURE_TITLES: Readonly<Record<PeerLoopFailureEvidence["kind"], string>> = {
+  CAPACITY_EXHAUSTED: "The Builder's capacity ran out",
+  AUTH_REQUIRED: "The Builder CLI needs signing in",
+  TRANSPORT_INTERRUPTED: "The Builder turn was cut off",
+};
+
+/**
+ * What Peer Loop recorded about the last Builder failure.
+ *
+ * `resetAt` is null unless the CLI stated one, and its absence is shown as
+ * "no reset time given" rather than as "no limit" — inventing a time here would
+ * be T3 Code guessing at somebody's quota.
+ */
+export function describeFailureEvidence(view: PeerLoopRunView): PeerLoopFailureEvidence | null {
+  const failure = view.state?.lastBuilderFailure ?? null;
+  if (failure === null || failure === undefined) return null;
+  return {
+    kind: failure.kind,
+    title: FAILURE_TITLES[failure.kind],
+    evidence: truncate(failure.evidence, PEER_LOOP_EVIDENCE_CHARS),
+    source: failure.source,
+    resetAt: failure.resetAt,
+  };
+}
+
+export const PEER_LOOP_EVIDENCE_CHARS = 600;
+
+/**
+ * The final state of a finished run, when Peer Loop recorded one.
+ *
+ * From the outcome first, then the durable Reviewer decision. Never derived
+ * from the run state alone: "done" says it finished, not how.
+ */
+export function describeFinalState(view: PeerLoopRunView): string | null {
+  const outcome = view.outcome;
+  if (outcome?.kind === "done") return truncate(outcome.finalState, 200);
+  const decision = view.state?.lastReviewerDecision ?? null;
+  if (decision !== null && decision.decision === "DONE") return truncate(decision.finalState, 200);
+  return null;
 }

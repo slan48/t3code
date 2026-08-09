@@ -1,6 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 
 import { PeerLoopIndexView } from "../components/peerLoop/PeerLoopIndexView";
 import {
@@ -10,7 +10,7 @@ import {
 } from "../components/peerLoop/PeerLoopStartRun";
 import { existingRunIdFromRefusal } from "~/peerLoopPresentation";
 import { peerLoopRunsAtom, peerLoopStatusAtom } from "../state/peerLoop";
-import { usePeerLoopStartRun } from "../state/peerLoopCommands";
+import { usePeerLoopStartRun, useRefreshPeerLoopRuns } from "../state/peerLoopCommands";
 import { environmentProjects } from "../state/projects";
 import { primaryEnvironmentIdAtom } from "../state/primaryEnvironment";
 
@@ -30,7 +30,7 @@ function PeerLoopIndexRoute() {
     environmentProjects.environmentProjectsAtom(environmentId ?? ("" as never)),
   );
   const start = usePeerLoopStartRun();
-  const [refusalRunId, setRefusalRunId] = useState<string | null>(null);
+  const refreshRuns = useRefreshPeerLoopRuns();
 
   const projects = useMemo<readonly StartRunProject[]>(
     () =>
@@ -46,7 +46,6 @@ function PeerLoopIndexRoute() {
   const onSubmit = useCallback(
     (submission: StartRunSubmission) => {
       if (environmentId === null) return;
-      setRefusalRunId(null);
       void start
         .invoke({
           environmentId,
@@ -59,18 +58,25 @@ function PeerLoopIndexRoute() {
           },
         })
         .then((result) => {
-          if (result !== null) {
-            void navigate({ to: "/peer-loop/$runId", params: { runId: result.runId } });
-          }
+          if (result === null) return;
+          // Re-read the list before leaving, so coming back shows the new run
+          // rather than waiting out the poll. Nothing is sent a second time.
+          refreshRuns();
+          void navigate({ to: "/peer-loop/$runId", params: { runId: result.runId } });
         });
     },
-    [environmentId, navigate, start],
+    [environmentId, navigate, refreshRuns, start],
   );
 
   // A duplicate-run refusal names the run that already exists, which is a far
   // better answer than an override that would fork the Reviewer's conversation.
+  // The raw refusal is kept beside its sanitized presentation precisely so this
+  // is readable without rendering anything unbounded.
   const startError = start.state.error;
-  const existingRunId = useMemo(() => refusalRunId, [refusalRunId]);
+  const existingRunId = useMemo(
+    () => (start.state.failure === null ? null : existingRunIdFromRefusal(start.state.failure)),
+    [start.state.failure],
+  );
 
   return (
     <PeerLoopIndexView

@@ -122,6 +122,18 @@ Web, the desktop app and a browser on your phone all use exactly this surface.
   interrupted task again asks a second time first, because that task may already
   have changed the repository.
 
+  If nothing is currently driving the run — the usual state of a run you come
+  back to — the page asks you to **Resume first**. Resolving an interrupted turn
+  is a live command, so Peer Loop has to be driving the run before it can accept
+  one. Resuming runs a Reviewer turn and does **not** replay the interrupted
+  Builder task; the three choices appear afterwards, once Peer Loop is in
+  control.
+
+- **Answer the Reviewer.** When it escalates a decision, the page shows the exact
+  question, why it cannot decide, and each option it offered. Sending an option
+  is one press and it goes as an ordinary owner message — nothing is sent because
+  the page rendered it.
+
 ## Shutting down
 
 Stopping the T3 Code server asks Peer Loop to stop too, and Peer Loop's next safe
@@ -161,6 +173,10 @@ setting it.
 - **A Builder turn was cut off partway.** The run is paused, not failed, and the
   repository may already have changed. Resuming runs a Reviewer turn first; the
   interrupted task is never replayed on its own.
+- **This run could not be read.** A run that no longer exists, a connection that
+  dropped, a session that is no longer authorized — you are told which, and
+  offered a button that looks again. Looking again only reads: nothing about the
+  run is started, resumed or resolved by it.
 - **The bridge stopped.** Your runs are unaffected — Peer Loop's record of them is
   on disk and nothing about them changed. T3 Code says the connection ended and
   waits for you; it does not restart a run to tidy the screen up.

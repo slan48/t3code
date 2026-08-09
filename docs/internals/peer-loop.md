@@ -412,7 +412,7 @@ they are the same kind of thing.
 | `apps/web/src/peerLoopPresentation.ts`   | Every word the surface renders, as pure functions    |
 | `apps/web/src/components/peerLoop/`      | Prop-driven views, server-renderable in tests        |
 
-Four rules the UI is built on:
+Five rules the UI is built on:
 
 - **The sidebar entry is static.** It must not read the status atom, because the
   first Peer Loop RPC is what spawns the bridge — an always-mounted component
@@ -428,6 +428,40 @@ Four rules the UI is built on:
 - **Peer Loop decides.** Every label comes from its structured state, outcome,
   halt reason or control availability. Nothing is derived from prose, and a
   control Peer Loop said was unavailable is never enabled.
+- **`available: false` means two different things.** `held_by_other_process` is
+  read-only — someone else holds the project lease and T3 Code neither signals
+  nor takes over. `not_attached` is the ordinary snapshot of a run nobody is
+  driving, and `resumable` there says `run.resume` may take control. Reading the
+  flag alone would leave every stopped run permanently unstartable.
+
+**Resume before Recover.** Recovery is a live command, so an interrupted run in
+the `not_attached` state shows Resume and an explanation rather than a Recover
+button Peer Loop would refuse. Resuming establishes control and does not replay
+the interrupted Builder task; observation is then restarted, and the three
+choices appear from the live snapshot that comes back.
+
+**Restarting observation is a refresh, not a cursor write.** The subscription
+atom is keyed by `(environment, run, afterSeq)`, so setting the cursor to the
+value it already holds re-subscribes to nothing — which is exactly the case a
+resync produces, since the safe cursor is usually where the view already is.
+`useAtomRefresh` on that atom tears the completed stream down and opens one
+replacement. The reducer view survives it: a restart at the cursor the view was
+already trimmed to keeps `needsResync`, the snapshot and the activity at or
+below that cursor, because that is what the client can still vouch for.
+
+Every successful mutation restarts observation and refreshes the run list —
+observation only. Nothing is replayed, and a timed-out mutation is never retried
+whatever the owner does next.
+
+**A failed subscription is visible.** A missing run, a dropped transport or an
+unauthorized session renders as itself with a retry that only reads, not as a
+run with nothing in it.
+
+**The command gate is a closure flag, not React state.** A flag set inside a
+`setState` updater is not a gate: two presses in the same tick both read
+`pending: false` before either render lands, and for `run.ownerMessage` that
+queues the same message twice. `createPeerLoopCommandGate` is plain, testable
+and released on success, refusal, defect and teardown.
 
 Start Run offers only projects this environment already knows and sends that
 project's own `workspaceRoot`. No executable path, no permission mode, no
