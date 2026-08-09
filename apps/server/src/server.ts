@@ -44,6 +44,7 @@ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
+import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
@@ -327,6 +328,16 @@ const TerminalLayerLive = TerminalManager.layer.pipe(
  */
 const AgentRunsLayerLive = AgentRunsService.layer.pipe(Layer.provide(ProcessRunner.layer));
 
+/**
+ * Control of an external Peer Loop, over a local stdio bridge.
+ *
+ * Nothing else in the runtime depends on this and it spawns nothing until a
+ * Peer Loop RPC is called, so an install without Peer Loop is unaffected —
+ * including at startup, which is why the layer only builds the service and
+ * never connects.
+ */
+const PeerLoopLayerLive = PeerLoopService.layer;
+
 const PreviewLayerLive = Layer.empty.pipe(
   Layer.provideMerge(PreviewManager.layer),
   Layer.provideMerge(PortScannerLayerLive),
@@ -376,7 +387,9 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(GitLayerLive),
   Layer.provideMerge(VcsLayerLive),
   Layer.provideMerge(ProviderRuntimeLayerLive),
-  Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive, AgentRunsLayerLive)),
+  Layer.provideMerge(
+    Layer.mergeAll(TerminalLayerLive, PreviewLayerLive, AgentRunsLayerLive, PeerLoopLayerLive),
+  ),
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provideMerge(Keybindings.layer),
   Layer.provideMerge(ProviderRegistryLive),

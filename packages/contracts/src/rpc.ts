@@ -71,6 +71,27 @@ import {
   AgentRunsListInput,
   AgentRunsListResult,
 } from "./agentRuns.ts";
+import {
+  PEER_LOOP_WS_METHODS,
+  PeerLoopAttachRunInput,
+  PeerLoopAttachResult,
+  PeerLoopError,
+  PeerLoopListRunsInput,
+  PeerLoopListRunsResult,
+  PeerLoopOwnerMessageResult,
+  PeerLoopPauseResult,
+  PeerLoopRecoverResult,
+  PeerLoopRecoverRunInput,
+  PeerLoopResumeResult,
+  PeerLoopRunIdInput,
+  PeerLoopSendOwnerMessageInput,
+  PeerLoopStartResult,
+  PeerLoopStartRunInput,
+  PeerLoopStatusInput,
+  PeerLoopStatusResult,
+  PeerLoopSubscribeEventsInput,
+  PeerLoopSubscriptionEvent,
+} from "./peerLoop.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -230,6 +251,17 @@ export const WS_METHODS = {
   // Agent run observability (read-only view of an external orchestrator)
   agentRunsList: AGENT_RUNS_WS_METHODS.list,
   agentRunsGet: AGENT_RUNS_WS_METHODS.get,
+
+  // Peer Loop (controllable Reviewer/Builder loop behind a local stdio bridge)
+  peerLoopStatus: PEER_LOOP_WS_METHODS.status,
+  peerLoopListRuns: PEER_LOOP_WS_METHODS.listRuns,
+  peerLoopAttachRun: PEER_LOOP_WS_METHODS.attachRun,
+  peerLoopStartRun: PEER_LOOP_WS_METHODS.startRun,
+  peerLoopResumeRun: PEER_LOOP_WS_METHODS.resumeRun,
+  peerLoopSendOwnerMessage: PEER_LOOP_WS_METHODS.sendOwnerMessage,
+  peerLoopPauseRun: PEER_LOOP_WS_METHODS.pauseRun,
+  peerLoopRecoverRun: PEER_LOOP_WS_METHODS.recoverRun,
+  peerLoopSubscribeEvents: PEER_LOOP_WS_METHODS.subscribeEvents,
 
   // Server meta
   serverProbe: "server.probe",
@@ -786,6 +818,71 @@ export const WsAgentRunsGetRpc = Rpc.make(WS_METHODS.agentRunsGet, {
   error: Schema.Union([AgentRunsError, EnvironmentAuthorizationError]),
 });
 
+/**
+ * Peer Loop control and observation.
+ *
+ * Every method is method-specific: there is deliberately no generic
+ * "send this bridge method" RPC, because that would make the wire surface a
+ * pass-through for whatever a client invented rather than a contract T3Code
+ * can authorize and validate.
+ */
+const peerLoopError = Schema.Union([PeerLoopError, EnvironmentAuthorizationError]);
+
+export const WsPeerLoopStatusRpc = Rpc.make(WS_METHODS.peerLoopStatus, {
+  payload: PeerLoopStatusInput,
+  success: PeerLoopStatusResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopListRunsRpc = Rpc.make(WS_METHODS.peerLoopListRuns, {
+  payload: PeerLoopListRunsInput,
+  success: PeerLoopListRunsResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopAttachRunRpc = Rpc.make(WS_METHODS.peerLoopAttachRun, {
+  payload: PeerLoopAttachRunInput,
+  success: PeerLoopAttachResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopStartRunRpc = Rpc.make(WS_METHODS.peerLoopStartRun, {
+  payload: PeerLoopStartRunInput,
+  success: PeerLoopStartResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopResumeRunRpc = Rpc.make(WS_METHODS.peerLoopResumeRun, {
+  payload: PeerLoopRunIdInput,
+  success: PeerLoopResumeResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopSendOwnerMessageRpc = Rpc.make(WS_METHODS.peerLoopSendOwnerMessage, {
+  payload: PeerLoopSendOwnerMessageInput,
+  success: PeerLoopOwnerMessageResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopPauseRunRpc = Rpc.make(WS_METHODS.peerLoopPauseRun, {
+  payload: PeerLoopRunIdInput,
+  success: PeerLoopPauseResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopRecoverRunRpc = Rpc.make(WS_METHODS.peerLoopRecoverRun, {
+  payload: PeerLoopRecoverRunInput,
+  success: PeerLoopRecoverResult,
+  error: peerLoopError,
+});
+
+export const WsPeerLoopSubscribeEventsRpc = Rpc.make(WS_METHODS.peerLoopSubscribeEvents, {
+  payload: PeerLoopSubscribeEventsInput,
+  success: PeerLoopSubscriptionEvent,
+  error: peerLoopError,
+  stream: true,
+});
+
 export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess, {
   payload: Schema.Struct({}),
   success: AuthAccessStreamEvent,
@@ -882,6 +979,15 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeResourceTelemetryRpc,
   WsAgentRunsListRpc,
   WsAgentRunsGetRpc,
+  WsPeerLoopStatusRpc,
+  WsPeerLoopListRunsRpc,
+  WsPeerLoopAttachRunRpc,
+  WsPeerLoopStartRunRpc,
+  WsPeerLoopResumeRunRpc,
+  WsPeerLoopSendOwnerMessageRpc,
+  WsPeerLoopPauseRunRpc,
+  WsPeerLoopRecoverRunRpc,
+  WsPeerLoopSubscribeEventsRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

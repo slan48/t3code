@@ -73,6 +73,7 @@ import {
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as PeerLoopService from "./peerLoop/Service.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -366,6 +367,7 @@ const makeWsRpcLayer = (
       const terminalManager = yield* TerminalManager.TerminalManager;
       const previewManager = yield* PreviewManager.PreviewManager;
       const agentRuns = yield* AgentRunsService.AgentRunsService;
+      const peerLoop = yield* PeerLoopService.PeerLoopService;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -1958,6 +1960,45 @@ const makeWsRpcLayer = (
         [WS_METHODS.agentRunsGet]: (input) =>
           observeRpcEffect(WS_METHODS.agentRunsGet, agentRuns.get(input.runId), {
             "rpc.aggregate": "agent-runs",
+          }),
+        // Peer Loop. Every handler is a pass-through to the bridge service:
+        // T3Code forwards owner intent and returns what Peer Loop says, so a
+        // refusal keeps its stable code instead of becoming a generic failure.
+        [WS_METHODS.peerLoopStatus]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopStatus, peerLoop.status(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopListRuns]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopListRuns, peerLoop.listRuns(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopAttachRun]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopAttachRun, peerLoop.attachRun(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopStartRun]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopStartRun, peerLoop.startRun(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopResumeRun]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopResumeRun, peerLoop.resumeRun(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopSendOwnerMessage]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopSendOwnerMessage, peerLoop.sendOwnerMessage(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopPauseRun]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopPauseRun, peerLoop.pauseRun(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopRecoverRun]: (input) =>
+          observeRpcEffect(WS_METHODS.peerLoopRecoverRun, peerLoop.recoverRun(input), {
+            "rpc.aggregate": "peer-loop",
+          }),
+        [WS_METHODS.peerLoopSubscribeEvents]: (input) =>
+          observeRpcStream(WS_METHODS.peerLoopSubscribeEvents, peerLoop.subscribeEvents(input), {
+            "rpc.aggregate": "peer-loop",
           }),
         [WS_METHODS.previewList]: (input) =>
           observeRpcEffect(WS_METHODS.previewList, previewManager.list(input), {

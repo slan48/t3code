@@ -37,6 +37,30 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.cloudInstallRelayClient)).toBe(AuthRelayWriteScope);
   });
 
+  it("separates Peer Loop observation from Peer Loop control", () => {
+    for (const method of [
+      WS_METHODS.peerLoopStatus,
+      WS_METHODS.peerLoopListRuns,
+      WS_METHODS.peerLoopAttachRun,
+      WS_METHODS.peerLoopSubscribeEvents,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+
+    // Anything that makes an agent act, spends subscription capacity, or
+    // resolves an interrupted turn needs operate — recovery most of all, since
+    // one of its choices replays a Builder task that may already have run.
+    for (const method of [
+      WS_METHODS.peerLoopStartRun,
+      WS_METHODS.peerLoopResumeRun,
+      WS_METHODS.peerLoopSendOwnerMessage,
+      WS_METHODS.peerLoopPauseRun,
+      WS_METHODS.peerLoopRecoverRun,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
   it("rejects unknown RPC method names", () => {
     for (const method of ["server.notRegistered", "toString", "constructor"]) {
       expect(() => requiredScopeForRpcMethod(method)).toThrow(

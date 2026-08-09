@@ -71,6 +71,14 @@
       "types": "./src/state/orchestration.ts",
       "default": "./src/state/orchestration.ts"
     },
+    "./state/peer-loop": {
+      "types": "./src/state/peerLoop.ts",
+      "default": "./src/state/peerLoop.ts"
+    },
+    "./state/peer-loop-reducer": {
+      "types": "./src/state/peerLoopReducer.ts",
+      "default": "./src/state/peerLoopReducer.ts"
+    },
     "./state/presentation": {
       "types": "./src/state/presentation.ts",
       "default": "./src/state/presentation.ts"

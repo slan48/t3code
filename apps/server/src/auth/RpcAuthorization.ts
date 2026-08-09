@@ -104,6 +104,19 @@ export const RPC_REQUIRED_SCOPES = {
   // method: T3Code cannot resume, recover, or kill a run.
   [WS_METHODS.agentRunsList]: AuthOrchestrationReadScope,
   [WS_METHODS.agentRunsGet]: AuthOrchestrationReadScope,
+  // Peer Loop. Reading what a run is doing is a read; anything that makes an
+  // agent act, spends subscription capacity, or resolves an interrupted turn is
+  // an operate. `recoverRun` in particular can authorize replaying a Builder
+  // task that may already have changed the repository.
+  [WS_METHODS.peerLoopStatus]: AuthOrchestrationReadScope,
+  [WS_METHODS.peerLoopListRuns]: AuthOrchestrationReadScope,
+  [WS_METHODS.peerLoopAttachRun]: AuthOrchestrationReadScope,
+  [WS_METHODS.peerLoopSubscribeEvents]: AuthOrchestrationReadScope,
+  [WS_METHODS.peerLoopStartRun]: AuthOrchestrationOperateScope,
+  [WS_METHODS.peerLoopResumeRun]: AuthOrchestrationOperateScope,
+  [WS_METHODS.peerLoopSendOwnerMessage]: AuthOrchestrationOperateScope,
+  [WS_METHODS.peerLoopPauseRun]: AuthOrchestrationOperateScope,
+  [WS_METHODS.peerLoopRecoverRun]: AuthOrchestrationOperateScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

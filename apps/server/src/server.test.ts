@@ -8,6 +8,7 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AgentRunsNotFoundError,
+  PeerLoopUnavailableError,
   AuthTokenExchangeGrantType,
   CommandId,
   DEFAULT_SERVER_SETTINGS,
@@ -93,6 +94,7 @@ import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
+import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
@@ -706,6 +708,38 @@ const buildAppUnderTest = (options?: {
             home: Effect.succeed(null),
             list: Effect.succeed({ runs: [], unreadable: [] }),
             get: (runId) => Effect.fail(new AgentRunsNotFoundError({ runId })),
+          }),
+          // Peer Loop, stubbed as unconfigured for the same reason: the WS
+          // surface must build and answer on a machine that has no Peer Loop
+          // installed, and no test may spawn one.
+          Layer.mock(PeerLoopService.PeerLoopService)({
+            status: () =>
+              Effect.succeed({
+                configured: false,
+                executableSource: "none" as const,
+                transport: {
+                  state: "unavailable" as const,
+                  changedAt: "2026-01-01T00:00:00.000Z",
+                  detail: null,
+                  protocolVersion: null,
+                },
+                health: null,
+              }),
+            listRuns: () => Effect.succeed({ runs: [], unreadable: [] }),
+            attachRun: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            startRun: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            resumeRun: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            sendOwnerMessage: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            pauseRun: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            recoverRun: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+            subscribeEvents: () => Stream.empty,
+            diagnostics: Effect.succeed([]),
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),

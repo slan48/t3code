@@ -43,6 +43,29 @@ export const LocalConfig = Schema.Struct({
    * run at a different home without editing the installed app's config.
    */
   orchestratorHome: Schema.optional(Schema.String),
+
+  /**
+   * The `peer-loop` executable this machine should drive.
+   *
+   * A bare name is resolved on PATH; anything with a separator in it must be
+   * absolute. Here rather than in settings for the same reason as everything
+   * else in this file: it names a program on this machine's filesystem, and a
+   * phone on the tailnet must not be able to point the server at a different
+   * one. No RPC reads it on demand, none writes it, and the resolved path is
+   * never sent to a client.
+   */
+  peerLoopExecutable: Schema.optional(Schema.String),
+
+  /**
+   * Absolute path to a Peer Loop Node entry file, run with this server's own
+   * `process.execPath`.
+   *
+   * For a checkout rather than an install: `…/peer-loop/dist/cli/main.js`. It
+   * exists because a packaged GUI has no login shell and no `peer-loop` on
+   * PATH, and because a developer wants to drive the build they just made.
+   * Lower precedence than `peerLoopExecutable`.
+   */
+  peerLoopNodeEntry: Schema.optional(Schema.String),
 });
 export type LocalConfig = typeof LocalConfig.Type;
 
