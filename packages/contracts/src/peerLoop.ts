@@ -1023,6 +1023,20 @@ export type PeerLoopSubscribeEventsInput = typeof PeerLoopSubscribeEventsInput.T
  */
 export const PeerLoopSubscriptionEvent = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("transport"), transport: PeerLoopTransportStatus }),
+  /**
+   * The snapshot this subscription's own `run.attach` already produced.
+   *
+   * A T3 transport convenience and nothing more: it is Peer Loop's validated
+   * answer, forwarded verbatim. Without it a UI would have to issue a second
+   * `run.attach` purely to learn the run's state and whether it may be
+   * controlled — a duplicate replay, serialised behind the first one, for data
+   * this server already had. Emitted once, before any backlog activity.
+   */
+  Schema.Struct({
+    kind: Schema.Literal("run-attached"),
+    runId: TrimmedNonEmptyString,
+    snapshot: PeerLoopAttachResult,
+  }),
   Schema.Struct({
     kind: Schema.Literal("run-event"),
     runId: TrimmedNonEmptyString,

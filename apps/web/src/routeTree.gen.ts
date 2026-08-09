@@ -10,10 +10,12 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as PeerLoopRouteImport } from './routes/peer-loop'
 import { Route as PairRouteImport } from './routes/pair'
 import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as AgentRunsRouteImport } from './routes/agent-runs'
 import { Route as ChatRouteImport } from './routes/_chat'
+import { Route as PeerLoopIndexRouteImport } from './routes/peer-loop.index'
 import { Route as AgentRunsIndexRouteImport } from './routes/agent-runs.index'
 import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as SettingsSourceControlRouteImport } from './routes/settings.source-control'
@@ -25,6 +27,7 @@ import { Route as SettingsConnectionsRouteImport } from './routes/settings.conne
 import { Route as SettingsBetaRouteImport } from './routes/settings.beta'
 import { Route as SettingsArchivedRouteImport } from './routes/settings.archived'
 import { Route as SettingsAppearanceRouteImport } from './routes/settings.appearance'
+import { Route as PeerLoopRunIdRouteImport } from './routes/peer-loop.$runId'
 import { Route as ConnectCallbackRouteImport } from './routes/connect_.callback'
 import { Route as AgentRunsRunIdRouteImport } from './routes/agent-runs.$runId'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
@@ -33,6 +36,11 @@ import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$e
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PeerLoopRoute = PeerLoopRouteImport.update({
+  id: '/peer-loop',
+  path: '/peer-loop',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PairRoute = PairRouteImport.update({
@@ -53,6 +61,11 @@ const AgentRunsRoute = AgentRunsRouteImport.update({
 const ChatRoute = ChatRouteImport.update({
   id: '/_chat',
   getParentRoute: () => rootRouteImport,
+} as any)
+const PeerLoopIndexRoute = PeerLoopIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => PeerLoopRoute,
 } as any)
 const AgentRunsIndexRoute = AgentRunsIndexRouteImport.update({
   id: '/',
@@ -109,6 +122,11 @@ const SettingsAppearanceRoute = SettingsAppearanceRouteImport.update({
   path: '/appearance',
   getParentRoute: () => SettingsRoute,
 } as any)
+const PeerLoopRunIdRoute = PeerLoopRunIdRouteImport.update({
+  id: '/$runId',
+  path: '/$runId',
+  getParentRoute: () => PeerLoopRoute,
+} as any)
 const ConnectCallbackRoute = ConnectCallbackRouteImport.update({
   id: '/connect_/callback',
   path: '/connect/callback',
@@ -136,9 +154,11 @@ export interface FileRoutesByFullPath {
   '/agent-runs': typeof AgentRunsRouteWithChildren
   '/connect': typeof ConnectRoute
   '/pair': typeof PairRoute
+  '/peer-loop': typeof PeerLoopRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
   '/agent-runs/$runId': typeof AgentRunsRunIdRoute
   '/connect/callback': typeof ConnectCallbackRoute
+  '/peer-loop/$runId': typeof PeerLoopRunIdRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -149,6 +169,7 @@ export interface FileRoutesByFullPath {
   '/settings/providers': typeof SettingsProvidersRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/agent-runs/': typeof AgentRunsIndexRoute
+  '/peer-loop/': typeof PeerLoopIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -158,6 +179,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRouteWithChildren
   '/agent-runs/$runId': typeof AgentRunsRunIdRoute
   '/connect/callback': typeof ConnectCallbackRoute
+  '/peer-loop/$runId': typeof PeerLoopRunIdRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -169,6 +191,7 @@ export interface FileRoutesByTo {
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/': typeof ChatIndexRoute
   '/agent-runs': typeof AgentRunsIndexRoute
+  '/peer-loop': typeof PeerLoopIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -178,9 +201,11 @@ export interface FileRoutesById {
   '/agent-runs': typeof AgentRunsRouteWithChildren
   '/connect': typeof ConnectRoute
   '/pair': typeof PairRoute
+  '/peer-loop': typeof PeerLoopRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
   '/agent-runs/$runId': typeof AgentRunsRunIdRoute
   '/connect_/callback': typeof ConnectCallbackRoute
+  '/peer-loop/$runId': typeof PeerLoopRunIdRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/archived': typeof SettingsArchivedRoute
   '/settings/beta': typeof SettingsBetaRoute
@@ -192,6 +217,7 @@ export interface FileRoutesById {
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/_chat/': typeof ChatIndexRoute
   '/agent-runs/': typeof AgentRunsIndexRoute
+  '/peer-loop/': typeof PeerLoopIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
 }
@@ -202,9 +228,11 @@ export interface FileRouteTypes {
     | '/agent-runs'
     | '/connect'
     | '/pair'
+    | '/peer-loop'
     | '/settings'
     | '/agent-runs/$runId'
     | '/connect/callback'
+    | '/peer-loop/$runId'
     | '/settings/appearance'
     | '/settings/archived'
     | '/settings/beta'
@@ -215,6 +243,7 @@ export interface FileRouteTypes {
     | '/settings/providers'
     | '/settings/source-control'
     | '/agent-runs/'
+    | '/peer-loop/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
   fileRoutesByTo: FileRoutesByTo
@@ -224,6 +253,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/agent-runs/$runId'
     | '/connect/callback'
+    | '/peer-loop/$runId'
     | '/settings/appearance'
     | '/settings/archived'
     | '/settings/beta'
@@ -235,6 +265,7 @@ export interface FileRouteTypes {
     | '/settings/source-control'
     | '/'
     | '/agent-runs'
+    | '/peer-loop'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
   id:
@@ -243,9 +274,11 @@ export interface FileRouteTypes {
     | '/agent-runs'
     | '/connect'
     | '/pair'
+    | '/peer-loop'
     | '/settings'
     | '/agent-runs/$runId'
     | '/connect_/callback'
+    | '/peer-loop/$runId'
     | '/settings/appearance'
     | '/settings/archived'
     | '/settings/beta'
@@ -257,6 +290,7 @@ export interface FileRouteTypes {
     | '/settings/source-control'
     | '/_chat/'
     | '/agent-runs/'
+    | '/peer-loop/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
   fileRoutesById: FileRoutesById
@@ -266,6 +300,7 @@ export interface RootRouteChildren {
   AgentRunsRoute: typeof AgentRunsRouteWithChildren
   ConnectRoute: typeof ConnectRoute
   PairRoute: typeof PairRoute
+  PeerLoopRoute: typeof PeerLoopRouteWithChildren
   SettingsRoute: typeof SettingsRouteWithChildren
   ConnectCallbackRoute: typeof ConnectCallbackRoute
 }
@@ -277,6 +312,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/peer-loop': {
+      id: '/peer-loop'
+      path: '/peer-loop'
+      fullPath: '/peer-loop'
+      preLoaderRoute: typeof PeerLoopRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/pair': {
@@ -306,6 +348,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/'
       preLoaderRoute: typeof ChatRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/peer-loop/': {
+      id: '/peer-loop/'
+      path: '/'
+      fullPath: '/peer-loop/'
+      preLoaderRoute: typeof PeerLoopIndexRouteImport
+      parentRoute: typeof PeerLoopRoute
     }
     '/agent-runs/': {
       id: '/agent-runs/'
@@ -384,6 +433,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsAppearanceRouteImport
       parentRoute: typeof SettingsRoute
     }
+    '/peer-loop/$runId': {
+      id: '/peer-loop/$runId'
+      path: '/$runId'
+      fullPath: '/peer-loop/$runId'
+      preLoaderRoute: typeof PeerLoopRunIdRouteImport
+      parentRoute: typeof PeerLoopRoute
+    }
     '/connect_/callback': {
       id: '/connect_/callback'
       path: '/connect/callback'
@@ -443,6 +499,20 @@ const AgentRunsRouteWithChildren = AgentRunsRoute._addFileChildren(
   AgentRunsRouteChildren,
 )
 
+interface PeerLoopRouteChildren {
+  PeerLoopRunIdRoute: typeof PeerLoopRunIdRoute
+  PeerLoopIndexRoute: typeof PeerLoopIndexRoute
+}
+
+const PeerLoopRouteChildren: PeerLoopRouteChildren = {
+  PeerLoopRunIdRoute: PeerLoopRunIdRoute,
+  PeerLoopIndexRoute: PeerLoopIndexRoute,
+}
+
+const PeerLoopRouteWithChildren = PeerLoopRoute._addFileChildren(
+  PeerLoopRouteChildren,
+)
+
 interface SettingsRouteChildren {
   SettingsAppearanceRoute: typeof SettingsAppearanceRoute
   SettingsArchivedRoute: typeof SettingsArchivedRoute
@@ -476,6 +546,7 @@ const rootRouteChildren: RootRouteChildren = {
   AgentRunsRoute: AgentRunsRouteWithChildren,
   ConnectRoute: ConnectRoute,
   PairRoute: PairRoute,
+  PeerLoopRoute: PeerLoopRouteWithChildren,
   SettingsRoute: SettingsRouteWithChildren,
   ConnectCallbackRoute: ConnectCallbackRoute,
 }

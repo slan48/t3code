@@ -337,10 +337,63 @@ describe("Peer Loop T3 surface", () => {
       },
       { kind: "run-resync", runId: "run-1", afterSeq: 3, reason: "re-attach" },
       { kind: "run-synced", runId: "run-1", afterSeq: 5, eventHighWaterMark: 5 },
+      {
+        kind: "run-attached",
+        runId: "run-1",
+        snapshot: {
+          runId: "run-1",
+          state: runStateWire,
+          control: {
+            available: true,
+            reason: "live_in_this_bridge",
+            liveWriter: null,
+            resumable: false,
+          },
+          eventHighWaterMark: 42,
+          replayFromSeq: 0,
+          live: true,
+        },
+      },
     ];
     for (const wire of kinds) {
       expect(Schema.decodeUnknownSync(PeerLoopSubscriptionEvent)(wire).kind).toBe(wire.kind);
     }
+  });
+
+  it("forwards the attach snapshot verbatim, including fields it does not model", () => {
+    // The subscription's snapshot is Peer Loop's answer, not a summary of it.
+    // A newer bridge's extra keys have to survive the trip or a UI that learns
+    // about them later would find them already discarded.
+    const decoded = decodeSubscriptionEvent({
+      kind: "run-attached",
+      runId: "run-1",
+      snapshot: {
+        runId: "run-1",
+        state: runStateWire,
+        control: {
+          available: false,
+          reason: "held_by_other_process",
+          liveWriter: null,
+          resumable: true,
+          somethingNewer: { detail: 1 },
+        },
+        eventHighWaterMark: 42,
+        replayFromSeq: 7,
+        live: false,
+        futureField: "kept",
+      },
+    });
+    if (decoded.kind !== "run-attached") throw new Error("unreachable");
+    expect(decoded.snapshot.control.resumable).toBe(true);
+    expect(decoded.snapshot.eventHighWaterMark).toBe(42);
+    expect(decoded.snapshot["futureField"]).toBe("kept");
+    expect(decoded.snapshot.control["somethingNewer"]).toEqual({ detail: 1 });
+  });
+
+  it("refuses an attach snapshot that is not a run snapshot", () => {
+    expect(() =>
+      decodeSubscriptionEvent({ kind: "run-attached", runId: "run-1", snapshot: {} }),
+    ).toThrow();
   });
 
   it("carries both cursors on the catch-up fact, and nothing else", () => {

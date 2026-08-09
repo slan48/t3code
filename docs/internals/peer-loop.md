@@ -290,6 +290,21 @@ subscription ends with exactly **one** `run-resync`, at a cursor it has actually
 delivered. Nothing follows it. The timeout is a recovery threshold, not a way to
 let the next attach in quietly.
 
+### `run-attached`
+
+The subscription's own `run.attach` answer, forwarded verbatim as the first
+thing after the opening transport fact and before any backlog. It exists so a UI
+does not have to issue a _second_ `run.attach` purely to learn a run's state and
+whether it may be controlled — that attach would trigger a duplicate replay and
+serialise behind the one already running, for data this server was already
+holding. It is a transport convenience, not a new fact: state, control
+availability and the boundary come straight from Peer Loop.
+
+The client reducer takes state, control and the boundary from it and touches
+nothing else. It does not move the cursor — an attach says what the run looks
+like, not what this client has been shown — does not clear `needsResync`, and
+does not discard retained activity.
+
 ### `run-synced`
 
 A T3 transport fact, not a Peer Loop one — it says nothing about the run. It
@@ -382,6 +397,47 @@ clock is simulated and would never let a timeout or a read fire.
 `Smoke.test.ts` runs against a real Peer Loop build when
 `T3_PEER_LOOP_SMOKE_ENTRY` points at its `dist/cli/main.js`, and is limited to
 `health` and `runs.list`: read-only, no agent, no credentials.
+
+## The web and desktop surface
+
+`/peer-loop` and `/peer-loop/$runId`, authenticated, mobile-first, and
+deliberately not merged with Agent Runs — that observes durable files T3 Code
+wrote, this drives a separate tool over a protocol, and one list would suggest
+they are the same kind of thing.
+
+| Module                                   | Responsibility                                       |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `apps/web/src/state/peerLoop.ts`         | Atoms over the primary environment; the per-run fold |
+| `apps/web/src/state/peerLoopCommands.ts` | One hook per owner control, with typed refusals kept |
+| `apps/web/src/peerLoopPresentation.ts`   | Every word the surface renders, as pure functions    |
+| `apps/web/src/components/peerLoop/`      | Prop-driven views, server-renderable in tests        |
+
+Four rules the UI is built on:
+
+- **The sidebar entry is static.** It must not read the status atom, because the
+  first Peer Loop RPC is what spawns the bridge — an always-mounted component
+  reading it would start `peer-loop` on every T3 Code launch, on machines that
+  have never used the feature. Agent Runs can hide itself; reading a directory
+  costs nothing. This cannot.
+- **One subscription per run.** The detail page consumes `run-attached` and the
+  activity from the same stream and never issues its own attach.
+- **Nothing is automatic.** Reattaching after a resync restores observation and
+  only that. No run is started, resumed, recovered or re-messaged because a view
+  came back, and no failed command is retried — a timeout says the command may
+  already have applied and stops there.
+- **Peer Loop decides.** Every label comes from its structured state, outcome,
+  halt reason or control availability. Nothing is derived from prose, and a
+  control Peer Loop said was unavailable is never enabled.
+
+Start Run offers only projects this environment already knows and sends that
+project's own `workspaceRoot`. No executable path, no permission mode, no
+recovery default and no `newRun`: forcing past a duplicate-run refusal would
+fork the Reviewer's conversation, so the refusal points at the existing run
+instead.
+
+Web, desktop-wrapped web and a remote browser are all covered by this one
+surface. The shared client-runtime foundation stays available for a native
+mobile screen later; there is none in this increment.
 
 ## What must not happen
 

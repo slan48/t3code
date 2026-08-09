@@ -72,6 +72,31 @@ starts exactly as it did before.
 Everything travels over that one connection, as structured data. T3 Code does not
 read Peer Loop's files and does not read its terminal output.
 
+## Opening it
+
+**Peer Loop** is in the sidebar, always — it does not hide itself when Peer Loop
+is not installed, because finding out would mean starting the bridge on every
+T3 Code launch, on machines that never asked for it. Opening the page is what
+asks; if Peer Loop is not there, the page says so and how to point at it.
+
+The index lists the runs on that machine in three groups — what needs you, what
+is moving, and what is finished — with the project each belongs to and when it
+last moved. Runs Peer Loop could not read are listed too, rather than quietly
+left out.
+
+**Start a run** from there. You pick one of the projects this T3 Code already
+knows and write the objective; that project's own folder is what Peer Loop is
+pointed at, and there is nothing to type a path into. A safety limit is
+optional. If the project already has an unfinished run, Peer Loop says so and
+the page offers you that run instead of starting a second one.
+
+Opening a run shows its state, iteration, which agents are configured, whether a
+turn was in flight, the current Builder task, the Reviewer's last decision, how
+many of your messages are queued, and the recent activity. Everything on that
+page is Peer Loop's own record; nothing is worked out locally.
+
+Web, the desktop app and a browser on your phone all use exactly this surface.
+
 ## What you can do
 
 - **See runs** for a project: state, iteration, when they last moved, and whether
@@ -93,6 +118,9 @@ read Peer Loop's files and does not read its terminal output.
 - **Pause**, which takes effect at the next safe boundary and never mid-turn.
 - **Resume** a paused run.
 - **Resolve an interrupted turn**, by choosing one of Peer Loop's three options.
+  Nothing is pre-selected and nothing happens until you pick one. Running the
+  interrupted task again asks a second time first, because that task may already
+  have changed the repository.
 
 ## Shutting down
 

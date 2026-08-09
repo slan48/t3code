@@ -786,11 +786,16 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         const { service, scope } = yield* makeService;
 
         const events = yield* Stream.runCollect(
-          service.subscribeEvents({ runId: "run-1", afterSeq: 3 }).pipe(Stream.take(5)),
+          service.subscribeEvents({ runId: "run-1", afterSeq: 3 }).pipe(Stream.take(6)),
         );
 
-        // Opening transport fact first, then only what this client is missing.
+        // Opening transport fact, then the snapshot this subscription's own
+        // attach produced, then only what this client is missing.
         assert.strictEqual(events[0]?.kind, "transport");
+        assert.strictEqual(events[1]?.kind, "run-attached");
+        if (events[1]?.kind !== "run-attached") throw new Error("unreachable");
+        assert.strictEqual(events[1].snapshot.runId, "run-1");
+        assert.strictEqual(events[1].snapshot.eventHighWaterMark, 5);
         assert.deepStrictEqual(seqsOf(events), [4, 5, 6]);
         // The durable backlog is flagged as such; the tail is live.
         assert.deepStrictEqual(
@@ -804,7 +809,8 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         if (synced?.kind !== "run-synced") throw new Error("unreachable");
         assert.strictEqual(synced.afterSeq, 5);
         assert.strictEqual(synced.eventHighWaterMark, 5);
-        assert.strictEqual(events.indexOf(synced), 3);
+        // Response before backlog: the snapshot precedes every event.
+        assert.strictEqual(events.indexOf(synced), 4);
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -822,8 +828,8 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
 
         const [collected] = yield* Effect.all(
           [
-            // A third event would mean a duplicate arrived.
-            Effect.timeoutOption(Stream.runCollect(Stream.take(stream, 3)), "500 millis"),
+            // A fourth event would mean a duplicate arrived.
+            Effect.timeoutOption(Stream.runCollect(Stream.take(stream, 4)), "500 millis"),
             // Meanwhile another client attaches from scratch, which makes Peer
             // Loop replay the whole backlog for it.
             Effect.andThen(
@@ -837,12 +843,13 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         assert.strictEqual(collected._tag, "None");
 
         const head = yield* Stream.runCollect(
-          Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq: 6 }), 2),
+          Stream.take(service.subscribeEvents({ runId: "run-1", afterSeq: 6 }), 3),
         );
         assert.strictEqual(head[0]?.kind, "transport");
-        assert.strictEqual(head[1]?.kind, "run-synced");
-        if (head[1]?.kind !== "run-synced") throw new Error("unreachable");
-        assert.strictEqual(head[1].afterSeq, 6);
+        assert.strictEqual(head[1]?.kind, "run-attached");
+        assert.strictEqual(head[2]?.kind, "run-synced");
+        if (head[2]?.kind !== "run-synced") throw new Error("unreachable");
+        assert.strictEqual(head[2].afterSeq, 6);
 
         yield* Scope.close(scope, Exit.void);
       }),

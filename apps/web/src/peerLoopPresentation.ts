@@ -1,0 +1,674 @@
+/**
+ * Everything the Peer Loop surface renders, as pure functions.
+ *
+ * Peer Loop decides; this file only chooses words. Every value here is read
+ * from Peer Loop's own structured state, outcome or halt reason — nothing is
+ * derived from prose, and nothing infers that a run should continue, has
+ * finished, or may be controlled. Those are Peer Loop's calls and the owner's.
+ *
+ * Kept separate from the components so the interesting part — which run needs
+ * attention, which control is legitimately available, how an unfamiliar event
+ * is shown without dumping a wall of JSON — is testable without a browser.
+ *
+ * @module PeerLoopPresentation
+ */
+import {
+  type PeerLoopControlAvailability,
+  type PeerLoopError,
+  type PeerLoopEvent,
+  type PeerLoopHaltKind,
+  type PeerLoopRunStateFile,
+  type PeerLoopRunSummary,
+  type PeerLoopTransportStatus,
+} from "@t3tools/contracts";
+import type { PeerLoopRunView } from "@t3tools/client-runtime/state/peer-loop-reducer";
+
+export type PeerLoopTone = "neutral" | "info" | "warning" | "danger" | "success";
+
+/* ------------------------------------------------------------- transport */
+
+export interface PeerLoopTransportPresentation {
+  readonly label: string;
+  readonly tone: PeerLoopTone;
+  /** Peer Loop's or the server's own words, already category-only. */
+  readonly detail: string | null;
+}
+
+const TRANSPORT_LABELS: Readonly<Record<PeerLoopTransportStatus["state"], string>> = {
+  unavailable: "Not available",
+  starting: "Starting",
+  connected: "Connected",
+  interrupted: "Connection ended",
+  stopped: "Stopped",
+};
+
+const TRANSPORT_TONES: Readonly<Record<PeerLoopTransportStatus["state"], PeerLoopTone>> = {
+  unavailable: "warning",
+  starting: "info",
+  connected: "success",
+  interrupted: "warning",
+  stopped: "neutral",
+};
+
+export function describeTransport(
+  status: PeerLoopTransportStatus,
+  configured: boolean,
+): PeerLoopTransportPresentation {
+  if (!configured && status.state === "unavailable") {
+    return {
+      label: "Peer Loop is not set up on this machine",
+      tone: "neutral",
+      detail: status.detail,
+    };
+  }
+  return {
+    label: TRANSPORT_LABELS[status.state],
+    tone: TRANSPORT_TONES[status.state],
+    detail: status.detail,
+  };
+}
+
+/* ------------------------------------------------------------ attention */
+
+/**
+ * What a run is waiting on, in the owner's terms.
+ *
+ * One entry per halt kind Peer Loop can report, plus the three conditions that
+ * are not halts: finished, interrupted transport, and nothing at all. Every one
+ * of them reads differently on purpose — "sign in to a CLI" and "the Reviewer
+ * has a question for you" are fixed in completely different places, and a
+ * single "needs attention" badge would hide that.
+ */
+export type PeerLoopAttentionKey =
+  | "none"
+  | "running"
+  | "owner-decision"
+  | "needs-objective"
+  | "capacity-exhausted"
+  | "auth-required"
+  | "transport-interrupted"
+  | "recovery-required"
+  | "paused"
+  | "safety-limit"
+  | "blocked"
+  | "failed"
+  | "done";
+
+export interface PeerLoopAttentionPresentation {
+  readonly key: PeerLoopAttentionKey;
+  readonly label: string;
+  readonly tone: PeerLoopTone;
+  /** True when a person has to do something before the run can move. */
+  readonly actionable: boolean;
+  /** Peer Loop's own message, when it gave one. Never invented here. */
+  readonly detail: string | null;
+}
+
+const ATTENTION: Readonly<
+  Record<PeerLoopAttentionKey, { readonly label: string; readonly tone: PeerLoopTone }>
+> = {
+  none: { label: "Idle", tone: "neutral" },
+  running: { label: "Working", tone: "info" },
+  "owner-decision": { label: "The Reviewer needs your decision", tone: "warning" },
+  "needs-objective": { label: "Needs an objective", tone: "warning" },
+  "capacity-exhausted": { label: "Agent capacity exhausted", tone: "warning" },
+  "auth-required": { label: "An agent CLI needs signing in", tone: "warning" },
+  "transport-interrupted": { label: "A turn was cut off", tone: "warning" },
+  "recovery-required": { label: "Interrupted turn — choose how to continue", tone: "danger" },
+  paused: { label: "Paused", tone: "neutral" },
+  "safety-limit": { label: "Stopped at its safety limit", tone: "neutral" },
+  blocked: { label: "Blocked", tone: "danger" },
+  failed: { label: "Failed", tone: "danger" },
+  done: { label: "Done", tone: "success" },
+};
+
+const HALT_ATTENTION: Readonly<Record<PeerLoopHaltKind, PeerLoopAttentionKey>> = {
+  OWNER_REQUIRED: "owner-decision",
+  OWNER_OBJECTIVE_REQUIRED: "needs-objective",
+  CAPACITY_EXHAUSTED: "capacity-exhausted",
+  AUTH_REQUIRED: "auth-required",
+  TRANSPORT_INTERRUPTED: "transport-interrupted",
+  AMBIGUOUS_INTERRUPTED_TURN: "recovery-required",
+  OWNER_PAUSED: "paused",
+  SAFETY_LIMIT: "safety-limit",
+  SYSTEM_BLOCKED: "blocked",
+  CAPABILITY_MISMATCH: "failed",
+  PROTOCOL_ERROR: "failed",
+  PROCESS_ERROR: "failed",
+};
+
+const NOT_ACTIONABLE: ReadonlySet<PeerLoopAttentionKey> = new Set([
+  "none",
+  "running",
+  "done",
+  "paused",
+  "safety-limit",
+]);
+
+const present = (
+  key: PeerLoopAttentionKey,
+  detail: string | null,
+): PeerLoopAttentionPresentation => ({
+  key,
+  label: ATTENTION[key].label,
+  tone: ATTENTION[key].tone,
+  actionable: !NOT_ACTIONABLE.has(key),
+  detail,
+});
+
+/**
+ * Read a run's condition off Peer Loop's structured state.
+ *
+ * `done` wins over a halt reason, because a finished run's last halt is
+ * history. `interrupted` outranks the rest because it is the one state where
+ * the repository may already have changed and only the owner can say what
+ * happens next.
+ */
+export function describeAttention(input: {
+  readonly state: PeerLoopRunSummary["state"];
+  readonly haltReason: PeerLoopRunSummary["haltReason"];
+  readonly inFlight: PeerLoopRunSummary["inFlight"];
+  readonly awaitingOwnerObjective?: boolean;
+}): PeerLoopAttentionPresentation {
+  if (input.state === "done") return present("done", input.haltReason?.message ?? null);
+  if (input.state === "interrupted") {
+    return present("recovery-required", input.haltReason?.message ?? null);
+  }
+  if (input.haltReason !== null) {
+    return present(HALT_ATTENTION[input.haltReason.kind], input.haltReason.message);
+  }
+  if (input.awaitingOwnerObjective === true) return present("needs-objective", null);
+  if (input.state === "error") return present("failed", null);
+  if (input.state === "reviewer_working" || input.state === "builder_working") {
+    return present("running", null);
+  }
+  if (input.state === "owner_required") return present("owner-decision", null);
+  if (input.state === "paused") return present("paused", null);
+  return present("none", null);
+}
+
+export function describeRunAttention(run: PeerLoopRunSummary): PeerLoopAttentionPresentation {
+  return describeAttention({
+    state: run.state,
+    haltReason: run.haltReason,
+    inFlight: run.inFlight,
+    awaitingOwnerObjective: run.awaitingOwnerObjective,
+  });
+}
+
+/**
+ * The run's condition, from the subscription's own snapshot.
+ *
+ * `DONE` is Peer Loop's outcome, not a guess from the state file, so a finished
+ * run reads as finished even before its state file is re-read.
+ */
+export function describeViewAttention(view: PeerLoopRunView): PeerLoopAttentionPresentation {
+  if (view.outcome?.kind === "done") return present("done", view.outcome.summary);
+  const state = view.state;
+  if (state === null) return present("none", null);
+  return describeAttention({
+    state: state.state,
+    haltReason: state.haltReason,
+    inFlight: state.inFlight,
+  });
+}
+
+/* -------------------------------------------------------------- grouping */
+
+export interface PeerLoopRunGroups {
+  /** Waiting on a person. Shown first, because nothing moves until they act. */
+  readonly attention: readonly PeerLoopRunSummary[];
+  /** An agent is working, or the run is simply between turns. */
+  readonly active: readonly PeerLoopRunSummary[];
+  /** Finished or failed. History. */
+  readonly recent: readonly PeerLoopRunSummary[];
+}
+
+const TERMINAL_STATES: ReadonlySet<PeerLoopRunSummary["state"]> = new Set(["done", "error"]);
+
+const byRecency = (a: PeerLoopRunSummary, b: PeerLoopRunSummary): number =>
+  b.updatedAt.localeCompare(a.updatedAt);
+
+export function groupRuns(runs: readonly PeerLoopRunSummary[]): PeerLoopRunGroups {
+  const attention: PeerLoopRunSummary[] = [];
+  const active: PeerLoopRunSummary[] = [];
+  const recent: PeerLoopRunSummary[] = [];
+
+  for (const run of runs) {
+    if (TERMINAL_STATES.has(run.state)) {
+      recent.push(run);
+      continue;
+    }
+    (describeRunAttention(run).actionable ? attention : active).push(run);
+  }
+
+  return {
+    attention: attention.sort(byRecency),
+    active: active.sort(byRecency),
+    recent: recent.sort(byRecency),
+  };
+}
+
+/** The last path segment, which is what an operator actually recognises. */
+export function projectLabel(projectPath: string): string {
+  const trimmed = projectPath.replace(/[/\\]+$/u, "");
+  const segments = trimmed.split(/[/\\]/u);
+  return segments[segments.length - 1] || projectPath;
+}
+
+/* ---------------------------------------------------------------- events */
+
+export interface PeerLoopEventPresentation {
+  readonly title: string;
+  /** One line at most. Long values are truncated rather than wrapped. */
+  readonly detail: string | null;
+  readonly tone: PeerLoopTone;
+}
+
+/** How much of an unfamiliar payload is worth showing before it is noise. */
+export const PEER_LOOP_EVENT_DETAIL_CHARS = 240;
+
+const truncate = (value: string, limit = PEER_LOOP_EVENT_DETAIL_CHARS): string => {
+  const collapsed = value.replace(/\s+/gu, " ").trim();
+  return collapsed.length <= limit ? collapsed : `${collapsed.slice(0, limit - 1)}…`;
+};
+
+const readString = (payload: PeerLoopEventPayloadLike, key: string): string | null => {
+  const value = payload[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+};
+
+type PeerLoopEventPayloadLike = Readonly<Record<string, unknown>> & { readonly kind: string };
+
+/**
+ * A summary of an unfamiliar payload, without dumping it.
+ *
+ * Peer Loop grows event types, and an unknown one must neither break the feed
+ * nor fill a phone with serialised objects. Scalars are shown because they are
+ * usually the interesting part; anything nested becomes its key and its shape.
+ */
+function summariseUnknownPayload(payload: PeerLoopEventPayloadLike): string | null {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "kind") continue;
+    if (typeof value === "string") parts.push(`${key}: ${truncate(value, 80)}`);
+    else if (typeof value === "number" || typeof value === "boolean") {
+      parts.push(`${key}: ${String(value)}`);
+    } else if (value === null) parts.push(`${key}: none`);
+    else if (Array.isArray(value)) parts.push(`${key}: ${value.length} item(s)`);
+    else if (typeof value === "object") parts.push(`${key}: …`);
+    if (parts.join(", ").length >= PEER_LOOP_EVENT_DETAIL_CHARS) break;
+  }
+  return parts.length === 0 ? null : truncate(parts.join(", "));
+}
+
+const ACTOR_LABEL: Readonly<Record<PeerLoopEvent["actor"], string>> = {
+  owner: "You",
+  reviewer: "Reviewer",
+  builder: "Builder",
+  system: "Peer Loop",
+};
+
+/**
+ * Recognised payload kinds, and how each one reads.
+ *
+ * Deliberately a small set. Everything else falls through to the summary
+ * above, which is what keeps this list from being a second copy of Peer Loop's
+ * event catalogue that has to be kept in step with it.
+ */
+const RECOGNISED: Readonly<
+  Record<
+    string,
+    (payload: PeerLoopEventPayloadLike) => {
+      readonly title: string;
+      readonly detail: string | null;
+    }
+  >
+> = {
+  run_started: () => ({ title: "Run started", detail: null }),
+  owner_objective: (payload) => ({
+    title: "Objective recorded",
+    detail: readString(payload, "text"),
+  }),
+  owner_message: (payload) => ({
+    title: "Your message",
+    detail: readString(payload, "text"),
+  }),
+  reviewer_decision: (payload) => ({
+    title: `Reviewer decided: ${readString(payload, "decision") ?? "unknown"}`,
+    detail: readString(payload, "summary"),
+  }),
+  builder_task: (payload) => ({
+    title: "Builder task",
+    detail: readString(payload, "task"),
+  }),
+  builder_report: (payload) => ({
+    title: "Builder reported back",
+    detail: readString(payload, "report"),
+  }),
+  builder_failure: (payload) => ({
+    title: "Builder turn failed",
+    detail: readString(payload, "message") ?? readString(payload, "reason"),
+  }),
+  turn_started: (payload) => ({
+    title: `${readString(payload, "actor") ?? "A turn"} started`,
+    detail: null,
+  }),
+  halted: (payload) => ({
+    title: `Halted: ${readString(payload, "kind") ?? "unknown"}`,
+    detail: readString(payload, "message"),
+  }),
+  paused: (payload) => ({ title: "Paused", detail: readString(payload, "message") }),
+  resumed: () => ({ title: "Resumed", detail: null }),
+  recovered: (payload) => ({
+    title: `Recovery: ${readString(payload, "choice") ?? "unknown"}`,
+    detail: readString(payload, "message"),
+  }),
+  notice: (payload) => ({ title: "Note", detail: readString(payload, "message") }),
+  run_finished: (payload) => ({
+    title: "Run finished",
+    detail: readString(payload, "summary"),
+  }),
+};
+
+const FAILURE_KINDS: ReadonlySet<string> = new Set(["builder_failure", "halted"]);
+
+export function describeEvent(event: PeerLoopEvent): PeerLoopEventPresentation {
+  const payload = event.payload as PeerLoopEventPayloadLike;
+  const recognised = RECOGNISED[payload.kind];
+  if (recognised !== undefined) {
+    const { title, detail } = recognised(payload);
+    return {
+      title,
+      detail: detail === null ? null : truncate(detail),
+      tone: FAILURE_KINDS.has(payload.kind) ? "warning" : "neutral",
+    };
+  }
+  // Unfamiliar, and shown as such rather than pretending to understand it.
+  return {
+    title: `${ACTOR_LABEL[event.actor]}: ${payload.kind}`,
+    detail: summariseUnknownPayload(payload),
+    tone: "neutral",
+  };
+}
+
+/* ------------------------------------------------------------- controls */
+
+export interface PeerLoopControls {
+  readonly canSendOwnerMessage: boolean;
+  readonly canPause: boolean;
+  readonly canResume: boolean;
+  readonly canRecover: boolean;
+  /** Why every control is off, when they are. Peer Loop's reason, not ours. */
+  readonly unavailableReason: string | null;
+}
+
+const CONTROL_REASON: Readonly<Record<PeerLoopControlAvailability["reason"], string>> = {
+  live_in_this_bridge: "",
+  held_by_other_process:
+    "Another Peer Loop process is driving this project. You can read the run here; nothing will be sent.",
+  not_attached: "Peer Loop is not driving this run right now.",
+};
+
+/**
+ * Which controls Peer Loop will actually accept.
+ *
+ * Availability is Peer Loop's answer, forwarded. This only decides what to grey
+ * out — it never enables a control Peer Loop said was unavailable, and it never
+ * predicts that one would have succeeded.
+ */
+export function describeControls(view: PeerLoopRunView): PeerLoopControls {
+  const control = view.control;
+  const state = view.state;
+  if (control === null || state === null) {
+    return {
+      canSendOwnerMessage: false,
+      canPause: false,
+      canResume: false,
+      canRecover: false,
+      unavailableReason: null,
+    };
+  }
+
+  if (!control.available) {
+    return {
+      canSendOwnerMessage: false,
+      canPause: false,
+      canResume: false,
+      canRecover: false,
+      unavailableReason: CONTROL_REASON[control.reason] ?? null,
+    };
+  }
+
+  const terminal = state.state === "done" || state.state === "error";
+  const interrupted = state.state === "interrupted";
+  const working = state.state === "reviewer_working" || state.state === "builder_working";
+
+  return {
+    // An owner message is queued for the next Reviewer turn, so it is
+    // legitimate whenever the run can still move.
+    canSendOwnerMessage: !terminal && !interrupted,
+    canPause: working || state.state === "idle" || state.state === "owner_required",
+    // Peer Loop says whether a run can be resumed. Nothing here infers it.
+    canResume: control.resumable && !terminal,
+    canRecover: interrupted,
+    unavailableReason: null,
+  };
+}
+
+export const RECOVERY_CHOICES = [
+  {
+    choice: "resume_to_reviewer",
+    label: "Hand it back to the Reviewer",
+    description:
+      "The Reviewer looks at where things stand and decides the next task. The interrupted task is not run again.",
+    confirm: false,
+  },
+  {
+    choice: "replay_builder_task",
+    label: "Run the interrupted task again",
+    description:
+      "The Builder is given the same task a second time. It may already have changed the repository, so this can repeat work that was partly done.",
+    confirm: true,
+  },
+  {
+    choice: "abandon",
+    label: "Abandon the run",
+    description: "Peer Loop stops here. Nothing else is run and the record is kept.",
+    confirm: false,
+  },
+] as const;
+
+export type PeerLoopRecoveryOption = (typeof RECOVERY_CHOICES)[number];
+
+/* --------------------------------------------------------------- errors */
+
+export interface PeerLoopErrorPresentation {
+  readonly title: string;
+  readonly detail: string | null;
+  /** Peer Loop's stable refusal code, when there was one. */
+  readonly code: string | null;
+  readonly tone: PeerLoopTone;
+  /** True when the command may have taken effect anyway. Never retried for you. */
+  readonly mayHaveApplied: boolean;
+}
+
+const REFUSAL_TITLES: Readonly<Record<string, string>> = {
+  CONTROL_UNAVAILABLE: "Another process is driving this project",
+  PROJECT_HAS_UNFINISHED_RUN: "This project already has an unfinished run",
+  REVIEWER_THREAD_BUSY: "The Reviewer conversation is held by another writer",
+  INVALID_RUN_STATE: "The run is not in a state that allows this",
+  RUN_NOT_FOUND: "Peer Loop does not know that run",
+  CAPACITY_EXHAUSTED: "Agent capacity is exhausted",
+  AUTH_REQUIRED: "An agent CLI needs signing in",
+  INVALID_PARAMS: "Peer Loop rejected the request",
+};
+
+/**
+ * What a client is told about a failed command.
+ *
+ * The refusal code travels because `CONTROL_UNAVAILABLE` and
+ * `PROJECT_HAS_UNFINISHED_RUN` are different problems with different fixes, and
+ * prose does not let an operator tell them apart. An unfamiliar code is shown
+ * as itself rather than flattened into "something went wrong" — a newer Peer
+ * Loop refusing for a new reason should still say which.
+ */
+export function describeError(error: PeerLoopError): PeerLoopErrorPresentation {
+  switch (error._tag) {
+    case "PeerLoopCommandRefusedError":
+      return {
+        title: REFUSAL_TITLES[error.code] ?? "Peer Loop refused this",
+        detail: truncate(error.detail),
+        code: error.code,
+        tone: "warning",
+        mayHaveApplied: false,
+      };
+    case "PeerLoopTimeoutError":
+      return {
+        title: "No answer in time",
+        detail: error.mayHaveApplied
+          ? "Peer Loop may still have accepted this and finished after T3 Code stopped waiting. Nothing was retried — re-read the run before trying again."
+          : "Peer Loop did not answer in time.",
+        code: null,
+        tone: "warning",
+        mayHaveApplied: error.mayHaveApplied,
+      };
+    case "PeerLoopUnavailableError":
+      return {
+        title: "Peer Loop is not available here",
+        detail: truncate(error.reason),
+        code: null,
+        tone: "neutral",
+        mayHaveApplied: false,
+      };
+    case "PeerLoopIncompatibleError":
+      return {
+        title: "This Peer Loop speaks a protocol this build does not",
+        detail: truncate(error.detail),
+        code: null,
+        tone: "danger",
+        mayHaveApplied: false,
+      };
+    case "PeerLoopTransportError":
+      return {
+        title: "The connection to Peer Loop ended",
+        detail: truncate(error.detail),
+        code: null,
+        tone: "warning",
+        mayHaveApplied: false,
+      };
+    case "PeerLoopProtocolError":
+      return {
+        title: "Peer Loop sent something this build could not read",
+        detail: truncate(error.detail),
+        code: null,
+        tone: "danger",
+        mayHaveApplied: false,
+      };
+  }
+}
+
+/** The structured run id a duplicate-run refusal points at, when it gave one. */
+export function existingRunIdFromRefusal(error: PeerLoopError): string | null {
+  if (error._tag !== "PeerLoopCommandRefusedError") return null;
+  if (error.code !== "PROJECT_HAS_UNFINISHED_RUN") return null;
+  const data = error.data;
+  if (typeof data !== "object" || data === null) return null;
+  const runId = (data as Record<string, unknown>)["runId"];
+  return typeof runId === "string" && runId.length > 0 ? runId : null;
+}
+
+/* ------------------------------------------------------------ start form */
+
+export interface StartRunValidation {
+  readonly ok: boolean;
+  readonly objectiveError: string | null;
+  readonly safetyLimitError: string | null;
+  readonly projectError: string | null;
+}
+
+/**
+ * What can be sent, and why not.
+ *
+ * The objective is delivered word for word to the first Reviewer turn, so an
+ * empty one is refused here rather than starting a run that immediately halts
+ * asking for it. The safety limit is Peer Loop's own optional bound; a zero or
+ * a fraction is a typo, not a limit.
+ */
+export function validateStartRun(input: {
+  readonly projectId: string | null;
+  readonly objective: string;
+  readonly safetyLimit: string;
+}): StartRunValidation {
+  const objective = input.objective.trim();
+  const safety = input.safetyLimit.trim();
+
+  const projectError = input.projectId === null ? "Choose a project." : null;
+  const objectiveError = objective.length === 0 ? "Say what this run should achieve." : null;
+
+  let safetyLimitError: string | null = null;
+  if (safety.length > 0) {
+    if (!/^\d+$/u.test(safety) || Number(safety) < 1) {
+      safetyLimitError = "Use a whole number of iterations, or leave this empty.";
+    }
+  }
+
+  return {
+    ok: projectError === null && objectiveError === null && safetyLimitError === null,
+    objectiveError,
+    safetyLimitError,
+    projectError,
+  };
+}
+
+export function parseSafetyLimit(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || !/^\d+$/u.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  return parsed >= 1 ? parsed : undefined;
+}
+
+/* ------------------------------------------------------------- snapshot */
+
+export interface PeerLoopDetailSummary {
+  readonly state: PeerLoopRunStateFile["state"] | null;
+  readonly iteration: number | null;
+  readonly reviewer: string | null;
+  readonly builder: string | null;
+  /** The actor whose turn was running when Peer Loop stopped, if any. */
+  readonly inFlightActor: "reviewer" | "builder" | null;
+  readonly currentTask: string | null;
+  readonly lastDecision: string | null;
+  readonly queuedOwnerMessages: number;
+  readonly projectPath: string | null;
+}
+
+export function describeDetail(view: PeerLoopRunView): PeerLoopDetailSummary {
+  const state = view.state;
+  if (state === null) {
+    return {
+      state: null,
+      iteration: null,
+      reviewer: null,
+      builder: null,
+      inFlightActor: null,
+      currentTask: null,
+      lastDecision: null,
+      queuedOwnerMessages: 0,
+      projectPath: null,
+    };
+  }
+
+  const decision = state.lastReviewerDecision;
+  return {
+    state: state.state,
+    iteration: state.iteration,
+    reviewer: state.adapters.reviewer,
+    builder: state.adapters.builder,
+    inFlightActor: state.inFlight?.actor ?? null,
+    currentTask: state.lastBuilderTask,
+    lastDecision: decision === null ? null : `${decision.decision} — ${truncate(decision.summary)}`,
+    queuedOwnerMessages: state.queuedOwnerMessages.length,
+    projectPath: state.projectPath,
+  };
+}

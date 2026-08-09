@@ -1245,6 +1245,10 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
 
         const head: readonly PeerLoopSubscriptionEvent[] = [
           { kind: "transport", transport: opening },
+          // The snapshot this subscription's own attach already produced,
+          // before any backlog. A client that had to ask for it separately
+          // would trigger a second replay for data this server was holding.
+          { kind: "run-attached", runId: input.runId, snapshot: handle.result },
           // Already past the boundary this attach reported: there is nothing to
           // wait for, and saying so at once is what stops a client sitting on
           // `needsResync` forever after an uneventful reattachment.

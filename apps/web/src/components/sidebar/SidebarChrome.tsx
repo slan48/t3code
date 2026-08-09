@@ -21,6 +21,7 @@ import {
   useSidebar,
 } from "../ui/sidebar";
 import { SidebarAgentRunsEntry } from "./SidebarAgentRunsEntry";
+import { SidebarPeerLoopEntry } from "./SidebarPeerLoopEntry";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdatePill } from "./SidebarUpdatePill";
 
@@ -125,6 +126,7 @@ export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
       <SidebarUpdatePill />
       <SidebarMenu>
         <SidebarAgentRunsEntry />
+        <SidebarPeerLoopEntry />
         <SidebarMenuItem>
           <SidebarMenuButton onClick={handleSettingsClick}>
             <SettingsIcon />

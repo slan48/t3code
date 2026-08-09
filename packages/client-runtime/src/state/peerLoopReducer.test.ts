@@ -185,6 +185,71 @@ describe("Peer Loop activity", () => {
   });
 });
 
+const attached = (
+  overrides: {
+    readonly available?: boolean;
+    readonly resumable?: boolean;
+    readonly eventHighWaterMark?: number;
+    readonly live?: boolean;
+    readonly haltKind?: PeerLoopHaltKind | null;
+  } = {},
+): PeerLoopSubscriptionEvent => ({
+  kind: "run-attached",
+  runId,
+  snapshot: {
+    runId,
+    state: runState(overrides.haltKind ?? null),
+    control: {
+      available: overrides.available ?? true,
+      reason: (overrides.available ?? true) ? "live_in_this_bridge" : "held_by_other_process",
+      liveWriter: null,
+      resumable: overrides.resumable ?? false,
+    },
+    eventHighWaterMark: overrides.eventHighWaterMark ?? 5,
+    replayFromSeq: 0,
+    live: overrides.live ?? true,
+  },
+});
+
+describe("Peer Loop attach snapshot", () => {
+  it("seeds authoritative state and control without touching the cursor", () => {
+    const view = applyAll(emptyPeerLoopRunView(runId, 3), [attached({ resumable: true })]);
+
+    expect(view.state?.state).toBe("builder_working");
+    expect(view.control?.available).toBe(true);
+    expect(view.control?.resumable).toBe(true);
+    expect(view.eventHighWaterMark).toBe(5);
+    expect(view.live).toBe(true);
+    // An attach says what the run looks like, never what this client has seen.
+    expect(view.afterSeq).toBe(3);
+    expect(view.outcome).toBe(null);
+    expect(view.finished).toBe(false);
+  });
+
+  it("does not clear a resync or discard what was already rendered", () => {
+    const resynced = applyAll(emptyPeerLoopRunView(runId), [
+      runEvent(1),
+      runEvent(2),
+      { kind: "run-resync", runId, afterSeq: 2, reason: "overflow" },
+    ]);
+
+    const reattached = applyAll(resynced, [attached()]);
+    // Only run-synced clears the flag: an attach proves a replay started.
+    expect(reattached.needsResync).toBe(true);
+    expect(reattached.afterSeq).toBe(2);
+    expect(reattached.activity.map((entry) => entry.seq)).toEqual([1, 2]);
+  });
+
+  it("ignores a snapshot for another run", () => {
+    const view = applyAll(emptyPeerLoopRunView(runId), [runEvent(1)]);
+    const other = applyPeerLoopSubscriptionEvent(view, {
+      ...(attached() as Extract<PeerLoopSubscriptionEvent, { kind: "run-attached" }>),
+      runId: "other",
+    });
+    expect(other).toBe(view);
+  });
+});
+
 const synced = (afterSeq: number, eventHighWaterMark: number): PeerLoopSubscriptionEvent => ({
   kind: "run-synced",
   runId,

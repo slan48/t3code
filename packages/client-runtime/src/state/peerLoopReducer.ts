@@ -18,6 +18,7 @@
  */
 import {
   PEER_LOOP_CLIENT_ACTIVITY_LIMIT,
+  type PeerLoopControlAvailability,
   type PeerLoopEvent,
   type PeerLoopHaltKind,
   type PeerLoopRunOutcome,
@@ -51,6 +52,17 @@ export interface PeerLoopRunView {
    * replay started and nothing about whether it finished.
    */
   readonly needsResync: boolean;
+  /**
+   * Whether Peer Loop will accept commands for this run right now, and why.
+   *
+   * Straight from the attach snapshot. A UI decides what to *disable* with it;
+   * it never decides that a control would have worked.
+   */
+  readonly control: PeerLoopControlAvailability | null;
+  /** The boundary the last attach reported. Null before the first one. */
+  readonly eventHighWaterMark: number | null;
+  /** False for a read-only attach: no live events will follow. */
+  readonly live: boolean;
   /** Recent activity, oldest first, bounded for a phone's sake. */
   readonly activity: readonly PeerLoopEvent[];
 }
@@ -75,6 +87,9 @@ export function emptyPeerLoopRunView(runId: string, afterSeq = 0): PeerLoopRunVi
     outcome: null,
     finished: false,
     needsResync: false,
+    control: null,
+    eventHighWaterMark: null,
+    live: false,
     activity: [],
   };
 }
@@ -108,6 +123,23 @@ export function applyPeerLoopSubscriptionEvent(
         view.transport?.changedAt === event.transport.changedAt
         ? view
         : { ...view, transport: event.transport };
+
+    case "run-attached": {
+      if (event.runId !== view.runId) return view;
+      // Authoritative state, control availability and the boundary — and
+      // nothing else. The cursor is not touched: an attach says what the run
+      // looks like, not what this client has been shown. `needsResync` is not
+      // cleared either; only `run-synced` proves a replay finished. Retained
+      // activity survives, because the events behind it are still the ones the
+      // client has seen.
+      return {
+        ...view,
+        state: event.snapshot.state,
+        control: event.snapshot.control,
+        eventHighWaterMark: event.snapshot.eventHighWaterMark,
+        live: event.snapshot.live,
+      };
+    }
 
     case "run-event": {
       if (event.runId !== view.runId) return view;
