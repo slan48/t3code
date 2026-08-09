@@ -985,6 +985,69 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
       }),
     );
 
+    it.effect("emits every subscription fact in its own chunk", () =>
+      Effect.gen(function* () {
+        // NOT `runCollect`. The client's stream adapter keeps only the last
+        // value of each pulled chunk, so a two-element chunk silently drops the
+        // first fact — which is exactly how a run's activity came out as
+        // 1,2,3,4,6 in the browser while the server had sent 5. Only inspecting
+        // the chunks themselves can catch that.
+        yield* useFakeBridge("ready");
+        const { service, scope } = yield* makeService;
+
+        const chunks = yield* Stream.runCollect(
+          Stream.chunks(
+            Stream.takeUntil(
+              service.subscribeEvents({ runId: "run-1", afterSeq: 0 }),
+              (event) => event.kind === "run-synced",
+            ),
+          ),
+        );
+
+        // The head alone is transport + run-attached, and the boundary emits
+        // the event and `run-synced` together; both would be multi-element.
+        for (const chunk of chunks) {
+          assert.strictEqual(chunk.length, 1, "every chunk carries exactly one fact");
+        }
+
+        const flat = chunks.flatMap((chunk) => [...chunk]);
+        assert.strictEqual(flat[0]?.kind, "transport");
+        assert.strictEqual(flat[1]?.kind, "run-attached");
+        assert.deepStrictEqual(seqsOf(flat), [1, 2, 3, 4, 5]);
+        assert.strictEqual(flat[flat.length - 1]?.kind, "run-synced");
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("keeps the boundary event and its catch-up fact as separate chunks", () =>
+      Effect.gen(function* () {
+        // The durable log skips 3, so the boundary is reached at 5 and the
+        // event-plus-`run-synced` pair is emitted in one `project` call.
+        yield* useFakeBridge("sequence-gap");
+        const { service, scope } = yield* makeService;
+
+        const chunks = yield* Stream.runCollect(
+          Stream.chunks(
+            Stream.takeUntil(
+              service.subscribeEvents({ runId: "run-1", afterSeq: 0 }),
+              (event) => event.kind === "run-synced",
+            ),
+          ),
+        );
+
+        for (const chunk of chunks) assert.strictEqual(chunk.length, 1);
+        const flat = chunks.flatMap((chunk) => [...chunk]);
+        // Non-contiguous but complete: nothing between the boundary event and
+        // the fact that follows it is lost.
+        assert.deepStrictEqual(seqsOf(flat), [1, 2, 4, 5]);
+        const syncedAt = flat.findIndex((event) => event.kind === "run-synced");
+        assert.strictEqual(flat[syncedAt - 1]?.kind, "run-event");
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
     it.effect("treats a legitimate sequence gap as data, not as loss", () =>
       Effect.gen(function* () {
         // This run's durable log has no seq 3: Peer Loop numbered an event and

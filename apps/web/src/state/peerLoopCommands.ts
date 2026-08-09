@@ -106,7 +106,12 @@ export function createPeerLoopCommandGate<Input, Output>(deps: {
   readonly onState: (state: PeerLoopCommandState) => void;
 }) {
   let inFlight = false;
-  let live = true;
+  // Starts inactive: the effect that owns this gate activates it. React's
+  // StrictMode development mount runs setup → cleanup → setup, so ownership has
+  // to be something the second setup can take back. A gate that could only ever
+  // be disposed left every mutation inert in development — the cleanup ran once
+  // and nothing ever revived it.
+  let live = false;
 
   const publish = (state: PeerLoopCommandState): void => {
     if (live) deps.onState(state);
@@ -154,6 +159,18 @@ export function createPeerLoopCommandGate<Input, Output>(deps: {
     invoke,
     /** True while an invocation is outstanding. For tests and teardown. */
     isBusy: () => inFlight,
+    isLive: () => live,
+    /** Taken by the owning effect on every setup, including a StrictMode remount. */
+    activate: () => {
+      live = true;
+    },
+    /**
+     * Released by the owning effect's cleanup.
+     *
+     * After a real unmount this is final: no later completion is published and
+     * no later invocation starts. After a StrictMode cleanup the next setup
+     * activates the same gate again, so nothing is permanently lost.
+     */
     dispose: () => {
       live = false;
       inFlight = false;
@@ -184,6 +201,7 @@ function usePeerLoopCommand<Input, Output, Failure>(
 
   useEffect(() => {
     const gate = gateRef.current;
+    gate?.activate();
     return () => gate?.dispose();
   }, []);
 

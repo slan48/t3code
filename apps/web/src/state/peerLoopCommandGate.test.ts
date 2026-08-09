@@ -31,10 +31,96 @@ const gateWith = (run: (input: string) => Promise<AsyncResult.AsyncResult<string
   return { gate, states } as const;
 };
 
+/** A gate its owning effect has already activated, which is the normal case. */
+const activeGateWith = (
+  run: (input: string) => Promise<AsyncResult.AsyncResult<string, unknown>>,
+) => {
+  const harness = gateWith(run);
+  harness.gate.activate();
+  return harness;
+};
+
+describe("Peer Loop command gate lifecycle", () => {
+  /**
+   * React's development mount, without React.
+   *
+   * StrictMode runs setup → cleanup → setup. The gate used to be created live
+   * and only ever disposable, so that middle cleanup killed it for good and
+   * every Peer Loop mutation — Start, Pause, Owner message, Resume, Recover —
+   * silently returned null in development without ever calling the RPC.
+   */
+  const strictModeMount = (gate: { activate: () => void; dispose: () => void }) => {
+    gate.activate();
+    gate.dispose();
+    gate.activate();
+  };
+
+  it("sends exactly one command after a StrictMode remount", async () => {
+    const run = vi.fn(async () => AsyncResult.success("done"));
+    const { gate } = gateWith(run);
+
+    strictModeMount(gate);
+    expect(gate.isLive()).toBe(true);
+
+    expect(await gate.invoke("a")).toBe("done");
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("still suppresses a same-tick duplicate after the remount", async () => {
+    const settle = deferred<AsyncResult.AsyncResult<string, unknown>>();
+    const run = vi.fn(() => settle.promise);
+    const { gate } = gateWith(run);
+    strictModeMount(gate);
+
+    const first = gate.invoke("a");
+    expect(await gate.invoke("a")).toBe(null);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    settle.resolve(AsyncResult.success("done"));
+    expect(await first).toBe("done");
+  });
+
+  it("starts nothing before the owning effect has activated it", async () => {
+    const run = vi.fn(async () => AsyncResult.success("done"));
+    const { gate } = gateWith(run);
+    // Created during render; the effect has not run yet.
+    expect(gate.isLive()).toBe(false);
+    expect(await gate.invoke("a")).toBe(null);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("refuses every command after the final cleanup", async () => {
+    const run = vi.fn(async () => AsyncResult.success("done"));
+    const { gate } = gateWith(run);
+    strictModeMount(gate);
+    gate.dispose();
+
+    expect(gate.isLive()).toBe(false);
+    expect(await gate.invoke("a")).toBe(null);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("publishes nothing when a command settles after the final cleanup", async () => {
+    const settle = deferred<AsyncResult.AsyncResult<string, unknown>>();
+    const { gate, states } = gateWith(() => settle.promise);
+    strictModeMount(gate);
+
+    void gate.invoke("a");
+    const seen = states.length;
+    gate.dispose();
+    settle.resolve(AsyncResult.success("done"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(states.length).toBe(seen);
+    expect(gate.isBusy()).toBe(false);
+  });
+});
+
 describe("Peer Loop command gate", () => {
   it("runs the first invocation", async () => {
     const run = vi.fn(async () => AsyncResult.success("done"));
-    const { gate, states } = gateWith(run);
+    const { gate, states } = activeGateWith(run);
 
     expect(await gate.invoke("a")).toBe("done");
     expect(run).toHaveBeenCalledTimes(1);
@@ -45,7 +131,7 @@ describe("Peer Loop command gate", () => {
   it("ignores a same-tick duplicate: one intent, one RPC", async () => {
     const settle = deferred<AsyncResult.AsyncResult<string, unknown>>();
     const run = vi.fn(() => settle.promise);
-    const { gate } = gateWith(run);
+    const { gate } = activeGateWith(run);
 
     const first = gate.invoke("a");
     const second = gate.invoke("a");
@@ -64,7 +150,7 @@ describe("Peer Loop command gate", () => {
       data: null,
     });
     const run = vi.fn(async () => AsyncResult.failure<string, unknown>(Cause.fail(refusal)));
-    const { gate, states } = gateWith(run);
+    const { gate, states } = activeGateWith(run);
 
     expect(await gate.invoke("a")).toBe(null);
     expect(gate.isBusy()).toBe(false);
@@ -78,7 +164,7 @@ describe("Peer Loop command gate", () => {
     const run = vi.fn(async () => {
       throw new Error("boom: /Users/nobody/secret-place");
     });
-    const { gate, states } = gateWith(run as never);
+    const { gate, states } = activeGateWith(run as never);
 
     // No rejection escapes: the route's `.then` chain must not become an
     // unhandled rejection, and the button must not stay spinning.
@@ -98,7 +184,7 @@ describe("Peer Loop command gate", () => {
 
   it("starts no mutation after disposal", async () => {
     const run = vi.fn(async () => AsyncResult.success("done"));
-    const { gate, states } = gateWith(run);
+    const { gate, states } = activeGateWith(run);
 
     gate.dispose();
     expect(await gate.invoke("a")).toBe(null);
@@ -112,7 +198,7 @@ describe("Peer Loop command gate", () => {
       detail: "This project already has an unfinished run.",
       data: { runId: "run-9", overrideParam: "newRun" },
     });
-    const { gate, states } = gateWith(async () =>
+    const { gate, states } = activeGateWith(async () =>
       AsyncResult.failure<string, unknown>(Cause.fail(refusal)),
     );
 
@@ -131,7 +217,7 @@ describe("Peer Loop command gate", () => {
       mayHaveApplied: true,
     });
     const run = vi.fn(async () => AsyncResult.failure<string, unknown>(Cause.fail(timeout)));
-    const { gate, states } = gateWith(run);
+    const { gate, states } = activeGateWith(run);
 
     expect(await gate.invoke("a")).toBe(null);
     expect(run).toHaveBeenCalledTimes(1);
@@ -141,7 +227,7 @@ describe("Peer Loop command gate", () => {
 
   it("stops publishing after disposal and releases the gate", async () => {
     const settle = deferred<AsyncResult.AsyncResult<string, unknown>>();
-    const { gate, states } = gateWith(() => settle.promise);
+    const { gate, states } = activeGateWith(() => settle.promise);
 
     void gate.invoke("a");
     const seen = states.length;

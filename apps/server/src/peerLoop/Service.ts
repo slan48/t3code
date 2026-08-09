@@ -1258,6 +1258,17 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         return Stream.concat(
           Stream.fromIterable(head),
           Stream.concat(projected, Stream.flattenIterable(Stream.fromEffect(closing))),
+        ).pipe(
+          // ONE FACT PER CHUNK, ALL THE WAY TO THE CLIENT. Several of these
+          // emissions are naturally multi-element — the head carries the
+          // transport fact, the attach snapshot and possibly `run-synced`, and
+          // crossing the boundary emits the event *and* `run-synced` together.
+          // The client's stream adapter keeps only the last value of each
+          // pulled chunk, so a two-element chunk silently dropped the event and
+          // kept the catch-up fact: a run's activity showed 1,2,3,4,6 while the
+          // server had faithfully sent 5. Rechunking is the fix at the boundary
+          // where the guarantee belongs; nothing downstream has to know.
+          Stream.rechunk(1),
         );
       }),
     );

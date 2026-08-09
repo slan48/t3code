@@ -19,6 +19,22 @@ export interface StartRunProject {
   readonly workspaceRoot: string;
 }
 
+/**
+ * Which project the form is actually about.
+ *
+ * The owner's choice while it still exists, otherwise the first project there
+ * is. One value drives the select, the validation and the submission, so the
+ * form cannot display one project and send another — which is the failure a
+ * separately seeded piece of state produced.
+ */
+export function resolveEffectiveProject(
+  projects: readonly StartRunProject[],
+  chosen: string | null,
+): string | null {
+  if (chosen !== null && projects.some((project) => project.id === chosen)) return chosen;
+  return projects[0]?.id ?? null;
+}
+
 export interface StartRunSubmission {
   readonly projectPath: string;
   readonly objective: string;
@@ -55,9 +71,17 @@ export const PeerLoopStartRun = memo(function PeerLoopStartRun({
   readonly onSubmit: (submission: StartRunSubmission) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [projectId, setProjectId] = useState<string | null>(projects[0]?.id ?? null);
+  /** What the owner picked, if they picked. Null means "whatever is first". */
+  const [chosenProjectId, setChosenProjectId] = useState<string | null>(null);
   const [objective, setObjective] = useState("");
   const [safetyLimit, setSafetyLimit] = useState("");
+
+  // DERIVED, NOT SEEDED. Initialising state from `projects[0]` on the first
+  // render captured an empty list — the project atom resolves asynchronously —
+  // and never caught up, so the select displayed a project while validation
+  // still held null and the button stayed disabled until the owner reselected
+  // the option that was already showing.
+  const projectId = resolveEffectiveProject(projects, chosenProjectId);
 
   const validation = useMemo(
     () => validateStartRun({ projectId, objective, safetyLimit }),
@@ -117,7 +141,7 @@ export const PeerLoopStartRun = memo(function PeerLoopStartRun({
           className="h-9 w-full rounded-md border bg-background px-2 text-sm"
           value={projectId ?? ""}
           disabled={pending}
-          onChange={(changeEvent) => setProjectId(changeEvent.target.value || null)}
+          onChange={(changeEvent) => setChosenProjectId(changeEvent.target.value || null)}
         >
           {projects.map((project) => (
             <option key={project.id} value={project.id}>

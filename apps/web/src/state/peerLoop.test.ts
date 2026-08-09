@@ -856,3 +856,77 @@ describe("Peer Loop index while disconnected", () => {
     expect(peerLoopProjectsAtomFor(ENV_A)).not.toBe(NO_PROJECTS_ATOM);
   });
 });
+
+describe("Peer Loop boundary facts survive as separate values", () => {
+  it("keeps the boundary event and clears the sync flag only after it", async () => {
+    // The server crossing its replay boundary produces the event AND
+    // `run-synced`. They reach the client as two values — the RPC stream is
+    // rechunked to singletons for exactly this reason — and both must land:
+    // the browser previously showed 1,2,3,4,6 because a two-element chunk
+    // dropped #5 and kept the catch-up fact.
+    const environmentAtom = Atom.make<typeof ENV_A | null>(ENV_A);
+    const { events, atoms, registry, run, read } = harness(environmentAtom);
+    registry.mount(atoms.observation(run));
+    read();
+
+    for (const seq of [1, 2, 3, 4]) {
+      events.emit(ENV_A, run, 0, runEvent(seq, true, run));
+      read();
+    }
+    events.emit(ENV_A, run, 0, attached(5, run));
+    read();
+
+    // The boundary pair, back to back with nothing between them.
+    events.emit(ENV_A, run, 0, runEvent(5, true, run));
+    const beforeSync = read();
+    expect(beforeSync.view.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect(beforeSync.view.afterSeq).toBe(5);
+
+    events.emit(ENV_A, run, 0, {
+      kind: "run-synced",
+      runId: run,
+      afterSeq: 5,
+      eventHighWaterMark: 5,
+    });
+    const synced = read();
+    expect(synced.view.needsResync).toBe(false);
+
+    // The live tail still arrives, and #5 is not lost to it.
+    events.emit(ENV_A, run, 0, runEvent(6, false, run));
+    const live = read();
+    const seqs = live.view.activity.map((entry) => entry.seq);
+    expect(seqs).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(new Set(seqs).size).toBe(seqs.length);
+    expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
+    expect(live.view.activity.length).toBeLessThanOrEqual(400);
+
+    registry.dispose();
+  });
+
+  it("stays correct when the durable log legitimately skips a sequence", () => {
+    const environmentAtom = Atom.make<typeof ENV_A | null>(ENV_A);
+    const { events, atoms, registry, run, read } = harness(environmentAtom);
+    registry.mount(atoms.observation(run));
+    read();
+
+    events.emit(ENV_A, run, 0, attached(5, run));
+    read();
+    for (const seq of [1, 2, 4, 5]) {
+      events.emit(ENV_A, run, 0, runEvent(seq, true, run));
+      read();
+    }
+    events.emit(ENV_A, run, 0, {
+      kind: "run-synced",
+      runId: run,
+      afterSeq: 5,
+      eventHighWaterMark: 5,
+    });
+    const settled = read();
+
+    // Monotonic, non-contiguous, complete, and caught up.
+    expect(settled.view.activity.map((entry) => entry.seq)).toEqual([1, 2, 4, 5]);
+    expect(settled.view.needsResync).toBe(false);
+
+    registry.dispose();
+  });
+});

@@ -16,6 +16,7 @@ import {
 } from "@t3tools/client-runtime/state/peer-loop-reducer";
 import { describe, expect, it } from "vite-plus/test";
 
+import { resolveEffectiveProject } from "./components/peerLoop/PeerLoopStartRun";
 import {
   describeControls,
   describeDetail,
@@ -739,5 +740,53 @@ describe("Peer Loop detail summary", () => {
       iteration: null,
       queuedOwnerMessages: 0,
     });
+  });
+});
+
+describe("Peer Loop start-run project selection", () => {
+  const projects = [
+    { id: "p1", title: "one", workspaceRoot: "/a" },
+    { id: "p2", title: "two", workspaceRoot: "/b" },
+  ];
+
+  it("has nothing to select before the project list arrives", () => {
+    expect(resolveEffectiveProject([], null)).toBe(null);
+    expect(validateStartRun({ projectId: null, objective: "go", safetyLimit: "" }).ok).toBe(false);
+  });
+
+  it("adopts the first project the moment the list arrives, with no change event", () => {
+    // The form renders once while the atom is still empty and again when it
+    // resolves. Seeding state on the first render left the select showing a
+    // project the validation did not have, so the button stayed disabled until
+    // the owner reselected the option already on screen.
+    const chosen = null;
+    expect(resolveEffectiveProject([], chosen)).toBe(null);
+    const effective = resolveEffectiveProject(projects, chosen);
+    expect(effective).toBe("p1");
+    expect(
+      validateStartRun({ projectId: effective, objective: "go", safetyLimit: "" }),
+    ).toMatchObject({ ok: true, projectError: null });
+  });
+
+  it("keeps an explicit selection across ordinary list refreshes", () => {
+    expect(resolveEffectiveProject(projects, "p2")).toBe("p2");
+    // A refresh that returns the same projects in a new array must not snap
+    // the owner back to the first one.
+    const refreshed = projects.map((project) => ({ ...project }));
+    expect(resolveEffectiveProject(refreshed, "p2")).toBe("p2");
+  });
+
+  it("falls back to the first project when the chosen one disappears", () => {
+    expect(resolveEffectiveProject(projects, "gone")).toBe("p1");
+    expect(resolveEffectiveProject([], "p2")).toBe(null);
+  });
+
+  it("never displays one project while submitting another", () => {
+    // One derived value drives the select, the validation and the submission,
+    // so there is no second source that could disagree.
+    for (const chosen of [null, "p1", "p2", "gone"]) {
+      const effective = resolveEffectiveProject(projects, chosen);
+      expect(projects.some((project) => project.id === effective)).toBe(true);
+    }
   });
 });
