@@ -9,6 +9,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { PeerLoopCommandRefusedError, type PeerLoopError } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -388,6 +389,60 @@ it.layer(NodeServices.layer, { excludeTestServices: true })("Peer Loop bridge tr
 
       const settled = yield* Effect.flatten(Fiber.await(pending));
       assert.isTrue(Exit.isFailure(settled));
+      assert.strictEqual(yield* connection.pendingRequestCount, 0);
+    }),
+  );
+
+  it.effect("refuses a request that races the child exiting, with the real reason", () =>
+    Effect.gen(function* () {
+      // The window this closes is narrow and entirely invisible from outside:
+      // a request checks that the transport is open, yields while building its
+      // deferred, and registers into `pending` after `shutdown` has already
+      // snapshotted and cleared it. Nothing then ever fails that caller. The
+      // seam parks a request in exactly that window rather than hoping the
+      // scheduler produces it.
+      const command = yield* fakeCommand("exit-on-request");
+      const arrived = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let armed = true;
+
+      const connection = yield* connect(command, {
+        // Deliberately long. If the racing request fell into the hole it would
+        // sit here for thirty seconds instead of being told the child had gone,
+        // which is the difference this test is about.
+        requestTimeout: Duration.seconds(30),
+        stopTimeout: Duration.millis(200),
+        seams: {
+          beforeRegisterRequest: Effect.suspend(() => {
+            if (!armed) return Effect.void;
+            armed = false;
+            return Deferred.succeed(arrived, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+            );
+          }),
+        },
+      });
+
+      const racing = yield* Effect.forkChild(
+        Effect.exit(Effect.asVoid(connection.request("health", {}))),
+      );
+      yield* Deferred.await(arrived);
+
+      // A second request reaches the child, which exits on reading it. The
+      // whole shutdown — snapshot, clear, fail, end — runs while the first
+      // request is still parked before its registration.
+      yield* Effect.exit(Effect.asVoid(connection.request("runs.list", {})));
+      const reason = yield* connection.closed;
+      assert.strictEqual(reason._tag, "PeerLoopTransportError");
+
+      yield* Deferred.succeed(release, undefined);
+      const settled = yield* Effect.flatten(Fiber.await(racing));
+
+      assert.isTrue(Exit.isFailure(settled));
+      const failure = String(Exit.isFailure(settled) ? settled.cause : "");
+      // The reason the transport actually ended, not a bound running out.
+      assert.include(failure, "PeerLoopTransportError");
+      assert.notInclude(failure, "PeerLoopTimeoutError");
       assert.strictEqual(yield* connection.pendingRequestCount, 0);
     }),
   );

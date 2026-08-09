@@ -235,6 +235,17 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     readonly lifecycleRequestTimeout?: Duration.Duration;
     readonly handshakeTimeout?: Duration.Duration;
     readonly stopTimeout?: Duration.Duration;
+    /**
+     * Test-only injection points. Nothing in the product supplies these.
+     *
+     * `beforeRegisterRequest` runs inside `request`, after the line is built and
+     * before the atomic registration, which is the exact window a shutdown has
+     * to be able to close. A test parks there and ends the transport underneath
+     * it; without a seam that interleaving is a matter of scheduler luck.
+     */
+    readonly seams?: {
+      readonly beforeRegisterRequest?: Effect.Effect<void>;
+    };
   } = {},
 ): Effect.fn.Return<
   PeerLoopBridgeConnection,
@@ -246,6 +257,7 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
   const lifecycleTimeout = options.lifecycleRequestTimeout ?? PEER_LOOP_LIFECYCLE_REQUEST_TIMEOUT;
   const handshakeTimeout = options.handshakeTimeout ?? PEER_LOOP_HANDSHAKE_TIMEOUT;
   const stopTimeout = options.stopTimeout ?? PEER_LOOP_STOP_TIMEOUT;
+  const beforeRegisterRequest = options.seams?.beforeRegisterRequest;
 
   // No shell. The command and its arguments are separate values and stay that
   // way all the way to `spawn`.
@@ -268,6 +280,48 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
 
   const pending = new Map<string, PendingRequest>();
   const subscribers = new Set<SubscriberFeed>();
+  /**
+   * Why this transport ended, or null while it is live.
+   *
+   * A PLAIN VARIABLE ON PURPOSE, and it is the synchronisation primitive for
+   * everything that joins or leaves this connection. `Deferred.isDone(closed)`
+   * cannot serve: reading it is an effect, so a request could observe "open",
+   * yield while building its deferred, and register into `pending` after
+   * `shutdown` had already snapshotted and cleared the map — a caller waiting on
+   * a dead transport until its own timeout. Registration, subscription and
+   * shutdown all check and mutate this in one synchronous step, which no fiber
+   * can interleave with.
+   */
+  let endedReason: PeerLoopTransportError | PeerLoopProtocolError | null = null;
+
+  /**
+   * Claim the right to end the transport. True for exactly one caller.
+   *
+   * Synchronous, so from the moment it returns true no further request or
+   * subscriber can join and the cleanup below sees a complete set.
+   */
+  const beginShutdownUnsafe = (reason: PeerLoopTransportError | PeerLoopProtocolError): boolean => {
+    if (endedReason !== null) return false;
+    endedReason = reason;
+    return true;
+  };
+
+  /** Register a request, or refuse it because the transport has already ended. */
+  const registerRequestUnsafe = (
+    id: string,
+    entry: PendingRequest,
+  ): PeerLoopTransportError | PeerLoopProtocolError | null => {
+    if (endedReason !== null) return endedReason;
+    pending.set(id, entry);
+    return null;
+  };
+
+  /** Add a subscriber, or refuse because there is nothing left to subscribe to. */
+  const addSubscriberUnsafe = (feed: SubscriberFeed): boolean => {
+    if (endedReason !== null) return false;
+    subscribers.add(feed);
+    return true;
+  };
   /**
    * The handshake, or why there will not be one.
    *
@@ -319,12 +373,15 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
    * happen happens first, and `closed` is resolved last, as the announcement
    * that it already has. Uninterruptible for the same reason: a half-finished
    * shutdown leaves subscribers parked on a queue nobody will ever write to.
+   *
+   * The claim is synchronous and comes first, so the snapshots below are the
+   * complete set: nothing can register after this line and be missed.
    */
   const shutdown = Effect.fn("peerLoop.bridge.shutdown")(function* (
     reason: PeerLoopTransportError | PeerLoopProtocolError,
   ) {
-    const settled = yield* Deferred.isDone(closed);
-    if (settled) return;
+    const claimed = yield* Effect.sync(() => beginShutdownUnsafe(reason));
+    if (!claimed) return;
 
     yield* Deferred.fail(ready, reason);
 
@@ -358,14 +415,16 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
         overflowed: Effect.sync(() => feed.overflowed),
       };
 
-      const alreadyClosed = yield* Deferred.isDone(closed);
-      if (alreadyClosed) {
+      // Atomic for the same reason a request registration is: making the queue
+      // above is a yield point, and a feed added after `shutdown` cleared the
+      // set would never be woken or ended.
+      const joined = yield* Effect.sync(() => addSubscriberUnsafe(feed));
+      if (!joined) {
         yield* Queue.offer(queue, { kind: "ended" });
         yield* Queue.end(queue);
         return handle;
       }
 
-      subscribers.add(feed);
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           subscribers.delete(feed);
@@ -545,6 +604,11 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
    * hand-written cleanup always misses. A response that arrives afterwards
    * finds nothing to resolve and is ignored.
    *
+   * AND IT CANNOT BE ADDED AFTER THE TRANSPORT ENDED. The check and the
+   * registration are one synchronous step against the same `endedReason` that
+   * `shutdown` claims, so a request racing a child exit is refused with that
+   * exit's typed reason immediately instead of waiting out its own timeout.
+   *
    * A TIMED-OUT MUTATION IS NOT RETRIED. Peer Loop may have accepted it and
    * finished after we stopped waiting; repeating a `run.start` would fork a
    * session and repeating a `run.recover` would replay a Builder task. The
@@ -554,8 +618,8 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
     method: PeerLoopBridgeMethod,
     params: Readonly<Record<string, unknown>>,
   ) {
-    const alreadyClosed = yield* Deferred.isDone(closed);
-    if (alreadyClosed) return yield* Deferred.await(closed).pipe(Effect.flatMap(Effect.fail));
+    const ended = endedReason;
+    if (ended !== null) return yield* ended;
 
     nextRequestId += 1;
     const id = `t3-${nextRequestId}`;
@@ -571,9 +635,9 @@ export const connect = Effect.fn("peerLoop.bridge.connect")(function* (
 
     const exchange = Effect.gen(function* () {
       const deferred = yield* Deferred.make<unknown, PeerLoopError>();
-      yield* Effect.sync(() => {
-        pending.set(id, { method, deferred });
-      });
+      if (beforeRegisterRequest !== undefined) yield* beforeRegisterRequest;
+      const refused = yield* Effect.sync(() => registerRequestUnsafe(id, { method, deferred }));
+      if (refused !== null) return yield* refused;
       yield* Queue.offer(stdinQueue, encoder.encode(`${line}\n`));
       return yield* Deferred.await(deferred);
     });

@@ -8,6 +8,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import type { PeerLoopSubscriptionEvent } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -73,11 +74,31 @@ const makeService = Effect.gen(function* () {
  *
  * The barrier is what makes a cold race real rather than hoped for: every
  * caller reaches the spawn together, and only then is one allowed through.
+ * `reachedSpawn` and `childStarted` turn "the attempt is now at this exact
+ * point" into something a test can wait on instead of sleeping and hoping.
  */
 interface CountingSpawner {
   readonly layer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
   readonly spawned: () => number;
+  /**
+   * How many spawn calls were ever entered, released or not.
+   *
+   * Distinct from `spawned`, and the distinction is the point: an attempt that
+   * was abandoned and silently restarted shows up here and nowhere else.
+   */
+  readonly attempts: () => number;
+  /** Pids of children that were actually created, in order. */
+  readonly pids: () => readonly number[];
   readonly release: () => void;
+  /** Resolves once `count` spawn calls have reached the gate. */
+  readonly reachedSpawn: (count: number) => Effect.Effect<void>;
+  /** Resolves once `count` children actually exist. */
+  readonly childStarted: (count: number) => Effect.Effect<void>;
+}
+
+interface CountWaiter {
+  readonly count: number;
+  readonly resume: () => void;
 }
 
 const makeCountingSpawner = (
@@ -85,8 +106,32 @@ const makeCountingSpawner = (
   options: { readonly hold?: boolean; readonly fail?: boolean } = {},
 ): CountingSpawner => {
   let count = 0;
+  let reached = 0;
+  let started = 0;
+  const pids: number[] = [];
   let open = options.hold !== true;
   const waiters: Array<() => void> = [];
+  const reachedWaiters: CountWaiter[] = [];
+  const startedWaiters: CountWaiter[] = [];
+
+  const wake = (list: CountWaiter[], value: number): void => {
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const waiter = list[index];
+      if (waiter !== undefined && value >= waiter.count) {
+        list.splice(index, 1);
+        waiter.resume();
+      }
+    }
+  };
+
+  const awaitCount = (list: CountWaiter[], current: () => number, count: number) =>
+    Effect.callback<void>((resume) => {
+      if (current() >= count) {
+        resume(Effect.void);
+        return;
+      }
+      list.push({ count, resume: () => resume(Effect.void) });
+    });
 
   const gate = Effect.callback<void>((resume) => {
     if (open) {
@@ -98,6 +143,10 @@ const makeCountingSpawner = (
 
   return {
     spawned: () => count,
+    attempts: () => reached,
+    pids: () => [...pids],
+    reachedSpawn: (target) => awaitCount(reachedWaiters, () => reached, target),
+    childStarted: (target) => awaitCount(startedWaiters, () => started, target),
     release: () => {
       open = true;
       for (const waiter of waiters.splice(0)) waiter();
@@ -106,7 +155,11 @@ const makeCountingSpawner = (
       ChildProcessSpawner.ChildProcessSpawner.of({
         ...real,
         spawn: (command) =>
-          gate.pipe(
+          Effect.sync(() => {
+            reached += 1;
+            wake(reachedWaiters, reached);
+          }).pipe(
+            Effect.andThen(gate),
             Effect.andThen(
               Effect.sync(() => {
                 count += 1;
@@ -117,10 +170,47 @@ const makeCountingSpawner = (
                 ? Effect.die(new Error("spawn refused by the counting spawner"))
                 : real.spawn(command),
             ),
+            Effect.tap((handle) =>
+              Effect.sync(() => {
+                pids.push(Number(handle.pid));
+                started += 1;
+                wake(startedWaiters, started);
+              }),
+            ),
           ),
       }),
     ),
   };
+};
+
+/**
+ * Releases every party at once.
+ *
+ * The last to arrive opens the gate, so "at the same time" is a fact rather
+ * than a sleep long enough that it probably worked.
+ */
+const makeBarrier = (parties: number) =>
+  Effect.gen(function* () {
+    const open = yield* Deferred.make<void>();
+    let arrived = 0;
+    return {
+      arrive: Effect.suspend(() => {
+        arrived += 1;
+        return arrived >= parties
+          ? Effect.asVoid(Deferred.succeed(open, undefined))
+          : Deferred.await(open);
+      }),
+    } as const;
+  });
+
+/** Read-only liveness probe. Sends no signal; only ever asked about our child. */
+const isProcessAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 };
 
 /** Sequence numbers of the run events in a collected subscription stream. */
@@ -270,6 +360,211 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         // to fail.
         assert.strictEqual(spawner.spawned(), 1);
         assert.isTrue(outcomes.every((outcome) => Exit.isFailure(outcome)));
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("finishes a shared attempt whose first caller disconnected", () =>
+      Effect.gen(function* () {
+        yield* useFakeBridge("ready");
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real, { hold: true });
+
+        const scope = yield* Scope.make();
+        const service = yield* make(TEST_SEAMS).pipe(
+          Effect.provide(spawner.layer),
+          Scope.provide(scope),
+        );
+
+        // The winner installs the claim; the attempt reaches the held spawn.
+        const winner = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.status({}))));
+        yield* spawner.reachedSpawn(1);
+
+        // A second caller joins the same attempt — `startImmediately` runs it
+        // as far as its first suspension, which is the await on the shared
+        // claim — and then the client that started it all goes away, a
+        // websocket closing mid-RPC.
+        const waiter = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.listRuns({}))), {
+          startImmediately: true,
+        });
+        yield* Fiber.interrupt(winner);
+
+        spawner.release();
+        const settled = yield* Effect.flatten(Fiber.await(waiter));
+
+        // The attempt belongs to the service, so cancelling one waiter neither
+        // cancels it nor strands the others.
+        assert.isTrue(Exit.isSuccess(settled));
+        assert.strictEqual(spawner.spawned(), 1);
+        // And it was the same attempt throughout — not abandoned and quietly
+        // begun again by whoever was left.
+        assert.strictEqual(spawner.attempts(), 1);
+
+        const status = yield* service.status({});
+        assert.strictEqual(status.transport.state, "connected");
+        const pid = status.health?.bridge.pid ?? 0;
+        assert.isAbove(pid, 0);
+        assert.strictEqual(spawner.spawned(), 1);
+
+        yield* Scope.close(scope, Exit.void);
+        // Nothing this service started outlives it.
+        assert.isFalse(isProcessAlive(pid));
+      }),
+    );
+
+    it.effect("closes a provisional child when the handshake fails after its caller left", () =>
+      Effect.gen(function* () {
+        // This bridge never announces itself, so the attempt is still
+        // mid-handshake — child alive, nothing adopted — when its caller is
+        // cancelled. A provisional scope left open here is an orphan
+        // `peer-loop` holding project leases nobody can release.
+        yield* useFakeBridge("silent");
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real);
+
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          connect: { handshakeTimeout: Duration.millis(400), stopTimeout: Duration.millis(200) },
+          replayBoundaryTimeout: Duration.seconds(2),
+        }).pipe(Effect.provide(spawner.layer), Scope.provide(scope));
+
+        const winner = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.status({}))));
+        yield* spawner.childStarted(1);
+        const waiter = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.listRuns({}))));
+        yield* Fiber.interrupt(winner);
+
+        const settled = yield* Effect.flatten(Fiber.await(waiter));
+        assert.isTrue(Exit.isFailure(settled));
+        assert.strictEqual(spawner.spawned(), 1);
+
+        const pid = spawner.pids()[0] ?? 0;
+        assert.isAbove(pid, 0);
+        assert.isFalse(isProcessAlive(pid));
+
+        // A completed failure is not retried on its own.
+        assert.strictEqual(spawner.spawned(), 1);
+
+        yield* Scope.close(scope, Exit.void);
+      }),
+    );
+
+    it.effect("settles every waiter when the service stops mid-attempt", () =>
+      Effect.gen(function* () {
+        yield* useFakeBridge("ready");
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real, { hold: true });
+
+        const scope = yield* Scope.make();
+        const service = yield* make(TEST_SEAMS).pipe(
+          Effect.provide(spawner.layer),
+          Scope.provide(scope),
+        );
+
+        const waiters = yield* Effect.forkChild(
+          Effect.all(
+            [
+              Effect.exit(Effect.asVoid(service.listRuns({}))),
+              Effect.exit(Effect.asVoid(service.attachRun({ runId: "run-1" }))),
+            ],
+            { concurrency: "unbounded" },
+          ),
+        );
+        yield* spawner.reachedSpawn(1);
+
+        // The layer goes down while the bridge is still being started.
+        yield* Scope.close(scope, Exit.void);
+        spawner.release();
+
+        const outcomes = yield* Effect.flatten(Fiber.await(waiters));
+        assert.isTrue(outcomes.every((outcome) => Exit.isFailure(outcome)));
+        // The child never got past the gate, so there is nothing to leak.
+        assert.deepStrictEqual(spawner.pids(), []);
+
+        // And the claim is gone: a later call refuses rather than joining a
+        // deferred nobody will ever complete.
+        const error = yield* Effect.flip(Effect.asVoid(service.listRuns({})));
+        assert.strictEqual(error._tag, "PeerLoopUnavailableError");
+      }),
+    );
+
+    it.effect("takes the provisional child down with the layer, mid-handshake", () =>
+      Effect.gen(function* () {
+        // The child exists and nothing has adopted it: `live` is still null, so
+        // the layer finalizer has nothing to release and only the attempt's own
+        // exit can close that scope. Interruption is the path a `tapError`
+        // never runs on, and the leak it leaves is a live `peer-loop`.
+        yield* useFakeBridge("silent");
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real);
+
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          connect: { handshakeTimeout: Duration.seconds(20), stopTimeout: Duration.millis(200) },
+          replayBoundaryTimeout: Duration.seconds(2),
+        }).pipe(Effect.provide(spawner.layer), Scope.provide(scope));
+
+        const waiter = yield* Effect.forkChild(Effect.exit(Effect.asVoid(service.listRuns({}))));
+        yield* spawner.childStarted(1);
+
+        // Well inside the twenty-second handshake bound: nothing here is
+        // waiting for a timeout to rescue it.
+        yield* Scope.close(scope, Exit.void);
+
+        const settled = yield* Effect.flatten(Fiber.await(waiter));
+        assert.isTrue(Exit.isFailure(settled));
+
+        const pid = spawner.pids()[0] ?? 0;
+        assert.isAbove(pid, 0);
+        assert.isFalse(isProcessAlive(pid));
+      }),
+    );
+
+    it.effect("gives two simultaneous first attachments one gate, not two", () =>
+      Effect.gen(function* () {
+        // Every replay here is paced, so the two genuinely overlap. Peer Loop
+        // keeps one attachment per run: two gates would mean the second attach
+        // supersedes the first mid-replay and strands it.
+        yield* useFakeBridge("slow-replay");
+        const { service, scope } = yield* makeService;
+
+        // The bridge is already up, so the race is on the replay coordination
+        // itself rather than on the connection.
+        yield* service.status({});
+
+        const barrier = yield* makeBarrier(2);
+        const collect = (afterSeq: number, take: number) =>
+          Stream.runCollect(
+            Stream.take(
+              Stream.unwrap(
+                Effect.as(
+                  barrier.arrive,
+                  service.subscribeEvents({ runId: "run-unseen", afterSeq }),
+                ),
+              ),
+              take,
+            ),
+          );
+
+        // No stagger: both are released by the last one to arrive.
+        const [fromZero, fromThree] = yield* Effect.all([collect(0, 7), collect(3, 4)], {
+          concurrency: "unbounded",
+        });
+
+        // Two gates would have let both replays run at once.
+        assert.strictEqual(yield* service.peakConcurrentReplays, 1);
+        assert.strictEqual(yield* service.replaySlotCount, 0);
+
+        assert.deepStrictEqual(seqsOf(fromZero), [1, 2, 3, 4, 5, 6]);
+        assert.deepStrictEqual(seqsOf(fromThree), [4, 5, 6]);
+        for (const stream of [fromZero, fromThree]) {
+          const seqs = seqsOf(stream);
+          assert.deepStrictEqual(
+            [...seqs].sort((a, b) => a - b),
+            seqs,
+          );
+          assert.strictEqual(new Set(seqs).size, seqs.length);
+        }
 
         yield* Scope.close(scope, Exit.void);
       }),
@@ -593,6 +888,8 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
         );
 
         assert.strictEqual(yield* service.replaySlotCount, 0);
+        // Every one of those attaches held the gate alone.
+        assert.strictEqual(yield* service.peakConcurrentReplays, 1);
 
         yield* Scope.close(scope, Exit.void);
       }),

@@ -101,8 +101,17 @@ repository.
 
 If your turns legitimately run longer, raise it on this machine with
 `peerLoopStopTimeoutSeconds` in `local.json` (or
-`T3_PEER_LOOP_STOP_TIMEOUT_SECONDS`), anywhere from one minute to one hour.
-Values outside that range are ignored rather than obeyed.
+`T3_PEER_LOOP_STOP_TIMEOUT_SECONDS`), anywhere from one minute to one hour, in
+whole seconds.
+
+Anything else is ignored and the ten minutes above applies: a value outside that
+range, a fraction, or something that is not a number. `120s` and `two minutes`
+are not read as 120 — a setting that half-worked would be worse than one that
+did not, because you would never find out. As with the executable, the variable
+decides once it is set: if you set it to something unusable, T3 Code falls back
+to the default rather than to whatever `local.json` says, so the answer is never
+a number you are not looking at. Leaving the variable empty is the same as not
+setting it.
 
 ## Things T3 Code will tell you instead of hiding
 

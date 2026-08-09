@@ -106,6 +106,14 @@ One child, owned by a `Scope`.
   error carries `mayHaveApplied: true`: Peer Loop may have accepted it and
   finished after we stopped waiting, so nothing is ever retried automatically.
 - Every pending request fails when the child exits or the protocol is violated.
+- **One synchronous ended-state, shared by everything that joins or leaves.**
+  Registering a request, adding a subscriber and starting a shutdown all check
+  and mutate the same plain variable in a single tick. Reading a `Deferred`
+  cannot serve here: a request could observe "open", yield while building its
+  own deferred, and land in `pending` after shutdown had already snapshotted and
+  cleared it — a caller left waiting out its full bound on a transport that was
+  already gone. A request racing a child exit now gets that exit's typed reason
+  immediately.
 - `bridge.ready` must arrive, announce protocol version 1, _and_ list every
   method and notification this build depends on. Announcing v1 is a claim;
   implementing it is the requirement. Extra capabilities are additive.
@@ -115,6 +123,31 @@ One child, owned by a `Scope`.
 
 The child's exit status is observed once and shared, because both the reader and
 the finalizer want it and awaiting the handle twice is not something to rely on.
+
+## Starting one bridge, once
+
+Nothing spawns until a Peer Loop RPC is used. Of any number of concurrent cold
+callers exactly one installs a shared attempt, with a single `Ref.modify`, and
+everyone else awaits its result — success or typed failure alike. Two bridges
+would be two writers contending for the same project leases, which is the one
+outcome Peer Loop's ownership model cannot express.
+
+**The attempt is owned by the service, not by the caller that installed it.** An
+RPC fiber dies when its client disconnects, and an attempt running on that fiber
+would take the other waiters' answer with it and leave a half-started child that
+nothing holds a handle to. So the attempt is forked into the service scope and
+every caller, including the one that installed it, is only ever a waiter.
+Cancelling a waiter cancels that waiter.
+
+The provisional scope holding the child is closed on every exit that is not an
+adoption — typed failure, defect, rejected handshake, interruption, or the layer
+going down mid-handshake. `onExit`, not `tapError`: interruption is the path a
+`tapError` never runs on, and what it leaks is an orphan `peer-loop` still
+holding Peer Loop's leases. If the layer stops while an attempt is in flight, the
+waiters are settled with a typed unavailable error rather than parked forever,
+and the claim is cleared so nothing joins an attempt that will never finish.
+A failure that completed is not retried by anything; a later explicit RPC starts
+a fresh attempt.
 
 ## Shutdown
 
@@ -131,8 +164,15 @@ minutes. A ten-second bound would terminate live turns as a matter of routine �
 the exact ambiguous half-applied state this integration exists to avoid. An
 operator whose turns run longer can raise it machine-locally with
 `peerLoopStopTimeoutSeconds` (or `T3_PEER_LOOP_STOP_TIMEOUT_SECONDS`), bounded to
-between one minute and one hour; a value outside that range is ignored rather
-than obeyed. Tests inject a short bound instead of waiting.
+between one minute and one hour. Tests inject a short bound instead of waiting.
+
+That value is read strictly. Only whole seconds are accepted from either source:
+`parseInt` would read `"120junk"` as 120 and `"1e4"` as 1, handing an operator a
+shutdown bound they never wrote and saying nothing about it, so a partial parse
+is no parse. Precedence follows presence rather than validity, exactly as the
+executable does — a set-but-unusable variable falls back to the built-in default
+rather than to a `local.json` number the operator is not looking at, and a blank
+variable counts as unset.
 
 `shutdown` releases subscribers and pending requests _before_ it resolves
 `closed`, and runs uninterruptibly. Resolving `closed` wakes the layer above,
@@ -170,6 +210,13 @@ on a real drop.
   itself reported — authoritative, unlike counting events, which is not possible
   when sequences can skip. The gate is reference-counted and disappears with its
   last user, so arbitrary run ids cannot grow a map.
+- **Finding or creating that gate is one synchronous step.** Building the
+  semaphore with an effect meant a lookup miss, a yield, and only then the write,
+  so two first attachments for the same run could each miss and each build a gate
+  of their own — serialising against nothing. The reference is taken
+  uninterruptibly and returned against the exact slot it was taken from, so a
+  caller cancelled mid-attach can neither leak a reference nor hand back one it
+  never held.
 - A subscription whose bridge dies ends with `interrupted` (or `stopped` on a
   clean server shutdown), never with the stale `connected` a plain read of the
   transport ref would still be showing. The transport end arrives as an item on
@@ -223,12 +270,24 @@ covers laziness, single-flight connection, refusal pass-through, deduplication
 against a concurrent attach, explicit pause/resume/recover forwarding, and the
 absence of any automatic recovery.
 
-`Service.test.ts` additionally proves the hard parts with deterministic seams: a
-counting spawner with a barrier holds every cold caller at the spawn to show a
-real race produces exactly one child (and shares one typed failure), and injected
-durations keep the stop and replay bounds measurable in milliseconds. Both the
-bridge's `pendingRequestCount` and the service's `replaySlotCount` are inspection
-seams for tests only — neither is an RPC or part of the product API.
+`Command.test.ts` is pure: it is entirely about how strictly the machine-local
+stop bound is read, including everything that must be refused.
+
+`Service.test.ts` additionally proves the hard parts with deterministic seams
+rather than sleeps. A counting spawner holds every cold caller at the spawn, and
+also reports when a spawn has been _entered_ and when a child actually _exists_
+— which is what lets a test cancel the winning caller at an exact point: before
+the spawn is released, after the child is running but before the handshake, and
+with the layer going down in between. It counts entered attempts separately from
+created children, so an attempt that was quietly abandoned and begun again shows
+up. A two-party barrier starts two first attachments for one run with nothing
+staggering them. Injected durations keep the stop and replay bounds measurable in
+milliseconds, and a bridge-side `beforeRegisterRequest` seam parks a request in
+the one window where it could have registered after a shutdown.
+
+The bridge's `pendingRequestCount` and the service's `replaySlotCount` and
+`peakConcurrentReplays` are inspection seams for tests only — none is an RPC or
+part of the product API.
 
 These tests need real timers — they wait on an actual subprocess — so they run
 under `it.layer(..., { excludeTestServices: true })`. The default `it.effect`

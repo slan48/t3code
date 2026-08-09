@@ -47,25 +47,46 @@ export interface PeerLoopCommand {
   readonly source: PeerLoopExecutableSource;
 }
 
+/** Whole seconds and nothing else. No sign, no decimal point, no suffix. */
+const WHOLE_SECONDS = /^\d+$/;
+
+/** In range and an exact integer, or null. Shared by both sources. */
+function acceptStopTimeout(seconds: number): number | null {
+  if (!Number.isSafeInteger(seconds)) return null;
+  return seconds >= PEER_LOOP_STOP_TIMEOUT_MIN_SECONDS &&
+    seconds <= PEER_LOOP_STOP_TIMEOUT_MAX_SECONDS
+    ? seconds
+    : null;
+}
+
 /**
- * Read the machine-local stop timeout, or null to use the default.
+ * Read the machine-local stop timeout, or null to use the documented default.
  *
- * A value outside the sane range, or one that is not a number at all, is
- * ignored rather than obeyed: a typo must not turn shutdown into either an
- * instant kill or an unbounded hang.
+ * STRICT, BECAUSE A PARTIAL PARSE IS WORSE THAN NO PARSE. `parseInt` reads
+ * `"120junk"` as 120 and `"1e4"` as 1, so an operator who fat-fingered a unit
+ * would get a bound they never wrote and no indication of it. Only whole
+ * seconds are accepted from either source: a decimal, a sign, a suffix, a
+ * non-finite number or anything outside one minute to one hour is ignored and
+ * the built-in default applies.
+ *
+ * PRECEDENCE IS DECIDED BY PRESENCE, NOT BY VALIDITY — the same rule the
+ * executable resolution uses, and for the same reason. A `local.json` value is
+ * consulted only when the environment says nothing at all; an environment
+ * variable that is set but unusable falls back to the safe built-in default
+ * rather than to a different number the operator is not looking at. An empty or
+ * whitespace-only variable counts as saying nothing, matching how a blank
+ * configured path is treated.
  */
 export function readStopTimeoutSeconds(
   fromEnv: string | undefined,
   fromFile: number | undefined,
 ): number | null {
-  const parsedEnv = fromEnv === undefined ? Number.NaN : Number.parseInt(fromEnv.trim(), 10);
-  const candidate = Number.isFinite(parsedEnv) ? parsedEnv : fromFile;
-  if (candidate === undefined || !Number.isFinite(candidate)) return null;
-  const rounded = Math.round(candidate);
-  return rounded >= PEER_LOOP_STOP_TIMEOUT_MIN_SECONDS &&
-    rounded <= PEER_LOOP_STOP_TIMEOUT_MAX_SECONDS
-    ? rounded
-    : null;
+  const env = fromEnv?.trim() ?? "";
+  if (env.length > 0) {
+    return WHOLE_SECONDS.test(env) ? acceptStopTimeout(Number(env)) : null;
+  }
+  if (fromFile === undefined) return null;
+  return acceptStopTimeout(fromFile);
 }
 
 /**

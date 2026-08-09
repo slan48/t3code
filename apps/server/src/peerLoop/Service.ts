@@ -116,6 +116,15 @@ export class PeerLoopService extends Context.Service<
      * rather than a hope. Not an RPC and not part of the product API.
      */
     readonly replaySlotCount: Effect.Effect<number>;
+    /**
+     * The most attaches ever inside a per-run replay gate at the same time.
+     *
+     * The other half of the same inspection seam: `replaySlotCount` proves the
+     * coordination map is bounded, this proves the gate in it actually
+     * excludes. Two simultaneous first attachments building two different gates
+     * would show as 2 here and as nothing at all anywhere else. Not an RPC.
+     */
+    readonly peakConcurrentReplays: Effect.Effect<number>;
   }
 >()("t3/peerLoop/Service/PeerLoopService") {}
 
@@ -148,6 +157,15 @@ interface RunReplaySlot {
 
 /** How long a replay may hold its run's slot before it is assumed finished. */
 export const PEER_LOOP_REPLAY_BOUNDARY_TIMEOUT = Duration.seconds(30);
+
+/**
+ * What a waiter is told when its shared connection attempt did not finish.
+ *
+ * Only reachable when the service scope closes while a bridge is still being
+ * started. A category, like every other public transport detail: no path, no
+ * cause, nothing from the child.
+ */
+export const PEER_LOOP_ATTEMPT_ENDED = "the Peer Loop connection attempt ended before it completed";
 
 const decodeRunsList = Schema.decodeUnknownEffect(PeerLoopRunsListResult);
 const decodeAttach = Schema.decodeUnknownEffect(PeerLoopAttachResult);
@@ -257,7 +275,16 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     Effect.provideService(Path.Path, path),
   );
 
-  /** Spawns a bridge and adopts it. Only ever called through `ensureConnection`. */
+  /**
+   * Spawn a bridge and adopt it. Only ever called through `runConnectionAttempt`.
+   *
+   * THE PROVISIONAL SCOPE IS CLOSED ON EVERY EXIT THAT IS NOT AN ADOPTION. A
+   * typed failure, a defect, a rejected handshake and an interruption all leave
+   * a child that nothing else holds a handle to, and an orphaned `peer-loop`
+   * still holds Peer Loop's project leases — the single worst leak available
+   * here. `onExit` covers the interruption case, which is the one a `tapError`
+   * silently misses.
+   */
   const openConnection = Effect.gen(function* () {
     // After shutdown there is no scope left to own a child, so a late call
     // must refuse rather than leave an orphan bridge holding project leases.
@@ -283,52 +310,132 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         ? undefined
         : Duration.seconds(resolution.stopTimeoutSeconds));
 
-    const connection = yield* connect(resolution.command, {
-      ...connectOptions,
-      ...(stopTimeout === undefined ? {} : { stopTimeout }),
-    }).pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-      Scope.provide(scope),
-      Effect.tapError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)),
-      Effect.tapError((error) => setTransport("unavailable", error.message, null)),
+    const adoptable = Effect.gen(function* () {
+      const connection = yield* connect(resolution.command, {
+        ...connectOptions,
+        ...(stopTimeout === undefined ? {} : { stopTimeout }),
+      }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Scope.provide(scope),
+        Effect.tapError((error) => setTransport("unavailable", error.message, null)),
+      );
+
+      const entry: LiveConnection = { connection, scope };
+      yield* Ref.set(live, entry);
+      yield* Ref.set(health, connection.health);
+      yield* setTransport("connected", null, connection.health.protocolVersion);
+
+      // Re-checked AFTER adoption, and the order is what makes it total. The
+      // layer finalizer sets `stopped` and then reads `live`; whichever of the
+      // two runs first, exactly one of them sees the other's write, so a bridge
+      // that finished handshaking during shutdown is always released.
+      if (yield* Ref.get(stopped)) {
+        yield* releaseConnection(entry, "stopped", null);
+        return yield* new PeerLoopUnavailableError({ reason: "this server is shutting down" });
+      }
+
+      // One watcher per connection, on the service scope so it cannot outlive
+      // the layer. It publishes the interruption; it does not act on it.
+      yield* connection.closed.pipe(
+        Effect.flatMap((reason) =>
+          Effect.logWarning("Peer Loop bridge transport ended.").pipe(
+            Effect.annotateLogs({ detail: reason.message }),
+            Effect.andThen(releaseConnection(entry, "interrupted", reason.message)),
+          ),
+        ),
+        Effect.forkIn(serviceScope),
+      );
+
+      return connection;
+    });
+
+    return yield* adoptable.pipe(
+      Effect.onExit((exit) =>
+        Exit.isSuccess(exit) ? Effect.void : Scope.close(scope, Exit.void).pipe(Effect.ignore),
+      ),
     );
+  });
 
-    const entry: LiveConnection = { connection, scope };
-    yield* Ref.set(live, entry);
-    yield* Ref.set(health, connection.health);
-    yield* setTransport("connected", null, connection.health.protocolVersion);
+  /**
+   * Run one connection attempt to completion and hand the result to everyone.
+   *
+   * Forked into the SERVICE scope, never run on a caller's fiber. An RPC fiber
+   * is cancelled when its client disconnects, and a shared attempt that died
+   * with its first caller would leave the other waiters parked forever and — if
+   * the child had already spawned — a bridge nobody owns. So cancellation of
+   * any individual waiter, including the one that won the claim, only cancels
+   * that waiter.
+   *
+   * `ensuring` is the promise that no waiter is left parked: whether this fiber
+   * succeeds, fails, dies or is interrupted by the layer shutting down, the
+   * claim is cleared and the deferred is settled. Settling twice is a no-op, so
+   * the normal path keeps its real outcome and only an abandoned attempt
+   * resolves to the typed unavailable error.
+   */
+  /**
+   * Stand this attempt down, and only this one.
+   *
+   * Conditional on purpose. An unconditional clear would let a finished
+   * attempt's cleanup wipe out the claim a *later* caller had already installed
+   * in its place, and the caller after that would then install a second one —
+   * two attempts, two bridges, two writers for the same project leases.
+   */
+  const retireClaim = (target: Deferred.Deferred<PeerLoopBridgeConnection, PeerLoopError>) =>
+    Ref.update(connecting, (current) => (current === target ? null : current));
 
-    // One watcher per connection, on the service scope so it cannot outlive
-    // the layer. It publishes the interruption; it does not act on it.
-    yield* connection.closed.pipe(
-      Effect.flatMap((reason) =>
-        Effect.logWarning("Peer Loop bridge transport ended.").pipe(
-          Effect.annotateLogs({ detail: reason.message }),
-          Effect.andThen(releaseConnection(entry, "interrupted", reason.message)),
+  const runConnectionAttempt = (
+    target: Deferred.Deferred<PeerLoopBridgeConnection, PeerLoopError>,
+  ) =>
+    Effect.gen(function* () {
+      // A connection may have completed between another caller's read of `live`
+      // and this claim being installed.
+      const settled = yield* Ref.get(live);
+      const outcome =
+        settled === null
+          ? yield* Effect.exit(openConnection)
+          : Exit.succeed<PeerLoopBridgeConnection>(settled.connection);
+
+      // Cleared before the result is published, so no caller can join an
+      // attempt that has already decided. A later explicit RPC starts a fresh
+      // one; nothing retries on its own.
+      yield* retireClaim(target);
+      yield* Deferred.done(target, outcome);
+    }).pipe(
+      Effect.ensuring(
+        retireClaim(target).pipe(
+          Effect.andThen(
+            Deferred.fail(
+              target,
+              new PeerLoopUnavailableError({ reason: PEER_LOOP_ATTEMPT_ENDED }),
+            ),
+          ),
         ),
       ),
-      Effect.forkIn(serviceScope),
+      Effect.withSpan("peerLoop.connectionAttempt"),
     );
-
-    return connection;
-  });
 
   /**
    * The live connection, opening one if there is not one already.
    *
    * The claim is a single `Ref.modify` — one atomic read-modify-write — so of
-   * any number of concurrent cold callers exactly one becomes the opener and
+   * any number of concurrent cold callers exactly one installs the attempt and
    * the rest await its result, success or typed failure alike. Two bridges
    * would be two writers contending for the same project leases, which is the
    * one outcome Peer Loop's ownership model cannot express.
    *
-   * The opener re-checks `live` after winning the claim, because a connection
-   * may have completed between another caller's read and its claim.
+   * The caller that installs the attempt does not run it; it waits on the
+   * result exactly like everyone else.
    */
   const ensureConnection: Effect.Effect<PeerLoopBridgeConnection, PeerLoopError> = Effect.gen(
     function* () {
       const existing = yield* Ref.get(live);
       if (existing !== null) return existing.connection;
+
+      // No claim is installed after shutdown: there is no scope left to own a
+      // child, and an orphan bridge would keep holding Peer Loop's leases.
+      if (yield* Ref.get(stopped)) {
+        return yield* new PeerLoopUnavailableError({ reason: "this server is shutting down" });
+      }
 
       const candidate = yield* Deferred.make<PeerLoopBridgeConnection, PeerLoopError>();
       const claim = yield* Ref.modify(
@@ -341,16 +448,8 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
             : [{ opener: false, deferred: current }, current],
       );
 
-      if (!claim.opener) return yield* Deferred.await(claim.deferred);
+      if (claim.opener) yield* Effect.forkIn(runConnectionAttempt(candidate), serviceScope);
 
-      const settled = yield* Ref.get(live);
-      const outcome =
-        settled === null
-          ? yield* Effect.exit(openConnection)
-          : Exit.succeed<PeerLoopBridgeConnection>(settled.connection);
-
-      yield* Ref.set(connecting, null);
-      yield* Deferred.done(claim.deferred, outcome);
       return yield* Deferred.await(claim.deferred);
     },
   );
@@ -358,24 +457,42 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
   /* ------------------------------------------------------ replay slots */
 
   const replaySlots = new Map<string, RunReplaySlot>();
+  /** Test seam: the most attaches ever inside a gate at once. Must stay 1. */
+  let concurrentReplays = 0;
+  let peakConcurrentReplays = 0;
 
-  const acquireReplaySlot = Effect.fn("peerLoop.acquireReplaySlot")(function* (runId: string) {
-    const existing = replaySlots.get(runId);
-    if (existing !== undefined) {
-      existing.users += 1;
-      return existing;
-    }
-    const slot: RunReplaySlot = { gate: yield* Semaphore.make(1), users: 1 };
-    replaySlots.set(runId, slot);
-    return slot;
-  });
-
-  const releaseReplaySlot = (runId: string) =>
+  /**
+   * Find or create this run's gate, and take a reference to it.
+   *
+   * ONE SYNCHRONOUS STEP, WHICH IS THE ENTIRE POINT. Creating the semaphore
+   * with an effect meant a lookup miss, a yield, and only then the write — so
+   * two first attachments for the same run could each miss, each build their
+   * own gate, and serialise against nothing. `makeUnsafe` keeps the miss and
+   * the write in the same tick, where no fiber can interleave.
+   */
+  const acquireReplaySlot = (runId: string): Effect.Effect<RunReplaySlot> =>
     Effect.sync(() => {
-      const slot = replaySlots.get(runId);
-      if (slot === undefined) return;
+      const existing = replaySlots.get(runId);
+      if (existing !== undefined) {
+        existing.users += 1;
+        return existing;
+      }
+      const slot: RunReplaySlot = { gate: Semaphore.makeUnsafe(1), users: 1 };
+      replaySlots.set(runId, slot);
+      return slot;
+    });
+
+  /**
+   * Give the reference back, deleting the entry with its last user.
+   *
+   * Takes the slot rather than looking it up again: releasing by run id could
+   * decrement a *different* slot created after this one was already deleted,
+   * and a client naming arbitrary run ids must not be able to corrupt a count.
+   */
+  const releaseReplaySlot = (runId: string, slot: RunReplaySlot) =>
+    Effect.sync(() => {
       slot.users -= 1;
-      if (slot.users <= 0) replaySlots.delete(runId);
+      if (slot.users <= 0 && replaySlots.get(runId) === slot) replaySlots.delete(runId);
     });
 
   /**
@@ -387,52 +504,78 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
    * The boundary is the `eventHighWaterMark` the attach itself reported —
    * authoritative, unlike counting events, because Peer Loop's sequences are
    * strictly increasing but not contiguous and the count is not knowable.
+   *
+   * `acquireUseRelease` rather than a hand-rolled `ensuring`: it takes the
+   * reference uninterruptibly and pairs the release with the exact slot it
+   * took, so a caller cancelled in the window between the two — a client that
+   * disconnected mid-attach — can neither leak a reference nor return one it
+   * never held.
    */
-  const attachSerialized = Effect.fn("peerLoop.attach")(function* (
+  const attachAndAwaitBoundary = (
     connection: PeerLoopBridgeConnection,
     runId: string,
     afterSeq: number,
-  ) {
-    const slot = yield* acquireReplaySlot(runId);
-    return yield* slot.gate
-      .withPermits(1)(
-        Effect.gen(function* () {
-          const watcher = yield* connection.subscribe;
-          const raw = yield* connection.request("run.attach", { runId, afterSeq });
-          const result = yield* decodeAttach(raw).pipe(
-            Effect.mapError(
-              () =>
-                new PeerLoopProtocolError({
-                  detail: "the bridge returned a run.attach result this build cannot read",
-                }),
-            ),
-          );
+  ) =>
+    Effect.gen(function* () {
+      const watcher = yield* connection.subscribe;
+      const raw = yield* connection.request("run.attach", { runId, afterSeq });
+      const result = yield* decodeAttach(raw).pipe(
+        Effect.mapError(
+          () =>
+            new PeerLoopProtocolError({
+              detail: "the bridge returned a run.attach result this build cannot read",
+            }),
+        ),
+      );
 
-          if (result.eventHighWaterMark > afterSeq) {
-            // Wait for the replay to reach its own boundary before letting the
-            // next attach for this run supersede it. Bounded, because a run
-            // that never emits again must not hold the slot forever.
-            yield* Stream.fromQueue(watcher.queue).pipe(
-              Stream.takeWhile((item) => item.kind === "notification"),
-              Stream.filter((item) => {
-                const message = (item as { readonly message: PeerLoopBridgeNotification }).message;
-                return (
-                  message.method === "run.event" &&
-                  message.params.runId === runId &&
-                  message.params.event.seq >= result.eventHighWaterMark
-                );
-              }),
-              Stream.take(1),
-              Stream.runDrain,
-              Effect.timeoutOption(replayBoundaryTimeout),
+      if (result.eventHighWaterMark > afterSeq) {
+        // Wait for the replay to reach its own boundary before letting the next
+        // attach for this run supersede it. Bounded, because a run that never
+        // emits again must not hold the slot forever.
+        yield* Stream.fromQueue(watcher.queue).pipe(
+          Stream.takeWhile((item) => item.kind === "notification"),
+          Stream.filter((item) => {
+            const message = (item as { readonly message: PeerLoopBridgeNotification }).message;
+            return (
+              message.method === "run.event" &&
+              message.params.runId === runId &&
+              message.params.event.seq >= result.eventHighWaterMark
             );
-          }
+          }),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.timeoutOption(replayBoundaryTimeout),
+        );
+      }
 
-          return result;
-        }).pipe(Effect.scoped),
-      )
-      .pipe(Effect.ensuring(releaseReplaySlot(runId)));
-  });
+      return result;
+    }).pipe(Effect.scoped);
+
+  const attachSerialized = (
+    connection: PeerLoopBridgeConnection,
+    runId: string,
+    afterSeq: number,
+  ) =>
+    Effect.acquireUseRelease(
+      acquireReplaySlot(runId),
+      (slot) =>
+        slot.gate.withPermits(1)(
+          // The counters are a test seam and are paired the same way, so an
+          // interrupted attach cannot drift them.
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              concurrentReplays += 1;
+              peakConcurrentReplays = Math.max(peakConcurrentReplays, concurrentReplays);
+            }),
+            () => attachAndAwaitBoundary(connection, runId, afterSeq),
+            () =>
+              Effect.sync(() => {
+                concurrentReplays -= 1;
+              }),
+          ),
+        ),
+      (slot) => releaseReplaySlot(runId, slot),
+    ).pipe(Effect.withSpan("peerLoop.attach"));
 
   /** One bridge call, with its result validated against the contract. */
   const call = <A>(
@@ -691,6 +834,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
     subscribeEvents,
     diagnostics,
     replaySlotCount: Effect.sync(() => replaySlots.size),
+    peakConcurrentReplays: Effect.sync(() => peakConcurrentReplays),
   });
 });
 
