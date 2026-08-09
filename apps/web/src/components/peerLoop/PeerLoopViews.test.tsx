@@ -32,7 +32,7 @@ import {
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
-import { describeError } from "~/peerLoopPresentation";
+import { describeControls, describeError } from "~/peerLoopPresentation";
 import { PeerLoopDetailView, IDLE_COMMAND } from "./PeerLoopDetailView";
 import { PeerLoopIndexView } from "./PeerLoopIndexView";
 import { PeerLoopErrorNotice } from "./PeerLoopPrimitives";
@@ -527,7 +527,9 @@ describe("Peer Loop controls against real snapshots", () => {
   it("tells an interrupted stopped run to resume first, and offers no recovery yet", async () => {
     const html = await detail(attachedView(runState({ state: "interrupted" }), STOPPED));
     expect(html).toContain("A turn was in flight when this run stopped");
-    expect(html).toContain("does not replay the interrupted Builder task");
+    // Resuming reconnects and confirms the interruption; it runs no turn.
+    expect(html).toContain("runs no Reviewer or Builder turn on its own");
+    expect(html).toContain("stays interrupted until you choose");
     expect(html).not.toContain("Choose how to continue");
     expect(html).not.toContain("Run the interrupted task again");
   });
@@ -790,5 +792,55 @@ describe("Peer Loop observation failures", () => {
       observation: { waiting: true, empty: true, error: null },
     });
     expect(html).toContain("Reading this run from Peer Loop…");
+  });
+});
+
+describe("Peer Loop interrupted run, end to end", () => {
+  it("goes stopped-resumable → resume → live, and only then offers the choices", async () => {
+    // 1. The snapshot of a run you come back to: nobody is driving it, and Peer
+    //    Loop says it can be resumed.
+    const stopped = attachedView(runState({ state: "interrupted" }), STOPPED);
+    const stoppedControls = describeControls(stopped);
+    expect(stoppedControls.canResume).toBe(true);
+    expect(stoppedControls.canRecover).toBe(false);
+    expect(stoppedControls.resumeBeforeRecover).toBe(true);
+
+    const before = await detail(stopped);
+    expect(before).toContain("Resume");
+    expect(before).toContain("runs no Reviewer or Builder turn on its own");
+    expect(before).not.toContain("Hand it back to the Reviewer");
+    expect(before).not.toContain("Abandon the run");
+
+    // 2. `run.resume` establishes ownership and reports the interruption. The
+    //    run is still interrupted; observation is restarted and the live
+    //    snapshot is what comes back.
+    const live = attachedView(runState({ state: "interrupted" }), LIVE);
+    const liveControls = describeControls(live);
+    expect(liveControls.canResume).toBe(false);
+    expect(liveControls.canRecover).toBe(true);
+    expect(liveControls.resumeBeforeRecover).toBe(false);
+
+    // 3. All three choices, none selected, none invoked by rendering.
+    let recovered: string | null = null;
+    const after = await detail(live, {
+      actions: {
+        sendOwnerMessage: noop,
+        pause: noop,
+        resume: noop,
+        recover: (choice: string) => {
+          recovered = choice;
+        },
+        reattach: noop,
+        retryObservation: noop,
+      },
+    });
+    expect(after).toContain("Hand it back to the Reviewer");
+    expect(after).toContain("Run the interrupted task again");
+    expect(after).toContain("Abandon the run");
+    expect(after).toContain("Nothing happens until you pick one");
+    expect(after).not.toContain("runs no Reviewer or Builder turn on its own");
+    // The dangerous choice still needs a second, explicit press.
+    expect(after).not.toContain("Yes, run the task again");
+    expect(recovered).toBe(null);
   });
 });

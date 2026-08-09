@@ -291,13 +291,15 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
             </p>
             {/*
               Recovery is a live command and nobody is driving this run, so a
-              Recover button here would be refused. Resuming takes control
-              first — and it does not replay the interrupted task; that stays an
-              explicit choice, offered once Peer Loop is driving again.
+              Recover button here would be refused. Resuming reconnects and
+              detects the ambiguity; it runs no turn at all. The run stays
+              interrupted until the owner picks a recovery choice.
             */}
             <p className="text-xs text-muted-foreground">
-              Resume first to take control. Resuming runs a Reviewer turn and does not replay the
-              interrupted Builder task; you choose what happens to that afterwards.
+              Resume first to take control. Resuming reconnects to the run and confirms the
+              interrupted turn — it runs no Reviewer or Builder turn on its own. The run stays
+              interrupted until you choose how to continue, and the choices appear here once Peer
+              Loop is driving it again.
             </p>
           </div>
         ) : null}

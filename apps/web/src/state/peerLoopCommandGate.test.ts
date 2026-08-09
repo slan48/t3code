@@ -74,14 +74,36 @@ describe("Peer Loop command gate", () => {
     expect(run).toHaveBeenCalledTimes(2);
   });
 
-  it("releases the gate when the call throws", async () => {
+  it("settles a thrown defect instead of staying pending for ever", async () => {
     const run = vi.fn(async () => {
-      throw new Error("boom");
+      throw new Error("boom: /Users/nobody/secret-place");
     });
-    const { gate } = gateWith(run as never);
+    const { gate, states } = gateWith(run as never);
 
-    await expect(gate.invoke("a")).rejects.toThrow("boom");
+    // No rejection escapes: the route's `.then` chain must not become an
+    // unhandled rejection, and the button must not stay spinning.
+    expect(await gate.invoke("a")).toBe(null);
     expect(gate.isBusy()).toBe(false);
+    expect(states.at(-1)?.pending).toBe(false);
+    expect(states.at(-1)?.error).not.toBe(null);
+    // Whatever the defect carried never reaches a remote client.
+    expect(JSON.stringify(states.at(-1))).not.toContain("secret-place");
+    expect(states.at(-1)?.error?.mayHaveApplied).toBe(false);
+
+    // And the owner can try again; nothing retried on its own.
+    expect(run).toHaveBeenCalledTimes(1);
+    await gate.invoke("a");
+    expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts no mutation after disposal", async () => {
+    const run = vi.fn(async () => AsyncResult.success("done"));
+    const { gate, states } = gateWith(run);
+
+    gate.dispose();
+    expect(await gate.invoke("a")).toBe(null);
+    expect(run).not.toHaveBeenCalled();
+    expect(states).toEqual([]);
   });
 
   it("keeps the raw refusal so a duplicate run can be linked to", async () => {

@@ -72,6 +72,22 @@ const SEND_FAILED: PeerLoopErrorPresentation = {
 };
 
 /**
+ * An unexpected throw out of the RPC layer.
+ *
+ * Bounded and generic on purpose: whatever a defect carries was never meant for
+ * a remote client, and putting it on a phone would be the one place this
+ * integration leaks something it never inspected.
+ */
+const SEND_FAILED_UNEXPECTEDLY: PeerLoopErrorPresentation = {
+  title: "The command could not be sent",
+  detail:
+    "Something went wrong sending this. Nothing was retried; check the run before trying again.",
+  code: null,
+  tone: "warning",
+  mayHaveApplied: false,
+};
+
+/**
  * The gate itself, with no React in it.
  *
  * A synchronous closure flag, which is the whole point: a flag set inside a
@@ -97,7 +113,9 @@ export function createPeerLoopCommandGate<Input, Output>(deps: {
   };
 
   const invoke = async (input: Input): Promise<Output | null> => {
-    if (inFlight) return null;
+    // Disposed: the component that owned this is gone. Starting a mutation now
+    // would send a command nobody is watching the result of.
+    if (!live || inFlight) return null;
     inFlight = true;
     publish({ pending: true, error: null, failure: null, success: null });
 
@@ -120,8 +138,14 @@ export function createPeerLoopCommandGate<Input, Output>(deps: {
         success: null,
       });
       return null;
+    } catch {
+      // A DEFECT IS STILL A TERMINAL STATE. Letting it escape left the hook
+      // visibly pending for ever and turned the route's `.then` chain into an
+      // unhandled rejection. It is settled here, generically, and not retried.
+      publish({ pending: false, error: SEND_FAILED_UNEXPECTEDLY, failure: null, success: null });
+      return null;
     } finally {
-      // Every path, including a defect thrown out of `run`.
+      // Every path.
       inFlight = false;
     }
   };

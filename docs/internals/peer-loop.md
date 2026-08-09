@@ -436,9 +436,28 @@ Five rules the UI is built on:
 
 **Resume before Recover.** Recovery is a live command, so an interrupted run in
 the `not_attached` state shows Resume and an explanation rather than a Recover
-button Peer Loop would refuse. Resuming establishes control and does not replay
-the interrupted Builder task; observation is then restarted, and the three
-choices appear from the live snapshot that comes back.
+button Peer Loop would refuse. `run.resume` on a run with recorded in-flight
+work establishes ownership, detects the ambiguity and returns `interrupted:
+true` — it runs no Reviewer or Builder turn, and the run stays `interrupted`
+until `run.recover`. Observation is restarted afterwards, and the three choices
+appear from the live snapshot that comes back.
+
+**Restarting is one operation, not two.** The route reads the _current_ cursor
+from the registry at action time, never from a render closure. If the safe
+target moved, setting the cursor is the whole restart — mounting the new key
+opens the replacement and unmounting the old one disposes it, and the key just
+left is never refreshed. If the target is unchanged, refreshing that exact atom
+is the restart. Doing both, as the first version did, issued a second attach at
+the cursor it had already abandoned.
+
+**Observation state is keyed by `(environmentId, runId)`.** Run ids are Peer
+Loop's and two machines can hold the same one; keyed by run alone, a change of
+primary environment would attach the second machine's run from the first
+machine's cursor and render the first machine's state, activity and control
+availability — with mutation controls derived from the wrong machine. Route
+teardown forgets the exact pair it mounted, and with no primary environment
+nothing is subscribed and the retry is disabled rather than built from an
+invented id.
 
 **Restarting observation is a refresh, not a cursor write.** The subscription
 atom is keyed by `(environment, run, afterSeq)`, so setting the cursor to the

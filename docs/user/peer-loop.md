@@ -125,9 +125,9 @@ Web, the desktop app and a browser on your phone all use exactly this surface.
   If nothing is currently driving the run — the usual state of a run you come
   back to — the page asks you to **Resume first**. Resolving an interrupted turn
   is a live command, so Peer Loop has to be driving the run before it can accept
-  one. Resuming runs a Reviewer turn and does **not** replay the interrupted
-  Builder task; the three choices appear afterwards, once Peer Loop is in
-  control.
+  one. Resuming reconnects and confirms the interrupted turn; it runs **no**
+  Reviewer or Builder turn by itself, and the run stays interrupted until you
+  choose. The three choices appear afterwards, once Peer Loop is in control.
 
 - **Answer the Reviewer.** When it escalates a decision, the page shows the exact
   question, why it cannot decide, and each option it offered. Sending an option
@@ -171,8 +171,9 @@ setting it.
   Code, on the machine running the agents. Peer Loop says which, and says whether
   the CLI reported a reset time — if it did not, T3 Code will not invent one.
 - **A Builder turn was cut off partway.** The run is paused, not failed, and the
-  repository may already have changed. Resuming runs a Reviewer turn first; the
-  interrupted task is never replayed on its own.
+  repository may already have changed. Resuming reconnects and confirms the
+  interruption without running anything; the interrupted task is never replayed
+  unless you explicitly choose that.
 - **This run could not be read.** A run that no longer exists, a connection that
   dropped, a session that is no longer authorized — you are told which, and
   offered a button that looks again. Looking again only reads: nothing about the

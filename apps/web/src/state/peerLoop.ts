@@ -100,11 +100,24 @@ export const peerLoopRunsAtom = Atom.make((get): PeerLoopListRunsResult => {
  * `run.attach`: asking again would make Peer Loop replay the backlog a second
  * time and serialise behind the replay already running.
  *
- * The cursor comes from the view itself. After an explicit `run-resync` the
- * reducer has already rewound to the last point it can vouch for, and
- * re-subscribing with that cursor is the whole reattachment — there is no
- * arithmetic anywhere that decides a gap happened.
+ * EVERYTHING HERE IS KEYED BY ENVIRONMENT AND RUN, NOT BY RUN ALONE. Run ids
+ * are Peer Loop's, and two machines can hold the same one. Keyed by run only, a
+ * change of primary environment would attach the second machine's run from the
+ * first machine's cursor — skipping durable events it never saw — and would
+ * render the first machine's state, activity and control availability while
+ * doing it. Enabling a mutation from that is the part that actually hurts.
  */
+export interface PeerLoopRunKey {
+  readonly environmentId: EnvironmentIdType;
+  readonly runId: string;
+}
+
+/** Length-prefixed, so no environment/run pair can be spelled two ways. */
+export const peerLoopRunKey = (key: PeerLoopRunKey): string => {
+  const environmentId = String(key.environmentId);
+  return `${environmentId.length}:${environmentId}:${key.runId}`;
+};
+
 export interface PeerLoopRunSubscriptionState {
   /** The cursor the current subscription was opened with. */
   readonly cursor: number;
@@ -114,27 +127,28 @@ export interface PeerLoopRunSubscriptionState {
 const runStates = new Map<string, PeerLoopRunSubscriptionState>();
 
 /**
- * The per-run views currently being watched.
+ * The per-environment, per-run views currently being watched.
  *
  * A plain map, and it is emptied by the route: a session that opened twenty
  * runs must not still be holding twenty bounded activity slices for runs nobody
  * is looking at.
  */
 export const peerLoopRunStore = {
-  read: (runId: string): PeerLoopRunSubscriptionState | undefined => runStates.get(runId),
-  write: (runId: string, state: PeerLoopRunSubscriptionState): void => {
-    runStates.set(runId, state);
+  read: (key: PeerLoopRunKey): PeerLoopRunSubscriptionState | undefined =>
+    runStates.get(peerLoopRunKey(key)),
+  write: (key: PeerLoopRunKey, state: PeerLoopRunSubscriptionState): void => {
+    runStates.set(peerLoopRunKey(key), state);
   },
-  forget: (runId: string): void => {
-    runStates.delete(runId);
+  forget: (key: PeerLoopRunKey): void => {
+    runStates.delete(peerLoopRunKey(key));
   },
   size: (): number => runStates.size,
   clear: (): void => runStates.clear(),
 } as const;
 
-/** Route teardown: a view nobody is watching is dropped. */
-export function forgetPeerLoopRun(runId: string): void {
-  peerLoopRunStore.forget(runId);
+/** Route teardown: the exact environment/run entry it mounted is dropped. */
+export function forgetPeerLoopRun(key: PeerLoopRunKey): void {
+  peerLoopRunStore.forget(key);
 }
 
 export function peerLoopRunStateCount(): number {
@@ -178,23 +192,23 @@ function resolveFoldBase(
 }
 
 /**
- * The cursor this run is subscribed from.
+ * The cursor this environment's run is subscribed from.
  *
- * A separate atom because it is the *input* to the subscription. Note that
- * setting it to the value it already holds is NOT a restart — the subscription
- * atom is keyed by that value, so nothing re-subscribes. Restarting is
- * `useAtomRefresh` on the events atom itself; see `peerLoopRunEventsAtom`.
+ * Setting it to the value it already holds is NOT a restart — the subscription
+ * atom is keyed by that value, so nothing re-subscribes. Setting it to a
+ * *different* value is: mounting the new key opens the replacement stream and
+ * unmounting the old one disposes it. See `restartPeerLoopObservation`.
  */
-export const peerLoopRunCursorAtom = Atom.family((runId: string) =>
-  Atom.make(peerLoopRunStore.read(runId)?.cursor ?? 0).pipe(
-    Atom.withLabel(`web-peer-loop-run-cursor:${runId}`),
+export const peerLoopRunCursorAtom = Atom.family((key: string) =>
+  Atom.make(runStates.get(key)?.cursor ?? 0).pipe(
+    Atom.withLabel(`web-peer-loop-run-cursor:${key}`),
   ),
 );
 
 /**
- * The exact subscription behind one run's view.
+ * The exact subscription behind one environment's run view.
  *
- * Exposed so the route can refresh *this* atom — environment, run and cursor —
+ * Exposed so a restart can refresh *this* atom — environment, run and cursor —
  * which is the repository's supported way to tear the completed stream down and
  * open one replacement.
  */
@@ -221,6 +235,8 @@ export interface PeerLoopRunObservation {
   readonly error: PeerLoopErrorPresentation | null;
   /** True before the subscription has produced anything at all. */
   readonly empty: boolean;
+  /** False when there is no primary environment: nothing may be retried. */
+  readonly observable: boolean;
 }
 
 /** Hoisted: `Schema.is` compiles a checker, and every failed stream runs it. */
@@ -251,6 +267,15 @@ function presentObservationFailure(cause: Cause.Cause<unknown>): PeerLoopErrorPr
     : GENERIC_OBSERVATION_FAILURE;
 }
 
+const DISCONNECTED: PeerLoopRunObservation = {
+  view: emptyPeerLoopRunView(""),
+  cursor: 0,
+  waiting: false,
+  error: NOT_CONNECTED,
+  empty: true,
+  observable: false,
+};
+
 /**
  * Fold one subscription's events into one run's view.
  *
@@ -267,38 +292,42 @@ export function createPeerLoopRunObservationAtoms(deps: {
     afterSeq: number,
   ) => Atom.Atom<AsyncResult.AsyncResult<PeerLoopSubscriptionEvent, unknown>>;
 }) {
+  const cursor = (key: PeerLoopRunKey) => peerLoopRunCursorAtom(peerLoopRunKey(key));
+  const events = (key: PeerLoopRunKey, afterSeq: number) =>
+    deps.eventsAtom(key.environmentId, key.runId, afterSeq);
+
   const observation = Atom.family((runId: string) =>
     Atom.make((get): PeerLoopRunObservation => {
       const environmentId = get(deps.environmentIdAtom);
-      const existing = peerLoopRunStore.read(runId);
+      // No environment: nothing is keyed, nothing is subscribed, and there is
+      // no invented id to refresh. Retry is a no-op the route disables.
       if (environmentId === null) {
-        return {
-          view: existing?.view ?? emptyPeerLoopRunView(runId),
-          cursor: existing?.cursor ?? 0,
-          waiting: false,
-          error: NOT_CONNECTED,
-          empty: existing === undefined,
-        };
+        return { ...DISCONNECTED, view: emptyPeerLoopRunView(runId) };
       }
 
-      const cursor = get(peerLoopRunCursorAtom(runId));
-      const result = get(deps.eventsAtom(environmentId, runId, cursor));
+      const key: PeerLoopRunKey = { environmentId, runId };
+      const existing = peerLoopRunStore.read(key);
+      const at = get(cursor(key));
+      const result = get(events(key, at));
       const event = Option.getOrNull(AsyncResult.value(result));
-      const next = advancePeerLoopRun(runId, existing, cursor, event);
-      peerLoopRunStore.write(runId, next);
+      const next = advancePeerLoopRun(runId, existing, at, event);
+      peerLoopRunStore.write(key, next);
 
       return {
         view: next.view,
-        cursor,
+        cursor: at,
         waiting: result.waiting,
         error: AsyncResult.isFailure(result) ? presentObservationFailure(result.cause) : null,
         empty: next.view.state === null && next.view.activity.length === 0,
+        observable: true,
       };
     }).pipe(Atom.withLabel(`web-peer-loop-run-observation:${runId}`)),
   );
 
   return {
     observation,
+    cursor,
+    events,
     /** The view alone, for callers that do not care why observation stopped. */
     view: Atom.family((runId: string) =>
       Atom.make((get): PeerLoopRunView => get(observation(runId)).view).pipe(
@@ -308,6 +337,8 @@ export function createPeerLoopRunObservationAtoms(deps: {
   } as const;
 }
 
+export type PeerLoopRunObservationAtoms = ReturnType<typeof createPeerLoopRunObservationAtoms>;
+
 const runObservationAtoms = createPeerLoopRunObservationAtoms({
   environmentIdAtom: primaryEnvironmentIdAtom,
   eventsAtom: peerLoopRunEventsAtom,
@@ -315,22 +346,66 @@ const runObservationAtoms = createPeerLoopRunObservationAtoms({
 
 export const peerLoopRunObservationAtom = runObservationAtoms.observation;
 export const peerLoopRunViewAtom = runObservationAtoms.view;
+export const peerLoopObservationAtoms = runObservationAtoms;
 
 /**
  * Rewind this run to the cursor a resync reported, keeping what it can vouch for.
  *
- * Explicit, and only ever called from a user-visible reattachment or after a
- * command whose effect the run's own snapshot has to reflect. It restores
- * *observation*: it starts nothing, resumes nothing and re-sends nothing.
- *
- * Returns the cursor the caller must then refresh the events atom at — setting
- * the cursor atom alone does not restart a subscription when the value has not
- * changed.
+ * Returns the cursor the subscription must run at next. The reducer has already
+ * trimmed the view to that point, so the view is kept as it is.
  */
-export function rewindPeerLoopRun(runId: string): number {
-  const existing = peerLoopRunStore.read(runId);
+export function rewindPeerLoopRun(key: PeerLoopRunKey): number {
+  const existing = peerLoopRunStore.read(key);
   if (existing === undefined) return 0;
   const cursor = peerLoopResumeCursor(existing.view);
-  peerLoopRunStore.write(runId, { cursor, view: existing.view });
+  peerLoopRunStore.write(key, { cursor, view: existing.view });
   return cursor;
+}
+
+/** The registry operations a restart needs. Narrow, so a test can supply them. */
+export interface PeerLoopRestartRegistry {
+  readonly get: <A>(atom: Atom.Atom<A>) => A;
+  readonly set: <R, W>(atom: Atom.Writable<R, W>, value: W) => void;
+  readonly refresh: <A>(atom: Atom.Atom<A>) => void;
+}
+
+export interface PeerLoopRestartOutcome {
+  readonly cursor: number;
+  /** True when the cursor moved, so a *new* subscription key was mounted. */
+  readonly switched: boolean;
+}
+
+/**
+ * Observe this run again, exactly once, at the cursor it can vouch for.
+ *
+ * TWO CASES, AND DOING BOTH IS THE BUG THIS REPLACES. The old code captured the
+ * cursor from a render, then always set it *and* refreshed — so a resync from 0
+ * to 5 refreshed the dead `(run, 0)` subscription while mounting `(run, 5)`,
+ * issuing a second, pointless attach at the old cursor that Peer Loop then had
+ * to serialise or supersede.
+ *
+ *   - the target moved: setting the cursor is the whole restart. Mounting the
+ *     new key opens the replacement and unmounting the old key disposes it. The
+ *     old key is never refreshed;
+ *   - the target is unchanged: the key is the same, so nothing would remount.
+ *     Refreshing that exact atom is what opens the replacement.
+ *
+ * The current cursor is read from the registry at action time, so a stale
+ * render value in a route closure cannot pick the wrong branch.
+ */
+export function restartPeerLoopObservation(
+  registry: PeerLoopRestartRegistry,
+  atoms: PeerLoopRunObservationAtoms,
+  key: PeerLoopRunKey,
+): PeerLoopRestartOutcome {
+  const cursorAtom = atoms.cursor(key);
+  const current = registry.get(cursorAtom);
+  const target = rewindPeerLoopRun(key);
+
+  if (target !== current) {
+    registry.set(cursorAtom, target);
+    return { cursor: target, switched: true };
+  }
+  registry.refresh(atoms.events(key, current));
+  return { cursor: current, switched: false };
 }

@@ -1,15 +1,14 @@
 import type { PeerLoopRecoveryChoice } from "@t3tools/contracts";
-import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
+import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect } from "react";
+import { useCallback, useContext, useEffect, useRef } from "react";
 
 import { PeerLoopDetailView } from "../components/peerLoop/PeerLoopDetailView";
 import {
   forgetPeerLoopRun,
-  peerLoopRunCursorAtom,
-  peerLoopRunEventsAtom,
+  peerLoopObservationAtoms,
   peerLoopRunObservationAtom,
-  rewindPeerLoopRun,
+  restartPeerLoopObservation,
 } from "../state/peerLoop";
 import {
   usePeerLoopOwnerMessage,
@@ -36,19 +35,7 @@ function PeerLoopRunRoute() {
   const { runId } = Route.useParams();
   const environmentId = useAtomValue(primaryEnvironmentIdAtom);
   const observation = useAtomValue(peerLoopRunObservationAtom(runId));
-  const setCursor = useAtomSet(peerLoopRunCursorAtom(runId));
-
-  /**
-   * Restarting the stream at the cursor it is already on.
-   *
-   * `useAtomRefresh` on the exact environment/run/cursor subscription. Setting
-   * the cursor atom to the value it already holds would do nothing at all — the
-   * subscription atom is keyed by that value — so a resync at an unchanged safe
-   * cursor would silently never reattach.
-   */
-  const refreshStream = useAtomRefresh(
-    peerLoopRunEventsAtom(environmentId ?? ("" as never), runId, observation.cursor),
-  );
+  const registry = useContext(RegistryContext);
 
   const ownerMessage = usePeerLoopOwnerMessage();
   const pause = usePeerLoopPause();
@@ -56,22 +43,42 @@ function PeerLoopRunRoute() {
   const recover = usePeerLoopRecover();
   const refreshRuns = useRefreshPeerLoopRuns();
 
-  // The view is dropped when nothing is watching this run, so a session that
-  // opened twenty runs is not still holding twenty bounded activity slices.
-  useEffect(() => () => forgetPeerLoopRun(runId), [runId]);
+  /**
+   * Stop observing the exact environment/run this route mounted.
+   *
+   * Held in a ref so teardown drops the pair it actually had, even if the
+   * primary environment changed while the route was open: forgetting the new
+   * one would leave the old machine's view retained.
+   */
+  const mounted = useRef<{ environmentId: typeof environmentId; runId: string } | null>(null);
+  if (environmentId !== null) mounted.current = { environmentId, runId };
+  useEffect(
+    () => () => {
+      const key = mounted.current;
+      if (key !== null && key.environmentId !== null) {
+        forgetPeerLoopRun({ environmentId: key.environmentId, runId: key.runId });
+      }
+    },
+    [runId],
+  );
 
   /**
    * Observe again from the cursor this view can vouch for.
    *
-   * The rewind keeps the trimmed view — its `needsResync`, its snapshot and the
-   * activity at or below the safe cursor — and the refresh is what actually
-   * opens a replacement stream.
+   * The current cursor is read from the registry inside the callback, not
+   * captured from a render, so a resync that moved the safe cursor cannot
+   * refresh the subscription it just left behind.
    */
   const restartObservation = useCallback(() => {
-    const cursor = rewindPeerLoopRun(runId);
-    setCursor(cursor);
-    refreshStream();
-  }, [refreshStream, runId, setCursor]);
+    if (environmentId === null) return;
+    restartPeerLoopObservation(registry, peerLoopObservationAtoms, { environmentId, runId });
+  }, [environmentId, registry, runId]);
+
+  /** Re-read the run and the list after a command. Observation only. */
+  const reconcile = useCallback(() => {
+    restartObservation();
+    refreshRuns();
+  }, [refreshRuns, restartObservation]);
 
   const sendOwnerMessage = useCallback(
     (text: string) => {
@@ -80,21 +87,19 @@ function PeerLoopRunRoute() {
         // Observation only: the queued-message count and the run's own snapshot
         // both live in Peer Loop, and this is how they are re-read.
         if (result === null) return;
-        restartObservation();
-        refreshRuns();
+        reconcile();
       });
     },
-    [environmentId, ownerMessage, refreshRuns, restartObservation, runId],
+    [environmentId, ownerMessage, reconcile, runId],
   );
 
   const doPause = useCallback(() => {
     if (environmentId === null) return;
     void pause.invoke({ environmentId, input: { runId } }).then((result) => {
       if (result === null) return;
-      restartObservation();
-      refreshRuns();
+      reconcile();
     });
-  }, [environmentId, pause, refreshRuns, restartObservation, runId]);
+  }, [environmentId, pause, reconcile, runId]);
 
   const doResume = useCallback(() => {
     if (environmentId === null) return;
@@ -103,21 +108,19 @@ function PeerLoopRunRoute() {
       // whether recovery is now possible. Re-reading is the only way to find
       // out; nothing is inferred from the resume result alone.
       if (result === null) return;
-      restartObservation();
-      refreshRuns();
+      reconcile();
     });
-  }, [environmentId, refreshRuns, restartObservation, resume, runId]);
+  }, [environmentId, reconcile, resume, runId]);
 
   const doRecover = useCallback(
     (choice: PeerLoopRecoveryChoice) => {
       if (environmentId === null) return;
       void recover.invoke({ environmentId, input: { runId, choice } }).then((result) => {
         if (result === null) return;
-        restartObservation();
-        refreshRuns();
+        reconcile();
       });
     },
-    [environmentId, recover, refreshRuns, restartObservation, runId],
+    [environmentId, recover, reconcile, runId],
   );
 
   return (
@@ -138,11 +141,15 @@ function PeerLoopRunRoute() {
         resume: doResume,
         recover: doRecover,
         reattach: restartObservation,
-        retryObservation: restartObservation,
+        // Disabled when there is no environment: there is nothing to retry and
+        // certainly no invented id to subscribe with.
+        retryObservation: observation.observable ? restartObservation : NO_RETRY,
       }}
     />
   );
 }
+
+const NO_RETRY = (): void => undefined;
 
 export const Route = createFileRoute("/peer-loop/$runId")({
   component: PeerLoopRunRoute,
