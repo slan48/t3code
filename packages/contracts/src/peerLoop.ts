@@ -377,7 +377,14 @@ export type PeerLoopEventPayload = typeof PeerLoopEventPayload.Type;
 export const PeerLoopEvent = Schema.StructWithRest(
   Schema.Struct({
     runId: TrimmedNonEmptyString,
-    /** Per-run, strictly increasing, contiguous. The cursor for every replay. */
+    /**
+     * Per-run and strictly increasing, but NOT contiguous. The cursor for
+     * every replay.
+     *
+     * Peer Loop numbers an event before it records it, so a number can be
+     * spent and never appear. A skip is ordinary data; nothing may infer loss
+     * from one.
+     */
     seq: PositiveInt,
     ts: IsoDateTime,
     type: TrimmedNonEmptyString,

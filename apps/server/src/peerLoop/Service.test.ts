@@ -611,6 +611,64 @@ it.layer(Layer.provideMerge(testConfig, NodeServices.layer), { excludeTestServic
       }),
     );
 
+    it.effect("ends stopped, not starting, when shutdown races the attempt's first step", () =>
+      Effect.gen(function* () {
+        // An attempt that has entered but not yet announced itself. If shutdown
+        // wins here the lifecycle is terminal while nothing has published a
+        // terminal status, so a client would be left looking at `starting` — or
+        // at `unavailable` — on a server that is already gone.
+        yield* useFakeBridge("ready");
+        const arrived = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const real = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const spawner = makeCountingSpawner(real);
+
+        const scope = yield* Scope.make();
+        const service = yield* make({
+          ...TEST_SEAMS,
+          testSeams: {
+            beforeStartConnection: Deferred.succeed(arrived, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+            ),
+          },
+        }).pipe(Effect.provide(spawner.layer), Scope.provide(scope));
+
+        const waiters = yield* Effect.forkChild(
+          Effect.all(
+            [
+              Effect.exit(Effect.asVoid(service.listRuns({}))),
+              Effect.exit(Effect.asVoid(service.attachRun({ runId: "run-1" }))),
+            ],
+            { concurrency: "unbounded" },
+          ),
+        );
+        yield* Deferred.await(arrived);
+
+        // Started at once, so the layer is genuinely tearing down while the
+        // attempt sits in that window rather than after it has left.
+        const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void), {
+          startImmediately: true,
+        });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.await(closing);
+
+        const outcomes = yield* Effect.flatten(Fiber.await(waiters));
+        assert.isTrue(outcomes.every((outcome) => Exit.isFailure(outcome)));
+
+        const status = yield* service.status({});
+        assert.strictEqual(status.transport.state, "stopped");
+        assert.strictEqual(status.transport.protocolVersion, null);
+        assert.strictEqual(status.health, null);
+
+        // Refused before anything was spawned, and refused again afterwards.
+        assert.strictEqual(spawner.attempts(), 0);
+        assert.deepStrictEqual(spawner.pids(), []);
+        const error = yield* Effect.flip(Effect.asVoid(service.listRuns({})));
+        assert.strictEqual(error._tag, "PeerLoopUnavailableError");
+        assert.strictEqual(spawner.attempts(), 0);
+      }),
+    );
+
     it.effect("leaves nothing behind when shutdown races the adoption", () =>
       Effect.gen(function* () {
         // The handshake is finished and the connection is about to be

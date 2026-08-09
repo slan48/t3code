@@ -288,13 +288,15 @@ export interface PeerLoopServiceSeams {
   /**
    * Test-only injection points. Nothing in the product supplies these.
    *
-   * Both sit in windows that are otherwise a matter of scheduler luck:
+   * All three sit in windows that are otherwise a matter of scheduler luck:
    * `beforeForkAttempt` between installing a connection claim and forking the
-   * runner that has to complete it, and `beforeAdoptConnection` between a
-   * finished handshake and the adoption that publishes it.
+   * runner that has to complete it, `beforeStartConnection` between entering an
+   * attempt and announcing it, and `beforeAdoptConnection` between a finished
+   * handshake and the adoption that publishes it.
    */
   readonly testSeams?: {
     readonly beforeForkAttempt?: Effect.Effect<void>;
+    readonly beforeStartConnection?: Effect.Effect<void>;
     readonly beforeAdoptConnection?: Effect.Effect<void>;
   };
 }
@@ -370,6 +372,47 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
   });
 
   /**
+   * Provisional scopes: children that exist but are not adopted yet.
+   *
+   * Registered under the gate so shutdown either refuses the attempt outright
+   * or inherits the scope it already started. Without this the finalizer could
+   * only see an *adopted* connection, and a child spawned a moment earlier
+   * would outlive the layer with nothing holding a handle to it.
+   */
+  const provisional = new Set<Scope.Closeable>();
+
+  /**
+   * Start one attempt: take ownership of its scope and say it is starting.
+   *
+   * ONE GATED TRANSITION, AND IT IS THE ONLY WAY IN. A bare `setTransport`
+   * here could publish `starting` after shutdown had already finished, leaving
+   * a terminal lifecycle describing a bridge that is coming up. Refusing under
+   * the same gate is also what stops a late attempt spawning at all.
+   */
+  const beginAttempt = (scope: Scope.Closeable) =>
+    lifecycleGate.withPermits(1)(
+      Effect.gen(function* () {
+        const state = yield* Ref.get(lifecycle);
+        if (state.kind === "stopped") return false;
+        provisional.add(scope);
+        yield* setTransport("starting", null, null);
+        return true;
+      }).pipe(Effect.uninterruptible),
+    );
+
+  /** Report why an attempt could not produce a bridge. Silent after shutdown. */
+  const publishAttemptFailure = (detail: string) =>
+    lifecycleGate
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const state = yield* Ref.get(lifecycle);
+          if (state.kind === "stopped") return;
+          yield* setTransport("unavailable", detail, null);
+        }).pipe(Effect.uninterruptible),
+      )
+      .pipe(Effect.asVoid);
+
+  /**
    * Publish a finished handshake as the live connection. One transition.
    *
    * Refuses, rather than adopting, once the layer has stopped: there would be
@@ -382,6 +425,8 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
       Effect.gen(function* () {
         const state = yield* Ref.get(lifecycle);
         if (state.kind === "stopped") return false;
+        // The lifecycle owns this scope from here; it is no longer provisional.
+        provisional.delete(entry.scope);
         yield* Ref.set(lifecycle, { kind: "live", entry, health: announced });
         yield* setTransport("connected", null, announced.protocolVersion);
         return true;
@@ -437,23 +482,35 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
    * here. `onExit` covers the interruption case, which is the one a `tapError`
    * silently misses.
    */
+  const SHUTTING_DOWN = "this server is shutting down";
+
   const openConnection = Effect.gen(function* () {
+    if (testSeams.beforeStartConnection !== undefined) {
+      yield* testSeams.beforeStartConnection;
+    }
+
     // After shutdown there is no scope left to own a child, so a late call
     // must refuse rather than leave an orphan bridge holding project leases.
     if (yield* isStopped) {
-      return yield* new PeerLoopUnavailableError({
-        reason: "this server is shutting down",
-      });
+      return yield* new PeerLoopUnavailableError({ reason: SHUTTING_DOWN });
     }
 
     if (resolution.kind === "invalid") {
-      yield* setTransport("unavailable", resolution.reason, null);
+      yield* publishAttemptFailure(resolution.reason);
       return yield* new PeerLoopUnavailableError({ reason: resolution.reason });
     }
 
-    yield* setTransport("starting", null, null);
-
     const scope = yield* Scope.make();
+
+    // The gate decides, and it decides before anything is spawned: either this
+    // attempt owns a registered scope and has said `starting`, or the layer has
+    // stopped and there is no child to leak.
+    const started = yield* beginAttempt(scope);
+    if (!started) {
+      yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
+      return yield* new PeerLoopUnavailableError({ reason: SHUTTING_DOWN });
+    }
+
     // The machine-local stop bound, when the operator set one. A test seam
     // still wins, so a bounded wait can be measured in milliseconds.
     const stopTimeout =
@@ -479,7 +536,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
       }).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Scope.provide(scope),
-        Effect.tapError((error) => setTransport("unavailable", error.message, null)),
+        Effect.tapError((error) => publishAttemptFailure(error.message)),
       );
 
       if (testSeams.beforeAdoptConnection !== undefined) {
@@ -498,7 +555,7 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
 
       // The layer stopped first. Nothing will release this child but us.
       if (!accepted) {
-        return yield* new PeerLoopUnavailableError({ reason: "this server is shutting down" });
+        return yield* new PeerLoopUnavailableError({ reason: SHUTTING_DOWN });
       }
 
       // One watcher per connection, on the service scope so it cannot outlive
@@ -518,9 +575,15 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
 
     return yield* adoptable.pipe(
       Effect.onExit((exit) =>
-        Exit.isSuccess(exit) || adopted
-          ? Effect.void
-          : Scope.close(scope, Exit.void).pipe(Effect.ignore),
+        Effect.sync(() => {
+          provisional.delete(scope);
+        }).pipe(
+          Effect.andThen(
+            Exit.isSuccess(exit) || adopted
+              ? Effect.void
+              : Scope.close(scope, Exit.void).pipe(Effect.ignore),
+          ),
+        ),
       ),
     );
   });
@@ -1211,9 +1274,25 @@ export const make = Effect.fn("peerLoop.Service.make")(function* (
         Effect.gen(function* () {
           const current = yield* Ref.get(lifecycle);
           yield* Ref.set(lifecycle, { kind: "stopped" });
-          if (current.kind !== "live") return;
+          // UNCONDITIONALLY. An attempt that had reached `starting`, or a
+          // resolution that had reported `unavailable`, would otherwise leave a
+          // terminal lifecycle wearing a transitional status — a client told
+          // the bridge was coming up on a server that had already gone.
           yield* setTransport("stopped", null, null);
-          yield* Scope.close(current.entry.scope, Exit.void).pipe(Effect.ignore);
+
+          // Children spawned but never adopted. Whichever of these ran first,
+          // this is the last chance to own them.
+          const pending = [...provisional];
+          provisional.clear();
+          yield* Effect.forEach(
+            pending,
+            (scope) => Scope.close(scope, Exit.void).pipe(Effect.ignore),
+            { discard: true },
+          );
+
+          if (current.kind === "live") {
+            yield* Scope.close(current.entry.scope, Exit.void).pipe(Effect.ignore);
+          }
         }).pipe(Effect.uninterruptible),
       )
       .pipe(Effect.ignore),
