@@ -18,6 +18,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { resolveEffectiveProject } from "./components/peerLoop/PeerLoopStartRun";
 import {
+  describeCompletion,
   describeControls,
   describeDetail,
   describeError,
@@ -34,8 +35,10 @@ import {
   pauseTakesEffectLater,
   projectLabel,
   validateStartRun,
+  PEER_LOOP_COMPLETION_SUMMARY_CHARS,
   PEER_LOOP_EVENT_DETAIL_CHARS,
   PEER_LOOP_EVIDENCE_CHARS,
+  PEER_LOOP_FINAL_STATE_CHARS,
   PEER_LOOP_OWNER_OPTION_LIMIT,
   PEER_LOOP_OWNER_TEXT_CHARS,
 } from "./peerLoopPresentation";
@@ -47,6 +50,25 @@ const adapters = {
   builderVersion: null,
 } as const;
 
+/**
+ * The lease Peer Loop reports for a run something is actually driving.
+ *
+ * A working *state* and a working *run* are not the same fact, and the fixtures
+ * below keep them apart deliberately: a run state file says the Builder was
+ * working when it was last written, and only this says anybody still is.
+ */
+const liveWriter = (isThisProcess = true): PeerLoopRunSummary["liveWriter"] =>
+  ({
+    pid: 4242,
+    host: "this-mac",
+    command: "start",
+    runId: "run-1",
+    acquiredAt: "2026-08-09T00:00:00.000Z",
+    renewedAt: "2026-08-09T00:05:00.000Z",
+    isThisProcess,
+  }) as NonNullable<PeerLoopRunSummary["liveWriter"]>;
+
+/** A genuinely live working run: Peer Loop's state says working, and so does its lease. */
 const summary = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummary =>
   ({
     runId: "run-1",
@@ -61,10 +83,14 @@ const summary = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummar
     lastSequence: 5,
     awaitingOwnerObjective: false,
     adapters,
-    liveWriter: null,
-    liveInThisBridge: false,
+    liveWriter: liveWriter(),
+    liveInThisBridge: true,
     ...overrides,
   }) as PeerLoopRunSummary;
+
+/** The same run after whatever was driving it went away. Nothing else differs. */
+const driverless = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummary =>
+  summary({ liveWriter: null, liveInThisBridge: false, ...overrides });
 
 const runState = (overrides: Partial<PeerLoopRunStateFile> = {}): PeerLoopRunStateFile =>
   ({
@@ -103,6 +129,19 @@ const event = (kind: string, payload: Record<string, unknown> = {}): PeerLoopEve
     payload: { kind, ...payload },
   }) as PeerLoopEvent;
 
+/**
+ * The lease that comes with each control snapshot.
+ *
+ * Peer Loop reports one whenever a process holds the project — this bridge or
+ * another — and reports none once nothing does. Deriving it from the reason
+ * here keeps every fixture a snapshot the bridge could actually send.
+ */
+const writerFor = (reason: string): PeerLoopRunSummary["liveWriter"] => {
+  if (reason === "live_in_this_bridge") return liveWriter(true);
+  if (reason === "held_by_other_process") return liveWriter(false);
+  return null;
+};
+
 const viewWith = (
   state: PeerLoopRunStateFile,
   control: {
@@ -110,8 +149,10 @@ const viewWith = (
     readonly resumable: boolean;
     readonly reason?: string;
   } = { available: true, resumable: false },
-): PeerLoopRunView =>
-  applyPeerLoopSubscriptionEvent(emptyPeerLoopRunView("run-1"), {
+): PeerLoopRunView => {
+  const reason =
+    control.reason ?? (control.available ? "live_in_this_bridge" : "held_by_other_process");
+  return applyPeerLoopSubscriptionEvent(emptyPeerLoopRunView("run-1"), {
     kind: "run-attached",
     runId: "run-1",
     snapshot: {
@@ -119,9 +160,8 @@ const viewWith = (
       state,
       control: {
         available: control.available,
-        reason: (control.reason ??
-          (control.available ? "live_in_this_bridge" : "held_by_other_process")) as never,
-        liveWriter: null,
+        reason: reason as never,
+        liveWriter: writerFor(reason),
         resumable: control.resumable,
       },
       eventHighWaterMark: 5,
@@ -129,6 +169,7 @@ const viewWith = (
       live: true,
     },
   });
+};
 
 describe("Peer Loop transport presentation", () => {
   it("says a machine has no Peer Loop rather than calling it a failure", () => {
@@ -212,6 +253,64 @@ describe("Peer Loop attention", () => {
     expect(presented.tone).toBe("danger");
   });
 
+  it("calls a working state with no live writer interrupted, not working", () => {
+    // The state file was written mid-turn and never updated again, because
+    // whatever was writing it went away. Peer Loop reports that as no live
+    // writer, and a "Working" badge on it would be a lie that hides a run
+    // nothing will ever move.
+    for (const state of ["builder_working", "reviewer_working"] as const) {
+      const presented = describeRunAttention(driverless({ state }));
+      expect(presented.key).toBe("driver-missing");
+      expect(presented.actionable).toBe(true);
+      expect(presented.label).toContain("Interrupted");
+      expect(presented.label).toContain("no Reviewer or Builder running");
+    }
+  });
+
+  it("leaves a working run with a live writer working", () => {
+    for (const state of ["builder_working", "reviewer_working"] as const) {
+      const presented = describeRunAttention(summary({ state }));
+      expect(presented.key).toBe("running");
+      expect(presented.actionable).toBe(false);
+    }
+  });
+
+  it("does not call a run another process is driving interrupted", () => {
+    // Not ours to command is not the same as not running. Peer Loop allows one
+    // live writer per repository, and someone else holding it means the run is
+    // moving — just not from here.
+    const presented = describeRunAttention(
+      summary({ state: "builder_working", liveWriter: liveWriter(false), liveInThisBridge: false }),
+    );
+    expect(presented.key).toBe("running");
+    expect(presented.actionable).toBe(false);
+  });
+
+  it("reads the driver off the control snapshot on an attached run, not off the clock", () => {
+    const stale = describeViewAttention(viewWith(runState({ state: "builder_working" }), STOPPED));
+    expect(stale.key).toBe("driver-missing");
+    expect(stale.actionable).toBe(true);
+
+    // Live here, and live elsewhere, are both live.
+    expect(describeViewAttention(viewWith(runState({ state: "builder_working" }), LIVE)).key).toBe(
+      "running",
+    );
+    expect(describeViewAttention(viewWith(runState({ state: "builder_working" }), HELD)).key).toBe(
+      "running",
+    );
+  });
+
+  it("does not guess at a driver it has no snapshot of", () => {
+    // No control snapshot yet. Silence is not evidence that nothing is running,
+    // so the run keeps reading as working until Peer Loop says otherwise.
+    const noControl: PeerLoopRunView = {
+      ...emptyPeerLoopRunView("run-1"),
+      state: runState({ state: "builder_working" }),
+    };
+    expect(noControl.control).toBe(null);
+    expect(describeViewAttention(noControl).key).toBe("running");
+  });
+
   it("does not ask for attention while an agent is working or the run is paused", () => {
     expect(describeRunAttention(summary({ state: "builder_working" })).actionable).toBe(false);
     expect(
@@ -268,6 +367,19 @@ describe("Peer Loop run grouping", () => {
       summary({ runId: "newer", updatedAt: "2026-08-09T00:09:00.000Z" }),
     ]);
     expect(groups.active.map((run) => run.runId)).toEqual(["newer", "older"]);
+  });
+
+  it("puts a working run with no live writer under what needs you", () => {
+    const groups = groupRuns([
+      summary({ runId: "live", state: "builder_working" }),
+      driverless({ runId: "stale-builder", state: "builder_working" }),
+      driverless({ runId: "stale-reviewer", state: "reviewer_working" }),
+    ]);
+    expect(groups.attention.map((run) => run.runId).sort()).toEqual([
+      "stale-builder",
+      "stale-reviewer",
+    ]);
+    expect(groups.active.map((run) => run.runId)).toEqual(["live"]);
   });
 
   it("counts a paused run as active, not as attention", () => {
@@ -572,6 +684,84 @@ describe("Peer Loop owner-facing structure", () => {
 
     // Never derived from the state alone.
     expect(describeFinalState(viewWith(runState({ state: "done" }), LIVE))).toBe(null);
+  });
+
+  it("summarises a finished run from the outcome, preferring it over the decision", () => {
+    const bothPresent = applyPeerLoopSubscriptionEvent(
+      viewWith(
+        runState({
+          state: "done",
+          lastReviewerDecision: {
+            decision: "DONE",
+            summary: "The durable one.",
+            finalState: "durable final state",
+          },
+        } as never),
+        LIVE,
+      ),
+      {
+        kind: "run-finished",
+        runId: "run-1",
+        outcome: { kind: "done", finalState: "live final state", summary: "The live one." },
+        state: null,
+        reason: "terminal",
+      },
+    );
+    expect(describeCompletion(bothPresent)).toEqual({
+      summary: "The live one.",
+      finalState: "live final state",
+    });
+
+    // Without an outcome, the durable DONE decision is the record.
+    expect(
+      describeCompletion(
+        viewWith(
+          runState({
+            state: "done",
+            lastReviewerDecision: {
+              decision: "DONE",
+              summary: "Objective met.",
+              finalState: "documented and merged",
+            },
+          } as never),
+          STOPPED_FINAL,
+        ),
+      ),
+    ).toEqual({ summary: "Objective met.", finalState: "documented and merged" });
+  });
+
+  it("has no completion to show for a run that has not finished, or only says it did", () => {
+    expect(describeCompletion(viewWith(runState({ state: "builder_working" }), LIVE))).toBe(null);
+    // "done" is that it finished, not how. Nothing is invented to fill the gap.
+    expect(describeCompletion(viewWith(runState({ state: "done" }), LIVE))).toBe(null);
+    // A CONTINUE decision is not a completion, whatever it says.
+    expect(
+      describeCompletion(
+        viewWith(
+          runState({
+            lastReviewerDecision: {
+              decision: "CONTINUE",
+              summary: "Keep going.",
+              builderTask: "Write NOTES.md.",
+            },
+          } as never),
+          LIVE,
+        ),
+      ),
+    ).toBe(null);
+  });
+
+  it("bounds a long completion summary", () => {
+    const view = applyPeerLoopSubscriptionEvent(viewWith(runState({ state: "done" }), LIVE), {
+      kind: "run-finished",
+      runId: "run-1",
+      outcome: { kind: "done", finalState: "f".repeat(2_000), summary: "s".repeat(9_000) },
+      state: null,
+      reason: "terminal",
+    });
+    const completion = describeCompletion(view);
+    expect(completion?.summary?.length).toBeLessThanOrEqual(PEER_LOOP_COMPLETION_SUMMARY_CHARS);
+    expect(completion?.finalState?.length).toBeLessThanOrEqual(PEER_LOOP_FINAL_STATE_CHARS);
   });
 });
 

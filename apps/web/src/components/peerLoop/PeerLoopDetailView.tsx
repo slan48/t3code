@@ -6,15 +6,16 @@ import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
 import { formatRelative } from "~/agentRunFormat";
 import {
+  describeCompletion,
   describeControls,
   describeDetail,
   describeEvent,
   describeFailureEvidence,
-  describeFinalState,
   describeOwnerDecision,
   describeViewAttention,
   pauseTakesEffectLater,
   projectLabel,
+  PEER_LOOP_NO_DRIVER_NOTE,
   RECOVERY_CHOICES,
   type PeerLoopErrorPresentation,
 } from "~/peerLoopPresentation";
@@ -82,7 +83,7 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
   const controls = describeControls(view);
   const ownerDecision = describeOwnerDecision(view);
   const failure = describeFailureEvidence(view);
-  const finalState = describeFinalState(view);
+  const completion = describeCompletion(view);
   const nowMs = Date.now();
 
   // A subscription that failed must not render as a run with nothing in it: a
@@ -131,6 +132,15 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         {attention.detail === null ? null : (
           <p className="text-sm break-words text-foreground">{attention.detail}</p>
         )}
+        {/*
+          Peer Loop's state file still says a turn is in progress and Peer Loop
+          says nothing is driving it. That is a fact it reported, not a guess
+          from how long ago the last event was — and it is said here rather than
+          acted on: nothing below resumes or recovers on its own.
+        */}
+        {attention.key === "driver-missing" ? (
+          <p className="text-sm break-words text-warning">{PEER_LOOP_NO_DRIVER_NOTE}</p>
+        ) : null}
       </header>
 
       {view.needsResync ? (
@@ -148,39 +158,27 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         </div>
       ) : null}
 
-      <PeerLoopSection title="State">
-        <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
-          <Fact label="Run state" value={detail.state} />
-          <Fact
-            label="Iteration"
-            value={detail.iteration === null ? null : String(detail.iteration)}
-          />
-          <Fact label="Reviewer" value={detail.reviewer} />
-          <Fact label="Builder" value={detail.builder} />
-          <Fact
-            label="Turn in flight"
-            value={detail.inFlightActor === null ? "none" : detail.inFlightActor}
-          />
-          <Fact label="Queued messages" value={String(detail.queuedOwnerMessages)} />
-        </dl>
-        {controls.unavailableReason === null ? null : (
-          <p className="text-xs text-warning">{controls.unavailableReason}</p>
-        )}
-        {detail.currentTask === null ? null : (
-          <div className="flex min-w-0 flex-col gap-0.5">
-            <span className="text-xs font-medium text-muted-foreground">Current Builder task</span>
-            <p className="text-sm break-words text-foreground">{detail.currentTask}</p>
+      {/*
+        A finished run leads with how it finished. Both lines are Peer Loop's
+        own structured DONE — the live outcome when there is one, the durable
+        Reviewer decision otherwise — and neither is read out of a Builder
+        report or the activity below.
+      */}
+      {completion === null ? null : (
+        <PeerLoopSection title="How it finished">
+          <div className="flex min-w-0 flex-col gap-1.5 rounded-md border border-success/40 px-3 py-2">
+            {completion.summary === null ? null : (
+              <p className="text-sm break-words text-foreground">{completion.summary}</p>
+            )}
+            {completion.finalState === null ? null : (
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span className="text-xs font-medium text-muted-foreground">Final state</span>
+                <p className="text-sm break-words text-foreground">{completion.finalState}</p>
+              </div>
+            )}
           </div>
-        )}
-        {detail.lastDecision === null ? null : (
-          <div className="flex min-w-0 flex-col gap-0.5">
-            <span className="text-xs font-medium text-muted-foreground">
-              Last Reviewer decision
-            </span>
-            <p className="text-sm break-words text-foreground">{detail.lastDecision}</p>
-          </div>
-        )}
-      </PeerLoopSection>
+        </PeerLoopSection>
+      )}
 
       {ownerDecision === null ? null : (
         <PeerLoopSection title="The Reviewer needs a decision">
@@ -240,13 +238,15 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         </PeerLoopSection>
       )}
 
-      {finalState === null ? null : (
-        <PeerLoopSection title="How it finished">
-          <p className="text-sm break-words text-foreground">{finalState}</p>
-        </PeerLoopSection>
-      )}
-
       <PeerLoopSection title="Controls">
+        {/*
+          Why the live controls are off, next to the controls themselves rather
+          than filed under the state facts — it is the answer to "why is Send
+          greyed out", which is a question about this section.
+        */}
+        {controls.unavailableReason === null ? null : (
+          <p className="text-xs text-warning">{controls.unavailableReason}</p>
+        )}
         <OwnerMessageForm
           disabled={!controls.canSendOwnerMessage}
           state={ownerMessage}
@@ -309,35 +309,91 @@ export const PeerLoopDetailView = memo(function PeerLoopDetailView({
         ) : null}
       </PeerLoopSection>
 
-      <PeerLoopSection title="Activity" count={view.activity.length}>
-        {view.activity.length === 0 ? (
-          <p className="text-sm text-muted-foreground">Nothing recorded for this run yet.</p>
-        ) : (
-          <ol className="flex min-w-0 flex-col gap-2">
-            {view.activity.map((entry) => {
-              const presented = describeEvent(entry);
-              const when = formatRelative(entry.ts, nowMs);
-              return (
-                <li
-                  key={entry.seq}
-                  className="flex min-w-0 flex-col gap-0.5 rounded-md border px-3 py-2"
-                >
-                  <div className="flex min-w-0 flex-wrap items-baseline gap-2">
-                    <span className="text-sm font-medium text-foreground">{presented.title}</span>
-                    <span className="text-[0.6875rem] text-muted-foreground">#{entry.seq}</span>
-                    {when === null ? null : (
-                      <span className="text-[0.6875rem] text-muted-foreground">{when}</span>
-                    )}
-                  </div>
-                  {presented.detail === null ? null : (
-                    <p className="text-xs break-words text-muted-foreground">{presented.detail}</p>
-                  )}
-                </li>
-              );
-            })}
-          </ol>
-        )}
-      </PeerLoopSection>
+      {/*
+        Everything Peer Loop recorded, kept and not deleted, but folded away.
+        A native <details> rather than a widget: it is keyboard-reachable and
+        expandable with no JavaScript, no dependency and no animation, and a
+        phone that has to scroll past a full Builder prompt to reach the button
+        that unblocks the run is the thing this fixes. Nothing that needs the
+        owner lives in here — the question, the failure evidence, the resync
+        notice, the outcome and every control stay above it.
+      */}
+      <details className="min-w-0 rounded-md border px-3 py-2">
+        <summary className="cursor-pointer text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+          Execution details
+          <span className="ms-1.5 font-normal normal-case">
+            run state, Builder task, activity ({view.activity.length})
+          </span>
+        </summary>
+        <div className="mt-3 flex min-w-0 flex-col gap-6">
+          <PeerLoopSection title="State">
+            <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
+              <Fact label="Run state" value={detail.state} />
+              <Fact
+                label="Iteration"
+                value={detail.iteration === null ? null : String(detail.iteration)}
+              />
+              <Fact label="Reviewer" value={detail.reviewer} />
+              <Fact label="Builder" value={detail.builder} />
+              <Fact
+                label="Turn in flight"
+                value={detail.inFlightActor === null ? "none" : detail.inFlightActor}
+              />
+              <Fact label="Queued messages" value={String(detail.queuedOwnerMessages)} />
+            </dl>
+            {detail.currentTask === null ? null : (
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Current Builder task
+                </span>
+                <p className="text-sm break-words text-foreground">{detail.currentTask}</p>
+              </div>
+            )}
+            {detail.lastDecision === null ? null : (
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Last Reviewer decision
+                </span>
+                <p className="text-sm break-words text-foreground">{detail.lastDecision}</p>
+              </div>
+            )}
+          </PeerLoopSection>
+
+          <PeerLoopSection title="Activity" count={view.activity.length}>
+            {view.activity.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Nothing recorded for this run yet.</p>
+            ) : (
+              <ol className="flex min-w-0 flex-col gap-2">
+                {view.activity.map((entry) => {
+                  const presented = describeEvent(entry);
+                  const when = formatRelative(entry.ts, nowMs);
+                  return (
+                    <li
+                      key={entry.seq}
+                      className="flex min-w-0 flex-col gap-0.5 rounded-md border px-3 py-2"
+                    >
+                      <div className="flex min-w-0 flex-wrap items-baseline gap-2">
+                        <span className="text-sm font-medium text-foreground">
+                          {presented.title}
+                        </span>
+                        <span className="text-[0.6875rem] text-muted-foreground">#{entry.seq}</span>
+                        {when === null ? null : (
+                          <span className="text-[0.6875rem] text-muted-foreground">{when}</span>
+                        )}
+                      </div>
+                      {presented.detail === null ? null : (
+                        <p className="text-xs break-words text-muted-foreground">
+                          {presented.detail}
+                        </p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+          </PeerLoopSection>
+        </div>
+      </details>
     </div>
   );
 });

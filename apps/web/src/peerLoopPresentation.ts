@@ -13,6 +13,7 @@
  * @module PeerLoopPresentation
  */
 import {
+  type PeerLoopControlAvailability,
   type PeerLoopError,
   type PeerLoopEvent,
   type PeerLoopHaltKind,
@@ -81,6 +82,7 @@ export function describeTransport(
 export type PeerLoopAttentionKey =
   | "none"
   | "running"
+  | "driver-missing"
   | "owner-decision"
   | "needs-objective"
   | "capacity-exhausted"
@@ -108,6 +110,10 @@ const ATTENTION: Readonly<
 > = {
   none: { label: "Idle", tone: "neutral" },
   running: { label: "Working", tone: "info" },
+  "driver-missing": {
+    label: "Interrupted — no Reviewer or Builder running",
+    tone: "warning",
+  },
   "owner-decision": { label: "The Reviewer needs your decision", tone: "warning" },
   "needs-objective": { label: "Needs an objective", tone: "warning" },
   "capacity-exhausted": { label: "Agent capacity exhausted", tone: "warning" },
@@ -156,18 +162,37 @@ const present = (
 });
 
 /**
+ * T3 Code's own words for a working state nobody is driving.
+ *
+ * Not Peer Loop's message — Peer Loop reported a fact (no live writer) rather
+ * than a sentence — so it is kept out of `detail`, which stays reserved for
+ * what Peer Loop actually said.
+ */
+export const PEER_LOOP_NO_DRIVER_NOTE =
+  "Peer Loop's record still says a turn is in progress, but no Reviewer or Builder is running it. " +
+  "The run stopped part-way rather than finishing. Nothing is resumed for you.";
+
+/**
  * Read a run's condition off Peer Loop's structured state.
  *
  * `done` wins over a halt reason, because a finished run's last halt is
  * history. `interrupted` outranks the rest because it is the one state where
  * the repository may already have changed and only the owner can say what
  * happens next.
+ *
+ * `hasActiveDriver` is the one fact a working state cannot supply on its own. A
+ * run state file says the Builder was working when it was last written; it does
+ * not say anybody still is. When Peer Loop reports no live writer, the run is
+ * stale rather than busy, and it needs a person. It defaults to true because
+ * "no driver" has to be Peer Loop's answer, never this file's guess: an unknown
+ * driver is shown as working, which is what it was before this existed.
  */
 export function describeAttention(input: {
   readonly state: PeerLoopRunSummary["state"];
   readonly haltReason: PeerLoopRunSummary["haltReason"];
   readonly inFlight: PeerLoopRunSummary["inFlight"];
   readonly awaitingOwnerObjective?: boolean;
+  readonly hasActiveDriver?: boolean;
 }): PeerLoopAttentionPresentation {
   if (input.state === "done") return present("done", input.haltReason?.message ?? null);
   if (input.state === "interrupted") {
@@ -179,7 +204,7 @@ export function describeAttention(input: {
   if (input.awaitingOwnerObjective === true) return present("needs-objective", null);
   if (input.state === "error") return present("failed", null);
   if (input.state === "reviewer_working" || input.state === "builder_working") {
-    return present("running", null);
+    return present(input.hasActiveDriver === false ? "driver-missing" : "running", null);
   }
   if (input.state === "owner_required") return present("owner-decision", null);
   if (input.state === "paused") return present("paused", null);
@@ -192,7 +217,26 @@ export function describeRunAttention(run: PeerLoopRunSummary): PeerLoopAttention
     haltReason: run.haltReason,
     inFlight: run.inFlight,
     awaitingOwnerObjective: run.awaitingOwnerObjective,
+    // A live writer is the whole of it. Whose process it is does not matter:
+    // another Peer Loop driving this run is still a run being driven.
+    hasActiveDriver: run.liveWriter !== null,
   });
+}
+
+/**
+ * Whether anything is driving the run this subscription is attached to.
+ *
+ * Peer Loop's own control snapshot, and nothing else — not elapsed time, not
+ * the last event, not whether this bridge happens to hold the lease, and not
+ * the transport, which says whether T3 Code can hear Peer Loop rather than
+ * whether Peer Loop is working. `held_by_other_process` is a driven run this
+ * page merely cannot command. Anything unrecognised counts as driven, so a
+ * newer Peer Loop can never make T3 Code call a live run interrupted.
+ */
+function hasActiveDriver(control: PeerLoopControlAvailability | null): boolean {
+  if (control === null) return true;
+  if (control.liveWriter !== null) return true;
+  return control.reason !== "not_attached";
 }
 
 /**
@@ -209,6 +253,7 @@ export function describeViewAttention(view: PeerLoopRunView): PeerLoopAttentionP
     state: state.state,
     haltReason: state.haltReason,
     inFlight: state.inFlight,
+    hasActiveDriver: hasActiveDriver(view.control),
   });
 }
 
@@ -788,6 +833,45 @@ export function describeFailureEvidence(view: PeerLoopRunView): PeerLoopFailureE
 
 export const PEER_LOOP_EVIDENCE_CHARS = 600;
 
+export interface PeerLoopCompletion {
+  /** The Reviewer's own one-line summary of the finished run. */
+  readonly summary: string | null;
+  /** Where it left the repository, in the Reviewer's words. */
+  readonly finalState: string | null;
+}
+
+/** A summary is a sentence, not a feed line, but it is still not unbounded. */
+export const PEER_LOOP_COMPLETION_SUMMARY_CHARS = 600;
+export const PEER_LOOP_FINAL_STATE_CHARS = 200;
+
+/**
+ * How a finished run finished, when Peer Loop recorded it.
+ *
+ * The live outcome first, then the durable Reviewer decision — the same
+ * precedence as every other structured field here, because the outcome is what
+ * the subscription reports the moment it happens and the state file is what
+ * survives afterwards. Both are Peer Loop's own structured `DONE`; nothing is
+ * read out of a Builder report, a prompt or the activity feed, and a run state
+ * of "done" on its own produces nothing, because it says that it finished and
+ * not how.
+ */
+export function describeCompletion(view: PeerLoopRunView): PeerLoopCompletion | null {
+  const completed = (summary: string, finalState: string): PeerLoopCompletion => ({
+    summary: nonEmpty(truncate(summary, PEER_LOOP_COMPLETION_SUMMARY_CHARS)),
+    finalState: nonEmpty(truncate(finalState, PEER_LOOP_FINAL_STATE_CHARS)),
+  });
+
+  const outcome = view.outcome;
+  if (outcome?.kind === "done") return completed(outcome.summary, outcome.finalState);
+  const decision = view.state?.lastReviewerDecision ?? null;
+  if (decision !== null && decision.decision === "DONE") {
+    return completed(decision.summary, decision.finalState);
+  }
+  return null;
+}
+
+const nonEmpty = (value: string): string | null => (value.length === 0 ? null : value);
+
 /**
  * The final state of a finished run, when Peer Loop recorded one.
  *
@@ -795,9 +879,5 @@ export const PEER_LOOP_EVIDENCE_CHARS = 600;
  * from the run state alone: "done" says it finished, not how.
  */
 export function describeFinalState(view: PeerLoopRunView): string | null {
-  const outcome = view.outcome;
-  if (outcome?.kind === "done") return truncate(outcome.finalState, 200);
-  const decision = view.state?.lastReviewerDecision ?? null;
-  if (decision !== null && decision.decision === "DONE") return truncate(decision.finalState, 200);
-  return null;
+  return describeCompletion(view)?.finalState ?? null;
 }

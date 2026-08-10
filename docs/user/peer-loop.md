@@ -90,10 +90,22 @@ pointed at, and there is nothing to type a path into. A safety limit is
 optional. If the project already has an unfinished run, Peer Loop says so and
 the page offers you that run instead of starting a second one.
 
-Opening a run shows its state, iteration, which agents are configured, whether a
-turn was in flight, the current Builder task, the Reviewer's last decision, how
-many of your messages are queued, and the recent activity. Everything on that
-page is Peer Loop's own record; nothing is worked out locally.
+A run whose record still says the Reviewer or Builder is working, when Peer Loop
+reports that nothing is actually driving it, is listed under **what needs you**
+rather than as busy — see **A run that stopped part-way** below.
+
+Opening a run leads with what you might have to act on: how it finished if it
+did, the question the Reviewer escalated if there is one, what the Builder
+reported when a turn failed, and the controls. Everything else — the run state,
+iteration, which agents are configured, whether a turn was in flight, the full
+current Builder task, the Reviewer's last decision, your queued messages and the
+recent activity — is kept in full behind **Execution details**, a section you
+open when you want it. Nothing is dropped or shortened by being in there.
+Everything on that page is Peer Loop's own record; nothing is worked out locally.
+
+A finished run opens with the Reviewer's own summary and the final state it
+recorded. Both come from Peer Loop's structured `DONE`; neither is read out of a
+Builder report, a prompt or the activity feed.
 
 Web, the desktop app and a browser on your phone all use exactly this surface.
 
@@ -170,6 +182,16 @@ setting it.
 - **Capacity is exhausted, or a CLI needs signing in.** Both are fixed outside T3
   Code, on the machine running the agents. Peer Loop says which, and says whether
   the CLI reported a reset time — if it did not, T3 Code will not invent one.
+- **A run that stopped part-way.** A run's record says the Reviewer or the
+  Builder is working, and Peer Loop reports that no Reviewer or Builder is
+  actually running it — the machine slept, the process was killed, the terminal
+  was closed. It is shown as interrupted and listed under what needs you, rather
+  than as a run that has been "Working" for eleven hours. This is Peer Loop's own
+  answer about which process holds the run, not a guess from how long it has been
+  quiet, and a run another Peer Loop process is driving is still running: you can
+  read it here and it is not called interrupted. Nothing is resumed or recovered
+  for you — **Resume** is there when Peer Loop says the run can be resumed, and
+  pressing it stays your decision.
 - **A Builder turn was cut off partway.** The run is paused, not failed, and the
   repository may already have changed. Resuming reconnects and confirms the
   interruption without running anything; the interrupted task is never replayed

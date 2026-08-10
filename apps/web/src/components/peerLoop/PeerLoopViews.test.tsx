@@ -75,6 +75,23 @@ const status = (overrides: Partial<PeerLoopStatusResult> = {}): PeerLoopStatusRe
     ...overrides,
   }) as PeerLoopStatusResult;
 
+/**
+ * The lease Peer Loop reports while something is actually driving a run.
+ *
+ * A working run and a run whose last written state says "working" are different
+ * things, and only this tells them apart.
+ */
+const liveWriter = (isThisProcess = true): PeerLoopRunSummary["liveWriter"] =>
+  ({
+    pid: 4242,
+    host: "this-mac",
+    command: "start",
+    runId: "run-1",
+    acquiredAt: "2026-08-09T00:00:00.000Z",
+    renewedAt: "2026-08-09T00:05:00.000Z",
+    isThisProcess,
+  }) as NonNullable<PeerLoopRunSummary["liveWriter"]>;
+
 const summary = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummary =>
   ({
     runId: "run-1",
@@ -89,10 +106,14 @@ const summary = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummar
     lastSequence: 5,
     awaitingOwnerObjective: false,
     adapters,
-    liveWriter: null,
-    liveInThisBridge: false,
+    liveWriter: liveWriter(),
+    liveInThisBridge: true,
     ...overrides,
   }) as PeerLoopRunSummary;
+
+/** The same run after whatever was driving it went away. */
+const driverless = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummary =>
+  summary({ liveWriter: null, liveInThisBridge: false, ...overrides });
 
 const runList = (overrides: Partial<PeerLoopListRunsResult> = {}): PeerLoopListRunsResult => ({
   runs: [],
@@ -160,7 +181,15 @@ const attachedView = (
       control: {
         available: control.available,
         reason: control.reason as never,
-        liveWriter: null,
+        // Peer Loop sends a lease whenever a process holds the project, and
+        // none once nothing does. Derived from the reason so no fixture here
+        // is a snapshot the bridge could not send.
+        liveWriter:
+          control.reason === "live_in_this_bridge"
+            ? liveWriter(true)
+            : control.reason === "held_by_other_process"
+              ? liveWriter(false)
+              : null,
         resumable: control.resumable,
       },
       eventHighWaterMark: 5,
@@ -256,6 +285,42 @@ describe("Peer Loop index", () => {
     expect(html).toContain("Recent");
     expect(html).toContain("demo");
     expect(html).toContain("iteration 2");
+  });
+
+  it("puts a working run nothing is driving under Needs you, not under Active", async () => {
+    const html = await render(
+      <PeerLoopIndexView
+        status={status()}
+        runs={runList({ runs: [driverless({ runId: "stale", state: "builder_working" })] })}
+        startRun={null}
+      />,
+    );
+    expect(html).toContain("Needs you");
+    expect(html).not.toContain(">Active<");
+    expect(html).toContain(">Interrupted — no Reviewer or Builder running<");
+  });
+
+  it("still calls a run another Peer Loop process is driving Active", async () => {
+    const html = await render(
+      <PeerLoopIndexView
+        status={status()}
+        runs={runList({
+          runs: [
+            summary({
+              runId: "elsewhere",
+              state: "builder_working",
+              liveWriter: liveWriter(false),
+              liveInThisBridge: false,
+            }),
+          ],
+        })}
+        startRun={null}
+      />,
+    );
+    expect(html).toContain("Active");
+    expect(html).toContain("driven by another process");
+    expect(html).not.toContain("Needs you");
+    expect(html).not.toContain("Interrupted");
   });
 
   it("reports runs Peer Loop could not read rather than hiding them", async () => {
@@ -477,6 +542,133 @@ describe("Peer Loop detail", () => {
     });
     expect(html).toContain("CONTROL_UNAVAILABLE");
     expect(html).toContain("Another process is driving this project");
+  });
+});
+
+describe("Peer Loop detail, ordered by what a person has to act on", () => {
+  /** Where a fragment sits in the rendered page, so order can be asserted on. */
+  const at = (html: string, fragment: string): number => {
+    const index = html.indexOf(fragment);
+    expect(index, `expected the page to contain ${fragment}`).toBeGreaterThan(-1);
+    return index;
+  };
+
+  const doneView = (): PeerLoopRunView =>
+    applyPeerLoopSubscriptionEvent(attachedView(runState({ state: "done" }), LIVE), {
+      kind: "run-finished",
+      runId: "run-1",
+      outcome: {
+        kind: "done",
+        finalState: "clean worktree, all tests green",
+        summary: "Documented the loop and shipped it.",
+      },
+      state: null,
+      reason: "terminal",
+    });
+
+  it("leads a finished run with its summary and final state, above the execution details", async () => {
+    const html = await detail(doneView());
+    expect(html).toContain("Documented the loop and shipped it.");
+    expect(html).toContain("clean worktree, all tests green");
+    expect(at(html, "Documented the loop and shipped it.")).toBeLessThan(
+      at(html, "Execution details"),
+    );
+    expect(at(html, "clean worktree, all tests green")).toBeLessThan(at(html, "Execution details"));
+  });
+
+  it("keeps the Builder task, the state facts and the activity in a closed disclosure", async () => {
+    const html = await detail(
+      attachedView(
+        runState({
+          lastReviewerDecision: {
+            decision: "CONTINUE",
+            summary: "Baseline established.",
+            builderTask: "Write NOTES.md.",
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+    );
+
+    // Nothing is deleted: every fact is still on the page.
+    expect(html).toContain("Current Builder task");
+    expect(html).toContain("Write NOTES.md. Then STOP.");
+    expect(html).toContain("Run state");
+    expect(html).toContain("builder_working");
+    expect(html).toContain("Activity");
+
+    // A native disclosure, and shut. `open` is the only thing that opens one.
+    expect(html).toContain("<details");
+    expect(html).not.toContain("<details open");
+    const disclosure = at(html, "Execution details");
+    for (const buried of ["Current Builder task", "Write NOTES.md. Then STOP.", "Run state"]) {
+      expect(at(html, buried)).toBeGreaterThan(disclosure);
+    }
+    // What the owner might have to press is not inside it.
+    for (const visible of ["Send message", ">Pause", ">Resume"]) {
+      expect(at(html, visible)).toBeLessThan(disclosure);
+    }
+  });
+
+  it("keeps a question, failure evidence and a resync warning out of the disclosure", async () => {
+    const view = applyPeerLoopSubscriptionEvent(
+      attachedView(
+        runState({
+          state: "owner_required",
+          lastReviewerDecision: {
+            decision: "OWNER_REQUIRED",
+            summary: "Needs a product call.",
+            ownerQuestion: "Should the export include archived threads?",
+            whyOwnerIsRequired: "It changes what leaves the machine.",
+            options: ["Include them"],
+          },
+          lastBuilderFailure: {
+            kind: "AUTH_REQUIRED",
+            source: "stderr",
+            evidence: "run `claude login`",
+            resetAt: null,
+          },
+        } as Partial<PeerLoopRunStateFile>),
+        LIVE,
+      ),
+      {
+        kind: "run-resync",
+        runId: "run-1",
+        afterSeq: 2,
+        reason: "this server could not retain the event stream for this client",
+      },
+    );
+    const html = await detail(view);
+    const disclosure = at(html, "Execution details");
+    for (const visible of [
+      "Should the export include archived threads?",
+      "run `claude login`",
+      "missing part of the run",
+      "Catch up from where it left off",
+    ]) {
+      expect(at(html, visible)).toBeLessThan(disclosure);
+    }
+  });
+
+  it("says an attached working run has nothing driving it, and offers only Resume", async () => {
+    for (const state of ["builder_working", "reviewer_working"] as const) {
+      const html = await detail(attachedView(runState({ state }), STOPPED));
+      expect(html).toContain(">Interrupted — no Reviewer or Builder running<");
+      expect(html).toContain("no Reviewer or Builder is running it");
+      expect(html).toContain("Nothing is resumed for you");
+      expect(html).toContain("Resume");
+      // Recovery is Peer Loop's, and this is not an interrupted run anyway.
+      expect(html).not.toContain("Choose how to continue");
+    }
+  });
+
+  it("does not call a working run interrupted while a writer holds it", async () => {
+    for (const control of [LIVE, HELD]) {
+      const html = await detail(attachedView(runState({ state: "builder_working" }), control));
+      expect(html).toContain(">Working<");
+      expect(html).not.toContain("no Reviewer or Builder is running it");
+      expect(html).not.toContain("Interrupted —");
+    }
   });
 });
 
