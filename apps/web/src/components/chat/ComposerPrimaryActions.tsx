@@ -26,7 +26,7 @@ interface ComposerPrimaryActionsProps {
    * False for a planning conversation, which keeps the refine action — that is
    * the whole point of it — and offers neither implementation path.
    */
-  canImplementPlan?: boolean;
+  canImplementPlan: boolean;
   promptHasText: boolean;
   isSendBusy: boolean;
   sendDisabledReason: string | null;
@@ -67,7 +67,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   pendingAction,
   isRunning,
   showPlanFollowUpPrompt,
-  canImplementPlan = true,
+  canImplementPlan,
   promptHasText,
   isSendBusy,
   sendDisabledReason,
@@ -168,7 +168,17 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           size="sm"
           className={cn("rounded-full", compact ? "h-9 px-3 sm:h-8" : "h-9 px-4 sm:h-8")}
           {...pointerFocusProps}
-          disabled={isSendBusy || isSendDisabled || isConnecting || isEnvironmentUnavailable}
+          disabled={
+            isSendBusy ||
+            isSendDisabled ||
+            isConnecting ||
+            isEnvironmentUnavailable ||
+            // For a coding thread this button only appears with text waiting.
+            // For a planning one it replaces "Implement", which submits with an
+            // empty composer on purpose — refining with nothing to say must not
+            // inherit that and send an empty turn.
+            (!canImplementPlan && !hasSendableContent)
+          }
         >
           {isConnecting || isSendBusy ? "Sending..." : "Refine"}
         </Button>

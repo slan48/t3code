@@ -13,7 +13,10 @@ import {
   CODING_PROPOSAL_WORDING,
   NAVIGATOR_PROPOSAL_WORDING,
   proposalWording,
+  rightPanelVisible,
+  terminalDrawerVisible,
   threadCapabilities,
+  visibleRightPanelSurfaces,
 } from "./navigatorCapabilities";
 
 describe("navigator capabilities", () => {
@@ -60,5 +63,47 @@ describe("proposal wording", () => {
     expect(proposalWording("coding").badge).toBe("Plan");
     expect(proposalWording("coding").untitled).toBe("Proposed plan");
     expect(proposalWording(undefined)).toEqual(CODING_PROPOSAL_WORDING);
+  });
+});
+
+describe("retained terminal and panel state", () => {
+  const navigator = threadCapabilities("navigator");
+  const coding = threadCapabilities("coding");
+
+  it("keeps a drawer left open by earlier state closed", () => {
+    // The realistic failure: a thread whose terminal UI state was written
+    // before this rule existed, or by a build without it. Reading the stored
+    // value straight through would reopen the drawer on the next visit.
+    expect(terminalDrawerVisible(navigator, true)).toBe(false);
+    expect(terminalDrawerVisible(navigator, false)).toBe(false);
+    expect(terminalDrawerVisible(coding, true)).toBe(true);
+    expect(terminalDrawerVisible(coding, false)).toBe(false);
+  });
+
+  it("drops a retained terminal surface and keeps the read-only ones", () => {
+    const surfaces = [
+      { id: "diff", kind: "diff" },
+      { id: "terminal:1", kind: "terminal" },
+      { id: "plan", kind: "plan" },
+      { id: "files", kind: "files" },
+    ] as const;
+    expect(visibleRightPanelSurfaces(navigator, surfaces).map((surface) => surface.id)).toEqual([
+      "diff",
+      "plan",
+      "files",
+    ]);
+    // Reading, diffing and inspecting are the point of a planning
+    // conversation; only the shell goes.
+    expect(visibleRightPanelSurfaces(coding, surfaces)).toEqual(surfaces);
+  });
+
+  it("does not open a panel whose only surface was the hidden terminal", () => {
+    expect(rightPanelVisible(navigator, true, 0)).toBe(false);
+    expect(rightPanelVisible(navigator, true, 1)).toBe(true);
+    expect(rightPanelVisible(navigator, false, 3)).toBe(false);
+    // A coding thread's panel is unchanged, including the transient moment
+    // where it is open with nothing in it yet.
+    expect(rightPanelVisible(coding, true, 0)).toBe(true);
+    expect(rightPanelVisible(coding, false, 2)).toBe(false);
   });
 });

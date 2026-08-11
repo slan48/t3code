@@ -14,7 +14,7 @@ interface ComposerPendingApprovalActionsProps {
    * without them a Navigator conversation would be stuck on a question it could
    * never answer.
    */
-  canAcceptApprovals?: boolean;
+  canAcceptApprovals: boolean;
   onRespondToApproval: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
@@ -24,7 +24,7 @@ interface ComposerPendingApprovalActionsProps {
 export const ComposerPendingApprovalActions = memo(function ComposerPendingApprovalActions({
   requestId,
   isResponding,
-  canAcceptApprovals = true,
+  canAcceptApprovals,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
   return (

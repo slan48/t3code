@@ -157,7 +157,14 @@ import {
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
-import { conversationIdentity, proposalWording, threadCapabilities } from "~/navigatorCapabilities";
+import {
+  conversationIdentity,
+  proposalWording,
+  rightPanelVisible,
+  terminalDrawerVisible,
+  threadCapabilities,
+  visibleRightPanelSurfaces,
+} from "~/navigatorCapabilities";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -1478,6 +1485,19 @@ function ChatViewContent(props: ChatViewProps) {
    * command, or a stale reference held by a component that has not re-rendered.
    */
   const capabilities = threadCapabilities(activeThreadPurpose);
+  /*
+   * Terminals for the conversation on screen, capability applied once.
+   *
+   * Read this below, never `terminalUiState.terminalOpen`. Terminal UI state is
+   * retained per thread and survives a reload, so a conversation that must not
+   * have a terminal has to be answered at the state, not at each of the dozen
+   * places that render from it — otherwise state written before this rule
+   * existed would still open a drawer.
+   */
+  const activeThreadTerminalOpen = terminalDrawerVisible(
+    capabilities,
+    Boolean(terminalUiState.terminalOpen),
+  );
   const proposalLabels = proposalWording(activeThreadPurpose);
   const threadIdentity = conversationIdentity(activeThreadPurpose);
   const runtimeMode = isNavigatorThread
@@ -1543,9 +1563,27 @@ function ChatViewContent(props: ChatViewProps) {
   const rightPanelState = useRightPanelStore((state) =>
     selectThreadRightPanelState(state.byThreadKey, activeThreadRef),
   );
-  const activeRightPanelSurface = useRightPanelStore((state) =>
+  const storedActiveRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  /*
+   * The panel as this conversation is allowed to see it.
+   *
+   * Right panel state is retained per thread and survives a reload, so a
+   * terminal surface written before a rule existed would still render its tab
+   * and its shell. Filtering here — rather than at each tab strip — means the
+   * surface is absent from the tab list, from the active surface, and from the
+   * content area together. The close/cleanup callbacks below deliberately keep
+   * reading the unfiltered list: a hidden terminal still has to be torn down.
+   */
+  const rightPanelSurfaces = useMemo(
+    () => visibleRightPanelSurfaces(capabilities, rightPanelState.surfaces),
+    [capabilities, rightPanelState.surfaces],
+  );
+  const activeRightPanelSurface =
+    !capabilities.canUseTerminals && storedActiveRightPanelSurface?.kind === "terminal"
+      ? null
+      : storedActiveRightPanelSurface;
   const activeFileSurface =
     activeRightPanelSurface?.kind === "file" ? activeRightPanelSurface : null;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
@@ -1566,7 +1604,11 @@ function ChatViewContent(props: ChatViewProps) {
     [activeKnownTerminalIds, panelTerminalIds],
   );
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
-  const rightPanelOpen = rightPanelState.isOpen;
+  const rightPanelOpen = rightPanelVisible(
+    capabilities,
+    rightPanelState.isOpen,
+    rightPanelSurfaces.length,
+  );
   const canMaximizeRightPanel = rightPanelOpen && !shouldUsePlanSidebarSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
@@ -1633,7 +1675,7 @@ function ChatViewContent(props: ChatViewProps) {
         currentThreadIds,
         openThreadIds: existingOpenTerminalThreadKeys,
         activeThreadId: activeThreadKey,
-        activeThreadTerminalOpen: Boolean(activeThreadKey && terminalUiState.terminalOpen),
+        activeThreadTerminalOpen: Boolean(activeThreadKey && activeThreadTerminalOpen),
         maxHiddenThreadCount: MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
       });
       return currentThreadIds.length === nextThreadIds.length &&
@@ -1641,7 +1683,7 @@ function ChatViewContent(props: ChatViewProps) {
         ? currentThreadIds
         : nextThreadIds;
     });
-  }, [activeThreadKey, existingOpenTerminalThreadKeys, terminalUiState.terminalOpen]);
+  }, [activeThreadKey, existingOpenTerminalThreadKeys, activeThreadTerminalOpen]);
   const latestTurnSettled = isLatestTurnSettled(activeLatestTurn, activeThread?.session ?? null);
   const activeProjectRef = activeThread
     ? scopeProjectRef(activeThread.environmentId, activeThread.projectId)
@@ -2444,6 +2486,11 @@ function ChatViewContent(props: ChatViewProps) {
   }, [turnDiffSummaries]);
   const revertTurnCountByUserMessageId = useMemo(() => {
     const byUserMessageId = new Map<MessageId, number>();
+    // An empty map is what removes the per-message "revert" affordance: the
+    // timeline draws the button only where a checkpoint turn count exists.
+    // Reverting rewinds a worktree, so a conversation that owns none has
+    // nothing to rewind and must not offer it.
+    if (!capabilities.canRevertCheckpoint) return byUserMessageId;
     for (let index = 0; index < timelineEntries.length; index += 1) {
       const entry = timelineEntries[index];
       if (!entry || entry.kind !== "message" || entry.message.role !== "user") {
@@ -2473,7 +2520,12 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     return byUserMessageId;
-  }, [inferredCheckpointTurnCountByTurnId, timelineEntries, turnDiffSummaryByAssistantMessageId]);
+  }, [
+    capabilities.canRevertCheckpoint,
+    inferredCheckpointTurnCountByTurnId,
+    timelineEntries,
+    turnDiffSummaryByAssistantMessageId,
+  ]);
 
   const gitCwd = activeProject
     ? projectScriptCwd({
@@ -2537,7 +2589,14 @@ function ChatViewContent(props: ChatViewProps) {
     terminalUiLaunchContext?.threadId === activeThreadId ? terminalUiLaunchContext : null;
   // Default true while loading to avoid toolbar flicker.
   const isGitRepo = gitStatusQuery.data?.isRepo ?? true;
-  const showComposerContextStrip = isGitRepo && activeProject !== null;
+  /*
+   * The branch/environment strip under the composer. It is the entry point to
+   * choosing a checkout, switching environments and checking out a pull
+   * request, none of which a planning conversation does — so the whole strip
+   * goes rather than each control inside it.
+   */
+  const showComposerContextStrip =
+    capabilities.canChooseCheckout && isGitRepo && activeProject !== null;
   const initialDiffPanelGitScope =
     gitStatusQuery.data?.hasWorkingTreeChanges === true ? "unstaged" : "branch";
   const diffPanelGitStatusResolutionKey = gitStatusQuery.data ? "resolved" : "pending";
@@ -2545,10 +2604,10 @@ function ChatViewContent(props: ChatViewProps) {
     () => ({
       context: {
         terminalFocus: true,
-        terminalOpen: Boolean(terminalUiState.terminalOpen),
+        terminalOpen: Boolean(activeThreadTerminalOpen),
       },
     }),
-    [terminalUiState.terminalOpen],
+    [activeThreadTerminalOpen],
   );
   const splitTerminalShortcutLabel = useMemo(
     () => shortcutLabelForCommand(keybindings, "terminal.split", terminalShortcutLabelOptions),
@@ -2677,7 +2736,7 @@ function ChatViewContent(props: ChatViewProps) {
   const toggleTerminalVisibility = useCallback(() => {
     if (!capabilities.canUseTerminals) return;
     if (!activeThreadRef) return;
-    const nextOpen = !terminalUiState.terminalOpen;
+    const nextOpen = !activeThreadTerminalOpen;
     if (nextOpen && terminalUiState.terminalIds.length === 0) {
       if (!activeThreadId || !activeProject) {
         return;
@@ -2716,7 +2775,7 @@ function ChatViewContent(props: ChatViewProps) {
     setTerminalOpen,
     storeEnsureTerminal,
     terminalUiState.terminalIds.length,
-    terminalUiState.terminalOpen,
+    activeThreadTerminalOpen,
   ]);
   const splitTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -2764,6 +2823,9 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
   const createNewTerminal = useCallback(() => {
+    // The `terminal.new` keybinding calls this directly, so it needs its own
+    // guard: refusing to open the drawer does not stop a shell from starting.
+    if (!capabilities.canUseTerminals) return;
     if (!activeThreadRef || !activeThreadId || !activeProject) {
       return;
     }
@@ -2792,6 +2854,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeThreadId,
     allocatableActiveTerminalIds,
     activeThreadRef,
+    capabilities.canUseTerminals,
     openTerminal,
     activeThreadWorktreePath,
     environmentId,
@@ -3211,6 +3274,10 @@ function ChatViewContent(props: ChatViewProps) {
     }
   }, [activeThreadRef]);
   const addTerminalSurface = useCallback(() => {
+    // Reachable from the panel's "new terminal" affordance and from the
+    // terminal keybindings, so the guard lives here rather than only where the
+    // affordance is drawn.
+    if (!capabilities.canUseTerminals) return;
     if (!activeThreadRef || !activeThreadId || !activeProject) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
     const terminalId = nextTerminalId(allocatableActiveTerminalIds);
@@ -3235,6 +3302,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeThreadRef,
     activeThreadWorktreePath,
     allocatableActiveTerminalIds,
+    capabilities.canUseTerminals,
     gitCwd,
     openTerminal,
   ]);
@@ -3933,14 +4001,14 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeThread?.id]);
 
   useEffect(() => {
-    if (!activeThread?.id || terminalUiState.terminalOpen) return;
+    if (!activeThread?.id || activeThreadTerminalOpen) return;
     const frame = window.requestAnimationFrame(() => {
       focusComposer();
     });
     return () => {
       window.cancelAnimationFrame(frame);
     };
-  }, [activeThread?.id, focusComposer, terminalUiState.terminalOpen]);
+  }, [activeThread?.id, focusComposer, activeThreadTerminalOpen]);
 
   useEffect(() => {
     if (!activeThread?.id) return;
@@ -4015,9 +4083,17 @@ function ChatViewContent(props: ChatViewProps) {
     requestedEnvMode: envMode,
     isGitRepo,
   });
+  /*
+   * Null for a conversation that does not own a checkout. This drives the
+   * "Branch changed / Restore branch" banner, and restoring runs a real
+   * `git checkout` in the owner's working tree — a repository mutation a
+   * planning conversation must not offer. `persistThreadSettingsForNextTurn`
+   * already refuses for the same conversations, so the branch this feeds into
+   * the next turn's settings is not lost by being absent here.
+   */
   const localCheckoutBranchMismatch = useMemo(
     () =>
-      isServerThread
+      isServerThread && capabilities.canStartRepositoryMutation
         ? resolveLocalCheckoutBranchMismatch({
             effectiveEnvMode: envMode,
             activeWorktreePath,
@@ -4025,7 +4101,14 @@ function ChatViewContent(props: ChatViewProps) {
             currentGitBranch: gitStatusQuery.data?.refName ?? null,
           })
         : null,
-    [activeThreadBranch, activeWorktreePath, envMode, gitStatusQuery.data?.refName, isServerThread],
+    [
+      activeThreadBranch,
+      activeWorktreePath,
+      capabilities.canStartRepositoryMutation,
+      envMode,
+      gitStatusQuery.data?.refName,
+      isServerThread,
+    ],
   );
   // Settled state of the open thread, resolved exactly like the sidebar
   // partition (same shell, same capability gate, same PR auto-settle input)
@@ -4392,18 +4475,18 @@ function ChatViewContent(props: ChatViewProps) {
   }, [activeProjectCwd, activeThreadId, activeThreadWorktreePath]);
 
   useEffect(() => {
-    if (terminalUiState.terminalOpen) {
+    if (activeThreadTerminalOpen) {
       return;
     }
     setTerminalUiLaunchContext((current) =>
       current?.threadId === activeThreadId ? null : current,
     );
-  }, [activeThreadId, terminalUiState.terminalOpen]);
+  }, [activeThreadId, activeThreadTerminalOpen]);
 
   useEffect(() => {
     if (!activeThreadKey) return;
     const previous = terminalUiOpenByThreadRef.current[activeThreadKey] ?? false;
-    const current = Boolean(terminalUiState.terminalOpen);
+    const current = Boolean(activeThreadTerminalOpen);
 
     if (!previous && current) {
       terminalUiOpenByThreadRef.current[activeThreadKey] = current;
@@ -4420,7 +4503,7 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     terminalUiOpenByThreadRef.current[activeThreadKey] = current;
-  }, [activeThreadKey, focusComposer, terminalUiState.terminalOpen]);
+  }, [activeThreadKey, focusComposer, activeThreadTerminalOpen]);
 
   useEffect(() => {
     const handler = (event: globalThis.KeyboardEvent) => {
@@ -4437,7 +4520,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       const shortcutContext = {
         terminalFocus: terminalFocusOwner !== null,
-        terminalOpen: Boolean(terminalUiState.terminalOpen),
+        terminalOpen: Boolean(activeThreadTerminalOpen),
         modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
       };
 
@@ -4479,7 +4562,7 @@ function ChatViewContent(props: ChatViewProps) {
           splitPanelTerminal();
           return;
         }
-        if (!terminalUiState.terminalOpen) {
+        if (!activeThreadTerminalOpen) {
           setTerminalOpen(true);
         }
         splitTerminal();
@@ -4493,7 +4576,7 @@ function ChatViewContent(props: ChatViewProps) {
           splitPanelTerminal("vertical");
           return;
         }
-        if (!terminalUiState.terminalOpen) {
+        if (!activeThreadTerminalOpen) {
           setTerminalOpen(true);
         }
         splitTerminal("vertical");
@@ -4507,7 +4590,7 @@ function ChatViewContent(props: ChatViewProps) {
           closePanelTerminal(activeRightPanelSurface.activeTerminalId);
           return;
         }
-        if (!terminalUiState.terminalOpen) return;
+        if (!activeThreadTerminalOpen) return;
         closeTerminal(terminalUiState.activeTerminalId);
         return;
       }
@@ -4519,7 +4602,7 @@ function ChatViewContent(props: ChatViewProps) {
           addTerminalSurface();
           return;
         }
-        if (!terminalUiState.terminalOpen) {
+        if (!activeThreadTerminalOpen) {
           setTerminalOpen(true);
         }
         createNewTerminal();
@@ -4554,7 +4637,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeProject,
     activeRightPanelSurface,
     addTerminalSurface,
-    terminalUiState.terminalOpen,
+    activeThreadTerminalOpen,
     terminalUiState.activeTerminalId,
     activeThreadId,
     closeTerminal,
@@ -5738,8 +5821,9 @@ function ChatViewContent(props: ChatViewProps) {
 
   const panelToggleControls = (
     <PanelLayoutControls
+      showTerminalToggle={capabilities.canUseTerminals}
       terminalAvailable={activeProject !== null}
-      terminalOpen={terminalUiState.terminalOpen}
+      terminalOpen={activeThreadTerminalOpen}
       terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
       rightPanelAvailable={activeProject !== null}
       rightPanelOpen={rightPanelOpen}
@@ -6023,6 +6107,7 @@ function ChatViewContent(props: ChatViewProps) {
                       <div className="chat-composer-glass-host relative z-10 w-full rounded-[22px]">
                         <div ref={attachDraftHeroComposerAnchorRef} className="relative z-10">
                           <ChatComposer
+                            capabilities={capabilities}
                             composerRef={composerRef}
                             composerDraftTarget={composerDraftTarget}
                             environmentId={environmentId}
@@ -6069,7 +6154,7 @@ function ChatViewContent(props: ChatViewProps) {
                             resolvedTheme={resolvedTheme}
                             settings={settings}
                             keybindings={keybindings}
-                            terminalOpen={Boolean(terminalUiState.terminalOpen)}
+                            terminalOpen={Boolean(activeThreadTerminalOpen)}
                             gitCwd={gitCwd}
                             promptRef={promptRef}
                             composerImagesRef={composerImagesRef}
@@ -6104,7 +6189,7 @@ function ChatViewContent(props: ChatViewProps) {
                       </div>
                       <div className="min-h-0">
                         <div
-                          data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}
+                          data-terminal-open={activeThreadTerminalOpen ? "true" : undefined}
                           className="relative z-0"
                         >
                           {showComposerContextStrip && (
@@ -6213,7 +6298,7 @@ function ChatViewContent(props: ChatViewProps) {
             key={mountedThreadKey}
             threadRef={mountedThreadRef}
             threadId={mountedThreadRef.threadId}
-            visible={mountedThreadKey === activeThreadKey && terminalUiState.terminalOpen}
+            visible={mountedThreadKey === activeThreadKey && activeThreadTerminalOpen}
             launchContext={
               mountedThreadKey === activeThreadKey ? (activeTerminalLaunchContext ?? null) : null
             }
@@ -6232,7 +6317,7 @@ function ChatViewContent(props: ChatViewProps) {
         <RightPanelTabs
           mode="inline"
           maximized={rightPanelMaximized}
-          surfaces={rightPanelState.surfaces}
+          surfaces={rightPanelSurfaces}
           activeSurfaceId={activeRightPanelSurface?.id ?? null}
           pendingSurfaceIds={pendingFileSurfaceIds}
           previewSessions={activePreviewState.sessions}
@@ -6259,7 +6344,7 @@ function ChatViewContent(props: ChatViewProps) {
           <RightPanelTabs
             mode="sheet"
             layoutControls={panelToggleControls}
-            surfaces={rightPanelState.surfaces}
+            surfaces={rightPanelSurfaces}
             activeSurfaceId={activeRightPanelSurface?.id ?? null}
             pendingSurfaceIds={pendingFileSurfaceIds}
             previewSessions={activePreviewState.sessions}

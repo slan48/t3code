@@ -17,8 +17,10 @@ import {
   NAVIGATOR_PROPOSAL_WORDING,
   threadCapabilities,
 } from "~/navigatorCapabilities";
+import { ComposerFooterModeControls } from "./ComposerFooterModeControls";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
+import { PanelLayoutControls } from "./PanelLayoutControls";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-local");
 const PLAN = "# Split the migration\n\n1. Add the column.\n2. Backfill.";
@@ -95,6 +97,79 @@ describe("plan follow-up actions", () => {
     expect(markup).toContain(">Implement<");
     expect(markup).toContain('data-chat-composer-implement-actions="true"');
     expect(markup).toContain('aria-label="Implementation actions"');
+  });
+});
+
+/* ------------------------------------------------- footer mode controls */
+
+describe("composer footer mode controls", () => {
+  const render = (input: { showRuntimeModeControl: boolean; showInteractionModeToggle: boolean }) =>
+    renderToStaticMarkup(
+      <ComposerFooterModeControls
+        showInteractionModeToggle={input.showInteractionModeToggle}
+        showRuntimeModeControl={input.showRuntimeModeControl}
+        interactionMode="plan"
+        runtimeMode="approval-required"
+        showPlanToggle
+        planSidebarLabel="Execution Proposal"
+        planSidebarOpen={false}
+        onToggleInteractionMode={() => undefined}
+        onRuntimeModeChange={() => undefined}
+        onTogglePlanSidebar={() => undefined}
+      />,
+    );
+
+  it("draws no permission-mode or plan/build selector for a planning conversation", () => {
+    const capabilities = threadCapabilities("navigator");
+    const markup = render({
+      showRuntimeModeControl: capabilities.canChangeRuntimeMode,
+      showInteractionModeToggle: capabilities.canChangeInteractionMode,
+    });
+    expect(markup).not.toContain('aria-label="Runtime mode"');
+    expect(markup).not.toContain("Supervised");
+    expect(markup).not.toContain("click to enter plan mode");
+    expect(markup).not.toContain("click to return to normal build mode");
+    // The plan sidebar toggle is reading, and stays.
+    expect(markup).toContain("Execution Proposal");
+  });
+
+  it("keeps both selectors for a coding thread", () => {
+    const markup = render({ showRuntimeModeControl: true, showInteractionModeToggle: true });
+    expect(markup).toContain('aria-label="Runtime mode"');
+    expect(markup).toContain("Supervised");
+    expect(markup).toContain("click to return to normal build mode");
+  });
+});
+
+/* --------------------------------------------------- panel layout controls */
+
+describe("panel layout controls", () => {
+  const render = (showTerminalToggle: boolean) =>
+    renderToStaticMarkup(
+      <PanelLayoutControls
+        showTerminalToggle={showTerminalToggle}
+        terminalAvailable
+        terminalOpen={false}
+        terminalShortcutLabel="⌘J"
+        rightPanelAvailable
+        rightPanelOpen={false}
+        rightPanelShortcutLabel="⌘I"
+        onToggleTerminal={() => undefined}
+        onToggleRightPanel={() => undefined}
+      />,
+    );
+
+  it("does not advertise a terminal a planning conversation cannot open", () => {
+    const markup = render(threadCapabilities("navigator").canUseTerminals);
+    // Not merely disabled: a greyed-out toggle still says the feature is there.
+    expect(markup).not.toContain("terminal drawer");
+    expect(markup).not.toContain("Terminal drawer is unavailable");
+    expect(markup).toContain("Toggle right panel");
+  });
+
+  it("keeps the terminal toggle for a coding thread", () => {
+    const markup = render(true);
+    expect(markup).toContain('aria-label="Toggle terminal drawer"');
   });
 });
 

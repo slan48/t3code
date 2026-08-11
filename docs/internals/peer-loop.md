@@ -712,10 +712,34 @@ scattering `purpose === "navigator"` comparisons through the components.
 `ChatView` derives it once and **passes it down**: `ChatHeader` (project
 scripts, and the conversation identity badge), `MessagesTimeline` and
 `ProposedPlanCard` (proposal wording and the workspace write), `PlanSidebar`
-(the same wording and the same write), `ComposerPrimaryActions` (refine instead
-of implement) and `ComposerPendingApprovalActions` (no accept, decline and
-cancel kept). Children consume the record rather than re-deriving purpose, so a
-new control cannot quietly skip the question.
+(the same wording and the same write), `PanelLayoutControls` (no terminal
+toggle at all — a disabled one still advertises the feature), and the whole
+`ChatComposer` tree through a single required `capabilities` prop.
+`ChatComposer` forwards the individual answers to the leaves:
+`ComposerPrimaryActions` (refine instead of implement),
+`ComposerPendingApprovalActions` at both of its render sites (no accept;
+decline and cancel kept) and `ComposerFooterModeControls` /
+`CompactComposerControlsMenu` (no permission-mode selector, no plan/build
+toggle). Children consume the record rather than re-deriving purpose, so a new
+control cannot quietly skip the question.
+
+**The leaf props are required, deliberately.** `canImplementPlan` and
+`canAcceptApprovals` used to default to `true`, which is exactly how the live
+composer kept offering implementation and approval after the capability record
+existed: the record was correct and nothing read it. Removing the defaults
+turned every unwired render site into a compile error.
+
+**Retained UI state is filtered, not just un-advertised.** Terminal drawer state
+and right panel surfaces are stored per thread and survive a reload, so
+`terminalDrawerVisible`, `visibleRightPanelSurfaces` and `rightPanelVisible`
+answer the capability against the stored value: a terminal drawer or panel tab
+written before this rule existed does not come back. Teardown still reads the
+unfiltered list, because a hidden terminal is still a running shell. The
+branch/environment strip under the composer (`BranchToolbar`, its environment
+picker and the pull-request checkout) is not rendered, and the
+"Branch changed / Restore branch" banner is not derived at all — restoring runs
+a real `git checkout` in the owner's working tree. The per-message revert
+affordance is removed by deriving no checkpoint turn counts.
 
 The callbacks read it again as an early guard, because hiding a button does not
 unbind a keyboard shortcut, a slash command, or a stale reference in a component
@@ -723,7 +747,9 @@ that has not re-rendered: `onRespondToApproval` (which inspects the _decision_ �
 `accept` and `acceptForSession` are blocked, `decline` and `cancel` are not),
 `onImplementPlanInNewThread`, `runProjectScript`, `setTerminalOpen`,
 `toggleTerminalVisibility`, `splitTerminal`, `splitPanelTerminal`,
-`onRevertToTurnCount`, `handleRuntimeModeChange` and
+`addTerminalSurface` and `createNewTerminal` (both reachable straight from the
+terminal keybindings, where refusing to open the drawer would not have stopped
+a shell from starting), `onRevertToTurnCount`, `handleRuntimeModeChange` and
 `handleInteractionModeChange` (which is also the standalone slash-command path,
 so `/default` is inert rather than refused). Declining and
 cancelling a pending approval stay available: the server explicitly permits
@@ -772,8 +798,9 @@ natural-language confirmation, child execution cards, structured run-result
 context and the DONE return flow, the `OWNER_REQUIRED` explanation UI, and the
 mobile Navigator UI.
 
-Nothing else launches a run, and there is no Navigator UI. The link and its
-history are described above.
+Nothing else launches a run. The conversation surface described above is
+planning-only: it has no Execute action, and the link and its history are
+described above.
 
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live

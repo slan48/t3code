@@ -91,6 +91,57 @@ export function threadCapabilities(purpose: ThreadPurpose | undefined): ThreadCa
   return purpose === "navigator" ? NAVIGATOR_CAPABILITIES : CODING_CAPABILITIES;
 }
 
+/* ------------------------------------------------------ retained UI state */
+
+/**
+ * Terminal drawer visibility, from the capability and the retained state.
+ *
+ * Terminal UI state is stored per thread and survives a reload, so "this
+ * conversation cannot use terminals" has to be answered against the stored
+ * value rather than only where the toggle is drawn: state written before the
+ * rule existed would otherwise still open a drawer on the next visit.
+ */
+export function terminalDrawerVisible(
+  capabilities: ThreadCapabilities,
+  retainedTerminalOpen: boolean,
+): boolean {
+  return capabilities.canUseTerminals && retainedTerminalOpen;
+}
+
+/**
+ * The right panel surfaces this conversation is allowed to see.
+ *
+ * Same reasoning as the drawer, for the panel's tab strip: a retained terminal
+ * surface has to disappear from the tabs, the active surface and the content
+ * area together, so it is filtered once at the source. Diff, files, plan and
+ * preview surfaces are read-only and stay.
+ *
+ * Teardown code must keep reading the unfiltered list — a hidden terminal is
+ * still a running shell that has to be closed.
+ */
+export function visibleRightPanelSurfaces<Surface extends { readonly kind: string }>(
+  capabilities: ThreadCapabilities,
+  surfaces: ReadonlyArray<Surface>,
+): ReadonlyArray<Surface> {
+  if (capabilities.canUseTerminals) return surfaces;
+  return surfaces.filter((surface) => surface.kind !== "terminal");
+}
+
+/**
+ * Whether the right panel opens at all.
+ *
+ * A panel whose only retained surface was a hidden terminal would otherwise
+ * open onto nothing.
+ */
+export function rightPanelVisible(
+  capabilities: ThreadCapabilities,
+  retainedOpen: boolean,
+  visibleSurfaceCount: number,
+): boolean {
+  if (!retainedOpen) return false;
+  return capabilities.canUseTerminals || visibleSurfaceCount > 0;
+}
+
 /* ------------------------------------------------------------ identity */
 
 /**
