@@ -156,12 +156,53 @@ describe("the facts a run contributes", () => {
     expect(JSON.stringify(facts)).not.toContain("which database");
   });
 
-  it("distinguishes no writer, this bridge, and another process", () => {
-    expect(factsFromSummary(summary({ liveWriter: null })).hasLiveWriter).toBe(false);
-    expect(factsFromSummary(summary()).liveWriterIsThisBridge).toBe(true);
-    const other = factsFromSummary(summary({ liveInThisBridge: false }));
-    expect(other.hasLiveWriter).toBe(true);
-    expect(other.liveWriterIsThisBridge).toBe(false);
+  it("calls the writer this bridge only when BOTH of Peer Loop's signals say so", () => {
+    /*
+     * Two different questions. `liveWriter.isThisProcess` is about who holds
+     * the project's lease; `liveInThisBridge` is about this run. Either alone
+     * would let T3 Code tell a model it is driving a run that another process
+     * is actually driving, so every combination is enumerated here.
+     */
+    const withWriter = (isThisProcess: boolean, liveInThisBridge: boolean) =>
+      factsFromSummary(
+        summary({
+          liveWriter: {
+            pid: 4242,
+            host: "workstation.local",
+            command: "start",
+            runId: "run-77",
+            acquiredAt: "2026-03-01T09:00:00.000Z",
+            renewedAt: "2026-03-01T10:05:00.000Z",
+            isThisProcess,
+          },
+          liveInThisBridge,
+        }),
+      );
+
+    // No writer at all.
+    const none = factsFromSummary(summary({ liveWriter: null, liveInThisBridge: false }));
+    expect(none.hasLiveWriter).toBe(false);
+    expect(none.liveWriterIsThisBridge).toBe(false);
+
+    // A writer that is this process, but Peer Loop does not call the run live
+    // here — another bridge in this process is driving it.
+    const processOnly = withWriter(true, false);
+    expect(processOnly.hasLiveWriter).toBe(true);
+    expect(processOnly.liveWriterIsThisBridge).toBe(false);
+
+    // Peer Loop says the run is live in this bridge, but the lease belongs to
+    // somebody else. Inconsistent signals: the safe reading is "not us".
+    const bridgeFlagOnly = withWriter(false, true);
+    expect(bridgeFlagOnly.hasLiveWriter).toBe(true);
+    expect(bridgeFlagOnly.liveWriterIsThisBridge).toBe(false);
+
+    // Neither.
+    expect(withWriter(false, false).liveWriterIsThisBridge).toBe(false);
+
+    // Both, which is the only case that counts.
+    const ours = withWriter(true, true);
+    expect(ours.hasLiveWriter).toBe(true);
+    expect(ours.liveWriterIsThisBridge).toBe(true);
   });
 });
 

@@ -19,6 +19,7 @@ import {
 } from "~/navigatorCapabilities";
 import { ComposerFooterModeControls } from "./ComposerFooterModeControls";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
+import { providerBlocksComposerSubmit } from "~/navigatorConfirmation";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { PanelLayoutControls } from "./PanelLayoutControls";
 
@@ -170,6 +171,69 @@ describe("panel layout controls", () => {
   it("keeps the terminal toggle for a coding thread", () => {
     const markup = render(true);
     expect(markup).toContain('aria-label="Toggle terminal drawer"');
+  });
+});
+
+/* ------------------------------------------- provider-less confirmation */
+
+describe("the primary send action with no provider configured", () => {
+  /*
+   * `isEnvironmentUnavailable` is what every live primary-action layout passes
+   * `providerBlocksSubmit` into. An eligible confirmation makes that false, so
+   * the same button the submit callback allows is also the one drawn enabled.
+   */
+  const render = (isEnvironmentUnavailable: boolean) =>
+    renderToStaticMarkup(
+      <ComposerPrimaryActions
+        compact={false}
+        pendingAction={null}
+        isRunning={false}
+        showPlanFollowUpPrompt={false}
+        canImplementPlan={false}
+        promptHasText
+        isSendBusy={false}
+        sendDisabledReason={null}
+        isConnecting={false}
+        isEnvironmentUnavailable={isEnvironmentUnavailable}
+        isPreparingWorktree={false}
+        hasSendableContent
+        onPreviousPendingQuestion={() => undefined}
+        onInterrupt={() => undefined}
+        onImplementPlanInNewThread={() => undefined}
+      />,
+    );
+
+  it("is enabled for an eligible confirmation, which needs no provider", () => {
+    const markup = render(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: true,
+        allowsSubmitWithoutProvider: true,
+      }),
+    );
+    expect(markup).not.toContain('disabled=""');
+    expect(markup).toContain('aria-label="Send message"');
+  });
+
+  it("stays disabled for ordinary text with nowhere to send it", () => {
+    const markup = render(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: true,
+        allowsSubmitWithoutProvider: false,
+      }),
+    );
+    expect(markup).toContain('disabled=""');
+    expect(markup).toContain('aria-label="Environment disconnected"');
+  });
+
+  it("is unchanged when a provider is available", () => {
+    expect(
+      render(
+        providerBlocksComposerSubmit({
+          noProviderAvailable: false,
+          allowsSubmitWithoutProvider: false,
+        }),
+      ),
+    ).not.toContain('disabled=""');
   });
 });
 

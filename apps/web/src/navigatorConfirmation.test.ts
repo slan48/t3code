@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   composerSubmitBlocked,
   consumeNavigatorConfirmation,
+  providerBlocksComposerSubmit,
   isNavigatorExecutionConfirmation,
   NAVIGATOR_CONFIRMATION_PHRASES,
   normalizeConfirmationText,
@@ -281,68 +282,70 @@ describe("consuming a routed send", () => {
 /* ------------------------------------------------- submitting with no provider */
 
 describe("submitting when no provider is configured", () => {
-  const blocked = (input: {
-    readonly noProviderAvailable: boolean;
-    readonly isSendDisabled?: boolean;
-    readonly allowsSubmitWithoutProvider?: boolean;
-  }) =>
-    composerSubmitBlocked({
-      noProviderAvailable: input.noProviderAvailable,
-      isSendDisabled: input.isSendDisabled ?? false,
-      allowsSubmitWithoutProvider: input.allowsSubmitWithoutProvider ?? false,
+  const providerBlocks = (overrides: Partial<Parameters<typeof routeNavigatorSend>[0]> = {}) =>
+    providerBlocksComposerSubmit({
+      noProviderAvailable: true,
+      allowsSubmitWithoutProvider: route(overrides).kind === "execute",
     });
 
-  it("lets an exact eligible confirmation through", () => {
-    // Executing calls Peer Loop's own operation. Refusing the press because
-    // the *conversation's* provider is missing refuses the one action that
-    // would still have worked.
-    expect(
-      blocked({
-        noProviderAvailable: true,
-        allowsSubmitWithoutProvider: route().kind === "execute",
-      }),
-    ).toBe(false);
+  it("does not block an exact eligible confirmation", () => {
+    // Executing calls Peer Loop's own operation. Refusing it because the
+    // *conversation's* provider is missing refuses the one action that would
+    // still have worked — and, before this, drew its button disabled too.
+    expect(providerBlocks()).toBe(false);
   });
 
-  it("still refuses ordinary conversation with nowhere to send it", () => {
+  it("still blocks ordinary conversation with nowhere to send it", () => {
     for (const overrides of [
       { text: "let's do it after changing the database" },
       { text: "what about step 3?" },
+      { text: "¿hagamos eso?" },
+      { text: "/execute the proposal" },
       { purpose: "coding" as const },
+      { isDurableThread: false },
       { proposal: null },
       { hasAttachments: true },
     ]) {
-      expect(
-        blocked({
-          noProviderAvailable: true,
-          allowsSubmitWithoutProvider: route(overrides).kind === "execute",
-        }),
-        JSON.stringify(overrides),
-      ).toBe(true);
+      expect(providerBlocks(overrides), JSON.stringify(overrides)).toBe(true);
     }
+  });
+
+  it("blocks nothing at all when a provider is available", () => {
+    expect(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: false,
+        allowsSubmitWithoutProvider: false,
+      }),
+    ).toBe(false);
+    expect(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: false,
+        allowsSubmitWithoutProvider: true,
+      }),
+    ).toBe(false);
   });
 
   it("never overrides the composer's own reason for refusing", () => {
     // Messages still loading, an image still compressing: not about providers,
     // and a confirmation does not get to skip them.
-    expect(
-      blocked({
-        noProviderAvailable: true,
-        isSendDisabled: true,
-        allowsSubmitWithoutProvider: true,
-      }),
-    ).toBe(true);
-    expect(
-      blocked({
-        noProviderAvailable: false,
-        isSendDisabled: true,
-        allowsSubmitWithoutProvider: true,
-      }),
-    ).toBe(true);
+    expect(composerSubmitBlocked({ providerBlocksSubmit: false, isSendDisabled: true })).toBe(true);
+    expect(composerSubmitBlocked({ providerBlocksSubmit: true, isSendDisabled: true })).toBe(true);
   });
 
-  it("changes nothing when a provider is available", () => {
-    expect(blocked({ noProviderAvailable: false })).toBe(false);
-    expect(blocked({ noProviderAvailable: false, allowsSubmitWithoutProvider: true })).toBe(false);
+  it("is the same value the submit callback and the controls both read", () => {
+    /*
+     * THE DEFECT THIS CLOSES. The callback allowed an eligible confirmation
+     * while every visible control consulted `noProviderAvailable` directly, so
+     * the press that would have worked was drawn disabled. One derived value,
+     * one answer.
+     */
+    const eligible = providerBlocks();
+    expect(composerSubmitBlocked({ providerBlocksSubmit: eligible, isSendDisabled: false })).toBe(
+      false,
+    );
+    const ordinary = providerBlocks({ text: "what about step 3?" });
+    expect(composerSubmitBlocked({ providerBlocksSubmit: ordinary, isSendDisabled: false })).toBe(
+      true,
+    );
   });
 });

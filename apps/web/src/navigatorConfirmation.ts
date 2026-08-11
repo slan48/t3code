@@ -189,24 +189,36 @@ export async function consumeNavigatorConfirmation(input: {
 /* -------------------------------------------------- composer submission */
 
 /**
- * Whether the composer must refuse this submission outright.
+ * Whether a missing provider is blocking this composer right now.
  *
- * It lives here because it exists only because of this feature. Executing a
- * proposal calls Peer Loop's own operation and never touches the Navigator
- * conversation's provider, so a composer that refuses the press for a missing
- * provider refuses the one action that would still have worked. Widening the
- * rule any further than "an exact eligible confirmation" would let ordinary
- * messages be submitted with nowhere to send them.
+ * ONE ANSWER, USED EVERYWHERE. The bug this replaces was a composer whose
+ * submit callback allowed an eligible confirmation through while every visible
+ * control still read `noProviderAvailable` directly — so the button that would
+ * have worked was drawn disabled. A single derived value, consulted by the
+ * callback and by each layout's disabled calculation, is what keeps those from
+ * disagreeing again.
  *
- * `isSendDisabled` still wins: that is the composer's own reason — messages
- * loading, an image still compressing — and it is not about the provider.
+ * Narrow on purpose: `allowsSubmitWithoutProvider` is true only for an exact,
+ * eligible Navigator execution confirmation, which calls Peer Loop's own
+ * operation and never needs this conversation's provider.
  */
-export function composerSubmitBlocked(input: {
+export function providerBlocksComposerSubmit(input: {
   readonly noProviderAvailable: boolean;
-  readonly isSendDisabled: boolean;
-  /** `routeNavigatorSend` said this text is an eligible confirmation. */
   readonly allowsSubmitWithoutProvider: boolean;
 }): boolean {
-  if (input.isSendDisabled) return true;
   return input.noProviderAvailable && !input.allowsSubmitWithoutProvider;
+}
+
+/**
+ * Whether the composer must refuse this submission outright.
+ *
+ * `isSendDisabled` still wins: that is the composer's own reason — messages
+ * loading, an image still compressing — and it is not about the provider, so a
+ * confirmation does not get to skip it.
+ */
+export function composerSubmitBlocked(input: {
+  readonly providerBlocksSubmit: boolean;
+  readonly isSendDisabled: boolean;
+}): boolean {
+  return input.isSendDisabled || input.providerBlocksSubmit;
 }

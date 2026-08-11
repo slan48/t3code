@@ -99,7 +99,15 @@ export interface NavigatorExecutionFacts {
   readonly haltKind: string | null;
   readonly queuedOwnerMessages: number;
   readonly hasLiveWriter: boolean;
-  /** True when the live writer is the bridge this server spawned. */
+  /**
+   * True only when a writer exists, it is this process, AND Peer Loop says the
+   * run is live in this bridge.
+   *
+   * BOTH SIGNALS, because they answer different questions and can disagree.
+   * `liveWriter.isThisProcess` is about who holds the project's lease;
+   * `liveInThisBridge` is about this run. Either one alone would let T3 Code
+   * tell a model it is driving a run that another process is actually driving.
+   */
   readonly liveWriterIsThisBridge: boolean;
 }
 
@@ -111,10 +119,9 @@ export function factsFromSummary(summary: PeerLoopRunSummary): NavigatorExecutio
     haltKind: summary.haltReason?.kind ?? null,
     queuedOwnerMessages: summary.queuedOwnerMessages,
     hasLiveWriter: summary.liveWriter !== null,
-    // Peer Loop's own answer. `liveWriter.isThisProcess` is about the bridge
-    // holding the lease; `liveInThisBridge` is about this run. Both have to be
-    // true for the run to be one this server is driving.
-    liveWriterIsThisBridge: summary.liveWriter !== null && summary.liveInThisBridge,
+    // Peer Loop's own two answers, and both must agree. See the field's doc.
+    liveWriterIsThisBridge:
+      summary.liveWriter !== null && summary.liveWriter.isThisProcess && summary.liveInThisBridge,
   };
 }
 

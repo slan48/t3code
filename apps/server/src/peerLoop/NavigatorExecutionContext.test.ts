@@ -21,6 +21,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import { describe, expect } from "vite-plus/test";
 
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -102,6 +104,10 @@ const stateFile = (overrides: Partial<PeerLoopRunStateFile> = {}): PeerLoopRunSt
     ...overrides,
   }) as PeerLoopRunStateFile;
 
+/** The service, provided from a per-test layer. */
+const context = (layer: Layer.Layer<NavigatorExecutionContext>) =>
+  Effect.service(NavigatorExecutionContext).pipe(Effect.provide(layer));
+
 const navigatorThread = (
   links: ReadonlyArray<OrchestrationPeerLoopExecution>,
 ): NavigatorExecutionContextThread => ({
@@ -118,9 +124,9 @@ interface Calls {
 }
 
 const harness = (options?: {
-  readonly runs?: ReadonlyArray<PeerLoopRunSummary> | "fail";
+  readonly runs?: ReadonlyArray<PeerLoopRunSummary> | "fail" | "interrupt" | "defect";
   readonly unreadable?: ReadonlyArray<string>;
-  readonly snapshots?: Readonly<Record<string, PeerLoopRunStateFile | "fail">>;
+  readonly snapshots?: Readonly<Record<string, PeerLoopRunStateFile | "fail" | "interrupt">>;
   readonly project?: "missing" | "fails";
 }) => {
   const calls: Calls = { list: [], attach: [], projectLookups: [] };
@@ -128,13 +134,22 @@ const harness = (options?: {
   const peerLoopLayer = Layer.mock(PeerLoopService)({
     listRuns: (input: PeerLoopListRunsInput) => {
       calls.list.push(input);
-      return options?.runs === "fail"
-        ? Effect.fail(new PeerLoopUnavailableError({ reason: "bridge is not installed" }))
-        : Effect.succeed({ runs: options?.runs ?? [], unreadable: options?.unreadable ?? [] });
+      if (options?.runs === "fail") {
+        return Effect.fail(new PeerLoopUnavailableError({ reason: "bridge is not installed" }));
+      }
+      // Not typed failures: a cancelled turn and a bug in this process. Both
+      // must travel, not be reported to a model as a remote status.
+      if (options?.runs === "interrupt") return Effect.interrupt as never;
+      if (options?.runs === "defect") return Effect.die("listRuns exploded") as never;
+      return Effect.succeed({
+        runs: options?.runs ?? [],
+        unreadable: options?.unreadable ?? [],
+      });
     },
     attachRun: (input: PeerLoopAttachRunInput) => {
       calls.attach.push(input.runId);
       const snapshot = options?.snapshots?.[input.runId];
+      if (snapshot === "interrupt") return Effect.interrupt as never;
       if (snapshot === undefined || snapshot === "fail") {
         return Effect.fail(new PeerLoopUnavailableError({ reason: "snapshot unavailable" }));
       }
@@ -470,8 +485,8 @@ describe("when Peer Loop cannot be read", () => {
       const context = yield* NavigatorExecutionContext;
       const result = (yield* context.forThread(navigatorThread([link({ runId: "run-77" })]))) ?? "";
       expect(result).toContain("Structured execution status is unavailable");
-      // Nothing from the Cause reaches the provider. A bridge error is exactly
-      // the kind of text that carries paths and diagnostics.
+      // Nothing from the error reaches the provider. A bridge failure is
+      // exactly the kind of text that carries paths and diagnostics.
       expect(result).not.toContain("bridge is not installed");
       // And no second attempt was made.
       expect(calls.list).toHaveLength(1);
@@ -479,13 +494,49 @@ describe("when Peer Loop cannot be read", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("still names the links it has, with no state claimed for them", () => {
-    const { layer } = harness({ runs: "fail" });
+  it.effect("claims nothing about any individual run", () => {
+    /*
+     * A FAILED READ ESTABLISHES NOTHING. "Peer Loop is not currently listing
+     * this run" is an answer a *successful* list gives; saying it because the
+     * read failed would tell the model a healthy run had vanished.
+     */
+    const { calls, layer } = harness({ runs: "fail" });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(navigatorThread([link({ runId: "run-77" })]))) ?? "";
-      expect(result).toContain("run run-77");
+      const result =
+        (yield* context.forThread(
+          navigatorThread([
+            link({ runId: "run-77", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-78", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
+        )) ?? "";
+      expect(result).not.toContain("not currently listing this run");
+      expect(result).not.toContain("could not read this run's record");
+      expect(result).not.toContain("state:");
+      expect(result).not.toContain("run run-77");
+      expect(result).not.toContain("run run-78");
+      // One sentence, and no attach attempts for runs whose state is unknown.
+      expect(calls.attach).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("keeps the missing and unreadable wording when the list actually succeeds", () => {
+    // The other half of the same rule: a successful list that genuinely omits a
+    // run, or names it unreadable, still says so explicitly.
+    const { layer } = harness({ runs: [], unreadable: ["run-broken"] });
+    return Effect.gen(function* () {
+      const context = yield* NavigatorExecutionContext;
+      const result =
+        (yield* context.forThread(
+          navigatorThread([
+            link({ runId: "run-gone", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-broken", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
+        )) ?? "";
+      expect(result).toContain("run run-gone");
       expect(result).toContain("not currently listing this run");
+      expect(result).toContain("could not read this run's record");
+      expect(result).not.toContain("Structured execution status is unavailable");
     }).pipe(Effect.provide(layer));
   });
 
@@ -511,4 +562,100 @@ describe("when Peer Loop cannot be read", () => {
       expect(calls.list).toEqual([]);
     }).pipe(Effect.provide(layer));
   });
+});
+
+/* ------------------------------------------------- typed versus not typed */
+
+describe("which failures degrade and which travel", () => {
+  it.effect("an interrupted list stays interrupted", () =>
+    Effect.gen(function* () {
+      /*
+       * A CANCELLED TURN IS NOT A PEER LOOP STATUS.
+       *
+       * `Effect.catchCause` would have turned this into "structured execution
+       * status is unavailable" and let the rest of the turn run — the fiber
+       * would keep working after its scope asked it to stop. Deterministic: the
+       * fake interrupts immediately, so there is nothing to sleep on.
+       */
+      const { calls, layer } = harness({ runs: "interrupt" });
+      const exit = yield* context(layer)
+        .pipe(
+          Effect.flatMap((service) =>
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
+          ),
+        )
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+      expect(calls.list).toHaveLength(1);
+      expect(calls.attach).toEqual([]);
+    }),
+  );
+
+  it.effect("a defect in the list is not reported as a remote status", () =>
+    Effect.gen(function* () {
+      // A bug in this process. Presenting it as "Peer Loop is unavailable"
+      // would hide a crash behind a sentence about somebody else's software.
+      const { layer } = harness({ runs: "defect" });
+      const exit = yield* context(layer)
+        .pipe(
+          Effect.flatMap((service) =>
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
+          ),
+        )
+        .pipe(Effect.exit);
+      expect(Exit.isSuccess(exit)).toBe(false);
+      // A defect, not an interruption — and certainly not a rendered sentence.
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(false);
+      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(true);
+    }),
+  );
+
+  it.effect("a typed attach failure degrades only that run", () =>
+    Effect.gen(function* () {
+      const { calls, layer } = harness({
+        runs: [
+          summary({ runId: "run-bad", state: "done" }),
+          summary({ runId: "run-ok", state: "done" }),
+        ],
+        snapshots: {
+          "run-bad": "fail",
+          "run-ok": stateFile({
+            lastReviewerDecision: { decision: "DONE", summary: "Shipped.", finalState: "Green." },
+          }),
+        },
+      });
+      const result = yield* context(layer).pipe(
+        Effect.flatMap((service) =>
+          service.forThread(
+            navigatorThread([
+              link({ runId: "run-bad", createdAt: "2026-03-02T10:00:00.000Z" }),
+              link({ runId: "run-ok", createdAt: "2026-03-01T10:00:00.000Z" }),
+            ]),
+          ),
+        ),
+      );
+      expect(result).toContain("structured detail unavailable");
+      expect(result).toContain("reviewer summary: Shipped.");
+      expect(calls.attach.toSorted()).toEqual(["run-bad", "run-ok"]);
+    }),
+  );
+
+  it.effect("an interrupted attach stays interrupted", () =>
+    Effect.gen(function* () {
+      const { layer } = harness({
+        runs: [summary({ runId: "run-77", state: "done" })],
+        snapshots: { "run-77": "interrupt" },
+      });
+      const exit = yield* context(layer)
+        .pipe(
+          Effect.flatMap((service) =>
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
+          ),
+        )
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+    }),
+  );
 });

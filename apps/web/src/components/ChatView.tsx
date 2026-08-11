@@ -2368,17 +2368,9 @@ function ChatViewContent(props: ChatViewProps) {
    * exactly the behaviour it has: no provider, no turn.
    */
   const allowsSubmitWithoutProvider = useCallback(
-    (text: string): boolean => {
-      const sendCtx = composerRef.current?.getSendContext();
-      if (!sendCtx) return false;
-      return (
-        navigatorSendRouteFor({
-          text,
-          hasAttachments: composerSendContextHasAttachments(sendCtx),
-        }).kind === "execute"
-      );
-    },
-    [composerRef, navigatorSendRouteFor],
+    (input: { readonly text: string; readonly hasAttachments: boolean }): boolean =>
+      navigatorSendRouteFor(input).kind === "execute",
+    [navigatorSendRouteFor],
   );
   /*
    * The sidebar shows whichever proposal the turn is about, and that can be a

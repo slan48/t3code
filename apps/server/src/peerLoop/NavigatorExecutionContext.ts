@@ -90,11 +90,17 @@ const make = Effect.gen(function* () {
   const peerLoop = yield* PeerLoopService;
 
   /**
-   * Peer Loop's view of this project, or the reason there isn't one.
+   * Peer Loop's view of this project, or the fact that there isn't one.
    *
-   * The failure is swallowed here deliberately and only the category survives.
-   * A `PeerLoopError` carries a refusal detail, a transport message or a
-   * protocol excerpt, and none of that should be describable to a model.
+   * `Effect.catch`, NOT `Effect.catchCause`. Only the typed `PeerLoopError`
+   * channel degrades — the bridge is not installed, refused, timed out. A
+   * defect is a bug in this process and an interruption is the turn being
+   * cancelled; dressing either as "Peer Loop is unavailable" would report a
+   * crash as a remote status and would keep a cancelled fiber running.
+   *
+   * The error itself is logged and never returned: a `PeerLoopError` carries a
+   * refusal detail, a transport message or a protocol excerpt, and none of that
+   * should be describable to a model.
    */
   const readRuns = Effect.fn("NavigatorExecutionContext.readRuns")(function* (projectPath: string) {
     return yield* peerLoop.listRuns({ projectPath }).pipe(
@@ -103,10 +109,10 @@ const make = Effect.gen(function* () {
         unreadable: result.unreadable,
         failed: false as const,
       })),
-      Effect.catchCause((cause) =>
+      Effect.catch((error) =>
         Effect.logWarning("navigator execution context could not read Peer Loop runs", {
           // Logged, never rendered.
-          cause,
+          error,
         }).pipe(
           Effect.as({
             runs: [] as ReadonlyArray<PeerLoopRunSummary>,
@@ -132,10 +138,11 @@ const make = Effect.gen(function* () {
       Effect.map((snapshot) =>
         detailFromSnapshot({ state: snapshot.state, expected: input.expected }),
       ),
-      Effect.catchCause((cause) =>
+      // Typed failures only, for the same reason as `readRuns` above.
+      Effect.catch((error) =>
         Effect.logWarning("navigator execution context could not read a run snapshot", {
           runId: input.runId,
-          cause,
+          error,
         }).pipe(Effect.as({ kind: "unavailable" } as const)),
       ),
     );
@@ -166,6 +173,19 @@ const make = Effect.gen(function* () {
     }
 
     const listed = yield* readRuns(projectOption.value.workspaceRoot);
+    if (listed.failed) {
+      /*
+       * A FAILED READ ESTABLISHES NOTHING ABOUT ANY RUN.
+       *
+       * It says T3 Code could not ask, not that a run is missing or unreadable
+       * — those are answers a *successful* list gives. Rendering entries from
+       * an empty substitute list would tell the model "Peer Loop is not
+       * currently listing this run" about runs that are very likely fine. One
+       * bounded sentence, no per-run claims, and no attach attempts.
+       */
+      return renderNavigatorExecutionContext({ entries: [], degraded: "status-unavailable" });
+    }
+
     const summaryByRunId = new Map<string, PeerLoopRunSummary>(
       listed.runs.map((run) => [run.runId, run]),
     );
@@ -206,10 +226,7 @@ const make = Effect.gen(function* () {
       detail: details[index] ?? { kind: "none" },
     }));
 
-    return renderNavigatorExecutionContext({
-      entries,
-      ...(listed.failed ? { degraded: "status-unavailable" as const } : {}),
-    });
+    return renderNavigatorExecutionContext({ entries });
   });
 
   return NavigatorExecutionContext.of({ forThread });

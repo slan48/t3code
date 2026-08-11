@@ -88,7 +88,7 @@ import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "../Compos
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { type ComposerCommandItem, ComposerCommandMenu } from "./ComposerCommandMenu";
 import type { ThreadCapabilities } from "~/navigatorCapabilities";
-import { composerSubmitBlocked } from "~/navigatorConfirmation";
+import { composerSubmitBlocked, providerBlocksComposerSubmit } from "~/navigatorConfirmation";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
@@ -386,8 +386,14 @@ export interface ChatComposerProps {
    * refusing the press for a missing provider would refuse the one action that
    * still works. Everything else keeps the behaviour it has: no provider, no
    * submit. A caller that does not pass this changes nothing.
+   *
+   * The attachment flag comes from here rather than being read back off the
+   * composer's ref, so the answer is derived from the same reactive state the
+   * controls are rendered from and cannot lag behind them.
    */
-  allowsSubmitWithoutProvider?: ((text: string) => boolean) | undefined;
+  allowsSubmitWithoutProvider?:
+    | ((input: { readonly text: string; readonly hasAttachments: boolean }) => boolean)
+    | undefined;
   isPreparingWorktree: boolean;
   environmentUnavailable: {
     readonly label: string;
@@ -905,6 +911,38 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ],
   );
 
+  /*
+   * Is a missing provider blocking this composer right now?
+   *
+   * DERIVED ONCE, FROM THE SAME REACTIVE STATE THE CONTROLS RENDER FROM, and
+   * read by the submit callback and by every layout's disabled calculation.
+   * The bug this replaces let the callback allow an eligible confirmation
+   * through while each visible control still consulted `noProviderAvailable`
+   * directly — so the one press that would have worked was drawn disabled.
+   *
+   * Everything else is untouched: ordinary text, an ineligible confirmation,
+   * anything with an attachment, and every non-provider disable reason keep
+   * exactly the behaviour they had.
+   */
+  const composerHasAttachments =
+    composerImages.length > 0 ||
+    composerTerminalContexts.length > 0 ||
+    composerElementContexts.length > 0 ||
+    composerPreviewAnnotations.length > 0 ||
+    composerReviewComments.length > 0;
+  const providerBlocksSubmit = useMemo(
+    () =>
+      providerBlocksComposerSubmit({
+        noProviderAvailable,
+        allowsSubmitWithoutProvider:
+          allowsSubmitWithoutProvider?.({
+            text: prompt,
+            hasAttachments: composerHasAttachments,
+          }) ?? false,
+      }),
+    [allowsSubmitWithoutProvider, composerHasAttachments, noProviderAvailable, prompt],
+  );
+
   // ------------------------------------------------------------------
   // Derived: composer trigger / menu
   // ------------------------------------------------------------------
@@ -1120,7 +1158,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isSendBusy ||
     isSendDisabled ||
     isConnecting ||
-    noProviderAvailable ||
+    providerBlocksSubmit ||
     projectSelectionRequired ||
     environmentUnavailable !== null ||
     !composerSendState.hasSendableContent;
@@ -1665,7 +1703,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       isSendBusy ||
       isSendDisabled ||
       isConnecting ||
-      noProviderAvailable ||
+      providerBlocksSubmit ||
       environmentUnavailable !== null ||
       phase === "running"
     ) {
@@ -1684,22 +1722,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isMobileViewport,
     isSendBusy,
     isSendDisabled,
-    noProviderAvailable,
     phase,
+    providerBlocksSubmit,
     showPlanFollowUpPrompt,
   ]);
 
   const submitComposer = useCallback(
     (event?: { preventDefault: () => void }) => {
-      // The one text that gets past a missing provider. See the prop's doc.
-      if (
-        composerSubmitBlocked({
-          noProviderAvailable,
-          isSendDisabled,
-          allowsSubmitWithoutProvider:
-            noProviderAvailable && (allowsSubmitWithoutProvider?.(promptRef.current) ?? false),
-        })
-      ) {
+      // The same value the controls are drawn from. See `providerBlocksSubmit`.
+      if (composerSubmitBlocked({ providerBlocksSubmit, isSendDisabled })) {
         event?.preventDefault();
         return;
       }
@@ -1723,12 +1754,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [
       activeThreadId,
-      allowsSubmitWithoutProvider,
       blurMobileComposerAfterSend,
       isSendDisabled,
-      noProviderAvailable,
       onSend,
-      promptRef,
+      providerBlocksSubmit,
       shouldBlurMobileComposerOnSubmit,
     ],
   );
@@ -2685,7 +2714,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       isConnecting={isConnecting}
                       isEnvironmentUnavailable={
                         environmentUnavailable !== null ||
-                        noProviderAvailable ||
+                        providerBlocksSubmit ||
                         projectSelectionRequired
                       }
                       isPreparingWorktree={false}
@@ -2969,7 +2998,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isConnecting={isConnecting}
                     isEnvironmentUnavailable={
                       environmentUnavailable !== null ||
-                      noProviderAvailable ||
+                      providerBlocksSubmit ||
                       projectSelectionRequired
                     }
                     isPreparingWorktree={false}
@@ -3106,7 +3135,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   isConnecting={isConnecting}
                   isEnvironmentUnavailable={
                     environmentUnavailable !== null ||
-                    noProviderAvailable ||
+                    providerBlocksSubmit ||
                     projectSelectionRequired
                   }
                   isPreparingWorktree={isPreparingWorktree}
