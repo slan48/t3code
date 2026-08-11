@@ -10,6 +10,7 @@ import type { OrchestrationProposedPlanId } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  composerSubmitBlocked,
   consumeNavigatorConfirmation,
   isNavigatorExecutionConfirmation,
   NAVIGATOR_CONFIRMATION_PHRASES,
@@ -274,5 +275,74 @@ describe("consuming a routed send", () => {
       expect(execute, JSON.stringify(overrides)).not.toHaveBeenCalled();
       expect(clearComposer, JSON.stringify(overrides)).not.toHaveBeenCalled();
     }
+  });
+});
+
+/* ------------------------------------------------- submitting with no provider */
+
+describe("submitting when no provider is configured", () => {
+  const blocked = (input: {
+    readonly noProviderAvailable: boolean;
+    readonly isSendDisabled?: boolean;
+    readonly allowsSubmitWithoutProvider?: boolean;
+  }) =>
+    composerSubmitBlocked({
+      noProviderAvailable: input.noProviderAvailable,
+      isSendDisabled: input.isSendDisabled ?? false,
+      allowsSubmitWithoutProvider: input.allowsSubmitWithoutProvider ?? false,
+    });
+
+  it("lets an exact eligible confirmation through", () => {
+    // Executing calls Peer Loop's own operation. Refusing the press because
+    // the *conversation's* provider is missing refuses the one action that
+    // would still have worked.
+    expect(
+      blocked({
+        noProviderAvailable: true,
+        allowsSubmitWithoutProvider: route().kind === "execute",
+      }),
+    ).toBe(false);
+  });
+
+  it("still refuses ordinary conversation with nowhere to send it", () => {
+    for (const overrides of [
+      { text: "let's do it after changing the database" },
+      { text: "what about step 3?" },
+      { purpose: "coding" as const },
+      { proposal: null },
+      { hasAttachments: true },
+    ]) {
+      expect(
+        blocked({
+          noProviderAvailable: true,
+          allowsSubmitWithoutProvider: route(overrides).kind === "execute",
+        }),
+        JSON.stringify(overrides),
+      ).toBe(true);
+    }
+  });
+
+  it("never overrides the composer's own reason for refusing", () => {
+    // Messages still loading, an image still compressing: not about providers,
+    // and a confirmation does not get to skip them.
+    expect(
+      blocked({
+        noProviderAvailable: true,
+        isSendDisabled: true,
+        allowsSubmitWithoutProvider: true,
+      }),
+    ).toBe(true);
+    expect(
+      blocked({
+        noProviderAvailable: false,
+        isSendDisabled: true,
+        allowsSubmitWithoutProvider: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("changes nothing when a provider is available", () => {
+    expect(blocked({ noProviderAvailable: false })).toBe(false);
+    expect(blocked({ noProviderAvailable: false, allowsSubmitWithoutProvider: true })).toBe(false);
   });
 });

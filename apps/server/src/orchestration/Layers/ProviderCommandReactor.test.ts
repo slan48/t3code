@@ -5,10 +5,14 @@ import * as NodePath from "node:path";
 
 import {
   ModelSelection,
+  PeerLoopUnavailableError,
   ProviderRuntimeEvent,
   ProviderSession,
   ProviderDriverKind,
   ProviderInstanceId,
+  type PeerLoopListRunsInput,
+  type PeerLoopRunStateFile,
+  type PeerLoopRunSummary,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import {
@@ -60,6 +64,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { NAVIGATOR_PROVIDER_FRAME } from "../navigatorProviderFrame.ts";
+import * as NavigatorExecutionContext from "../../peerLoop/NavigatorExecutionContext.ts";
+import {
+  NAVIGATOR_CONTEXT_HEADING,
+  NAVIGATOR_CONTEXT_MAX_CHARS,
+  NAVIGATOR_CONTEXT_TRUNCATION_MARKER,
+} from "../../peerLoop/navigatorExecutionContextFormat.ts";
+import { PeerLoopService } from "../../peerLoop/Service.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
 
@@ -151,6 +162,16 @@ describe("ProviderCommandReactor", () => {
     readonly titleRegenerationBeforeStart?: "one" | "two";
     /** Create the thread as a Navigator conversation instead of a coding one. */
     readonly threadPurpose?: "coding" | "navigator";
+    /**
+     * Peer Loop runs this project has, as the bridge would report them.
+     *
+     * Absent means Peer Loop is wired but has nothing; `"fail"` means the read
+     * itself fails, which is a different case from an empty list.
+     */
+    readonly peerLoopRuns?: ReadonlyArray<PeerLoopRunSummary> | "fail";
+    readonly peerLoopUnreadable?: ReadonlyArray<string>;
+    /** Durable snapshots by run id, for the read-only `attachRun`. */
+    readonly peerLoopSnapshots?: Readonly<Record<string, PeerLoopRunStateFile | "fail">>;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -162,6 +183,8 @@ describe("ProviderCommandReactor", () => {
     const { stateDir } = deriveServerPathsSync(baseDir, undefined);
     createdStateDirs.add(stateDir);
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+    const peerLoopListCalls: Array<PeerLoopListRunsInput> = [];
+    const peerLoopAttachCalls: Array<string> = [];
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
     const modelSelection = input?.threadModelSelection ?? {
@@ -384,7 +407,67 @@ describe("ProviderCommandReactor", () => {
         } satisfies OrchestrationEngineService["Service"];
       }),
     ).pipe(Layer.provide(orchestrationLayer));
+    /*
+     * The real `NavigatorExecutionContext` over a recording Peer Loop.
+     *
+     * A stub of the context service would prove the reactor calls something;
+     * this proves what actually matters — that a coding turn and a link-free
+     * Navigator turn reach the bridge zero times, and that a linked one asks
+     * exactly once, scoped to its own project.
+     */
+    const navigatorContextLayer = NavigatorExecutionContext.layer.pipe(
+      Layer.provide(
+        Layer.mock(PeerLoopService)({
+          listRuns: (listInput) => {
+            peerLoopListCalls.push(listInput);
+            return input?.peerLoopRuns === "fail"
+              ? Effect.fail(
+                  new PeerLoopUnavailableError({ reason: "peer loop is not installed here" }),
+                )
+              : Effect.succeed({
+                  runs: input?.peerLoopRuns ?? [],
+                  unreadable: input?.peerLoopUnreadable ?? [],
+                });
+          },
+          attachRun: (attachInput) => {
+            peerLoopAttachCalls.push(attachInput.runId);
+            const snapshot = input?.peerLoopSnapshots?.[attachInput.runId];
+            if (snapshot === undefined || snapshot === "fail") {
+              return Effect.fail(new PeerLoopUnavailableError({ reason: "snapshot unavailable" }));
+            }
+            return Effect.succeed({
+              runId: attachInput.runId,
+              state: snapshot,
+              control: {
+                available: false,
+                reason: "not_attached",
+                resumable: true,
+                liveWriter: null,
+              },
+              eventHighWaterMark: 0,
+              replayFromSeq: 0,
+              live: false,
+            });
+          },
+          // EVERY MUTATION AND THE SUBSCRIPTION DIE. Context construction that
+          // touched one of these would fail the test that provoked it rather
+          // than quietly starting or changing a run.
+          status: () => Effect.die("status must not be called to build context"),
+          startRun: () => Effect.die("startRun must not be called to build context"),
+          resumeRun: () => Effect.die("resumeRun must not be called to build context"),
+          sendOwnerMessage: () =>
+            Effect.die("sendOwnerMessage must not be called to build context"),
+          pauseRun: () => Effect.die("pauseRun must not be called to build context"),
+          recoverRun: () => Effect.die("recoverRun must not be called to build context"),
+          subscribeEvents: () => Stream.die("subscribeEvents must not be called to build context"),
+          diagnostics: Effect.succeed([]),
+        }),
+      ),
+      Layer.provide(projectionSnapshotLayer),
+    );
+
     const layer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(navigatorContextLayer),
       Layer.provideMerge(reactorOrchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
@@ -514,6 +597,8 @@ describe("ProviderCommandReactor", () => {
       stateDir,
       drain,
       runEffect,
+      peerLoopListCalls,
+      peerLoopAttachCalls,
       get titleRegenerationCompletionDispatchAttempts() {
         return titleRegenerationCompletionDispatchAttempts;
       },
@@ -2826,6 +2911,64 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.activeTurnId).toBeNull();
   });
 
+  const navigatorRunSummary = (
+    overrides: Partial<PeerLoopRunSummary> = {},
+  ): PeerLoopRunSummary => ({
+    runId: "run-77",
+    projectPath: "/tmp/provider-project",
+    state: "builder_working",
+    iteration: 3,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:05:00.000Z",
+    haltReason: null,
+    inFlight: null,
+    queuedOwnerMessages: 0,
+    lastSequence: 4,
+    awaitingOwnerObjective: false,
+    adapters: {
+      reviewer: "codex",
+      reviewerVersion: null,
+      builder: "claude-code",
+      builderVersion: null,
+    },
+    liveWriter: null,
+    liveInThisBridge: false,
+    ...overrides,
+  });
+
+  const navigatorRunStateFile = (
+    overrides: Partial<PeerLoopRunStateFile> = {},
+  ): PeerLoopRunStateFile =>
+    ({
+      schemaVersion: 1,
+      runId: "run-77",
+      projectPath: "/tmp/provider-project",
+      state: "done",
+      iteration: 3,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:05:00.000Z",
+      ownerPolicyText: "",
+      builderSessionId: null,
+      reviewerThreadId: null,
+      repo: null,
+      lastBuilderTask: null,
+      lastBuilderReport: null,
+      lastReviewerDecision: null,
+      queuedOwnerMessages: [],
+      inFlight: null,
+      haltReason: null,
+      stopRequested: false,
+      adapters: {
+        reviewer: "codex",
+        reviewerVersion: null,
+        builder: "claude-code",
+        builderVersion: null,
+      },
+      safetyLimit: null,
+      lastSequence: 4,
+      ...overrides,
+    }) as PeerLoopRunStateFile;
+
   describe("navigator provider role frame", () => {
     /*
      * The frame is applied at the shared turn-start boundary, so it reaches every
@@ -2900,6 +3043,218 @@ describe("ProviderCommandReactor", () => {
       // Identical, not merely equivalent: an ordinary turn is untouched by this.
       expect(sent?.input).toBe(OWNER_TEXT);
       expect(sent?.input).not.toContain("You are Navigator");
+      // And it reached Peer Loop zero times on the way.
+      expect(harness.peerLoopListCalls).toEqual([]);
+      expect(harness.peerLoopAttachCalls).toEqual([]);
+    });
+
+    it("adds no execution section, and asks Peer Loop nothing, with no links", async () => {
+      const harness = await createHarness({
+        threadPurpose: "navigator",
+        peerLoopRuns: [navigatorRunSummary()],
+      });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-navigator-turn-no-links"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("navigator-message-no-links"),
+            role: "user",
+            text: OWNER_TEXT,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      // Byte for byte the framing this conversation had before context existed.
+      expect(sent?.input).toBe(`${NAVIGATOR_PROVIDER_FRAME}\n\n---\n\n${OWNER_TEXT}`);
+      expect(sent?.input).not.toContain(NAVIGATOR_CONTEXT_HEADING);
+      /*
+       * THE ZERO-CALL BOUNDARY, AT THE REAL SEAM.
+       *
+       * The bridge is wired and has a run to report; the conversation has no
+       * links, so nothing is asked. The first Peer Loop call is what spawns
+       * `peer-loop`, and an install that has never executed anything must not
+       * spawn it on an ordinary Navigator turn.
+       */
+      expect(harness.peerLoopListCalls).toEqual([]);
+      expect(harness.peerLoopAttachCalls).toEqual([]);
+    });
+
+    it("adds the structured context once, scoped to the project, when links exist", async () => {
+      const harness = await createHarness({
+        threadPurpose: "navigator",
+        peerLoopRuns: [
+          navigatorRunSummary({ runId: "run-77", state: "done" }),
+          navigatorRunSummary({ runId: "run-unlinked", state: "builder_working" }),
+        ],
+        peerLoopSnapshots: {
+          "run-77": navigatorRunStateFile({
+            lastReviewerDecision: {
+              decision: "DONE",
+              summary: "Backfill shipped.",
+              finalState: "Green on main.",
+            },
+          }),
+        },
+      });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.proposed-plan.upsert",
+          commandId: CommandId.make("cmd-navigator-plan"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlan: {
+            id: "plan-1" as never,
+            turnId: null,
+            planMarkdown: "# Split the migration",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.peer-loop-execution.link",
+          commandId: CommandId.make("cmd-navigator-link"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlanId: "plan-1" as never,
+          runId: "run-77",
+          createdAt: now,
+        }),
+      );
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-navigator-turn-linked"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("navigator-message-linked"),
+            role: "user",
+            text: OWNER_TEXT,
+            attachments: [],
+          },
+          // Matches the thread's current title, so title generation actually
+          // runs and the assertion about its input below is not vacuous.
+          titleSeed: "Thread",
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      const input = sent?.input ?? "";
+
+      // One list, scoped to this project's canonical workspace root.
+      expect(harness.peerLoopListCalls).toEqual([{ projectPath: "/tmp/provider-project" }]);
+      // One snapshot, for the one DONE link.
+      expect(harness.peerLoopAttachCalls).toEqual(["run-77"]);
+
+      // Frame first, one context section, owner's words last.
+      expect(input.startsWith(NAVIGATOR_PROVIDER_FRAME)).toBe(true);
+      expect(input.endsWith(OWNER_TEXT)).toBe(true);
+      expect(input.split(NAVIGATOR_CONTEXT_HEADING)).toHaveLength(2);
+      expect(input).toContain("run run-77");
+      expect(input).toContain("reviewer summary: Backfill shipped.");
+      // Strictly linked runs. Another run in the same project is not shown.
+      expect(input).not.toContain("run-unlinked");
+      expect(input.length).toBeLessThanOrEqual(
+        NAVIGATOR_PROVIDER_FRAME.length + NAVIGATOR_CONTEXT_MAX_CHARS + OWNER_TEXT.length + 16,
+      );
+      expect(input).not.toContain(NAVIGATOR_CONTEXT_TRUNCATION_MARKER);
+
+      // The durable record is still exactly what the owner typed, and the
+      // title seed above used the same string.
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      const stored = thread?.messages.find(
+        (entry) => entry.id === asMessageId("navigator-message-linked"),
+      );
+      expect(stored?.text).toBe(OWNER_TEXT);
+      expect(stored?.text).not.toContain(NAVIGATOR_CONTEXT_HEADING);
+
+      // Title generation reads the owner's words, not the provider request.
+      await waitFor(() => harness.generateThreadTitle.mock.calls.length === 1);
+      const titleInput = harness.generateThreadTitle.mock.calls[0]?.[0];
+      expect(titleInput?.message).toBe(OWNER_TEXT);
+      expect(titleInput?.message).not.toContain(NAVIGATOR_CONTEXT_HEADING);
+      expect(titleInput?.message).not.toContain("You are Navigator");
+    });
+
+    it("still sends the turn when Peer Loop cannot be read", async () => {
+      const harness = await createHarness({
+        threadPurpose: "navigator",
+        peerLoopRuns: "fail",
+      });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.proposed-plan.upsert",
+          commandId: CommandId.make("cmd-navigator-plan-fail"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlan: {
+            id: "plan-1" as never,
+            turnId: null,
+            planMarkdown: "# Split the migration",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.peer-loop-execution.link",
+          commandId: CommandId.make("cmd-navigator-link-fail"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlanId: "plan-1" as never,
+          runId: "run-77",
+          createdAt: now,
+        }),
+      );
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-navigator-turn-degraded"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("navigator-message-degraded"),
+            role: "user",
+            text: OWNER_TEXT,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      // The turn happens. A conversation is not blocked because a bridge is not
+      // installed, and the sentence the model gets says nothing about why.
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      expect(sent?.input).toContain("Structured execution status is unavailable");
+      expect(sent?.input).not.toContain("peer loop is not installed here");
+      expect(sent?.input).toContain(OWNER_TEXT);
     });
   });
 });

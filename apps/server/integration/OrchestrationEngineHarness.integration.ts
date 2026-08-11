@@ -53,6 +53,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/L
 import { RuntimeReceiptBusTest } from "../src/orchestration/Layers/RuntimeReceiptBus.ts";
 import { OrchestrationReactorLive } from "../src/orchestration/Layers/OrchestrationReactor.ts";
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
+import * as NavigatorExecutionContext from "../src/peerLoop/NavigatorExecutionContext.ts";
 import { ProviderRuntimeIngestionLive } from "../src/orchestration/Layers/ProviderRuntimeIngestion.ts";
 import {
   OrchestrationEngineService,
@@ -322,7 +323,23 @@ export const makeOrchestrationIntegrationHarness = (
       generateBranchName: () => Effect.succeed({ branch: "update" }),
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
     } as unknown as TextGenerationShape);
+    /*
+     * The integration harness runs coding threads, which never reach Peer Loop
+     * at all. A stub that dies on use is therefore the honest wiring: if this
+     * harness ever grows a Navigator turn, it fails loudly rather than
+     * silently exercising a service nobody configured.
+     */
+    const navigatorExecutionContextLayer = Layer.succeed(
+      NavigatorExecutionContext.NavigatorExecutionContext,
+      {
+        forThread: (thread) =>
+          thread.purpose === "navigator"
+            ? Effect.die("navigator execution context is not configured in this harness")
+            : Effect.succeed(null),
+      },
+    );
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(navigatorExecutionContextLayer),
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),
       Layer.provideMerge(textGenerationLayer),

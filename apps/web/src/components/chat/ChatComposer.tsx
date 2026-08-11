@@ -88,6 +88,7 @@ import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "../Compos
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { type ComposerCommandItem, ComposerCommandMenu } from "./ComposerCommandMenu";
 import type { ThreadCapabilities } from "~/navigatorCapabilities";
+import { composerSubmitBlocked } from "~/navigatorConfirmation";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
@@ -376,6 +377,17 @@ export interface ChatComposerProps {
   isConnecting: boolean;
   isSendBusy: boolean;
   sendDisabledReason: string | null;
+  /**
+   * Whether this exact composer text may submit with no provider configured.
+   *
+   * NARROW ON PURPOSE, AND IT DEFAULTS TO NO. `ChatView` answers true only for
+   * an exact, eligible Navigator execution confirmation — which calls Peer
+   * Loop's own operation and never needs this conversation's provider — so
+   * refusing the press for a missing provider would refuse the one action that
+   * still works. Everything else keeps the behaviour it has: no provider, no
+   * submit. A caller that does not pass this changes nothing.
+   */
+  allowsSubmitWithoutProvider?: ((text: string) => boolean) | undefined;
   isPreparingWorktree: boolean;
   environmentUnavailable: {
     readonly label: string;
@@ -489,6 +501,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isConnecting,
     isSendBusy,
     sendDisabledReason,
+    allowsSubmitWithoutProvider,
     isPreparingWorktree,
     environmentUnavailable,
     activePendingApproval,
@@ -1678,7 +1691,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const submitComposer = useCallback(
     (event?: { preventDefault: () => void }) => {
-      if (noProviderAvailable || isSendDisabled) {
+      // The one text that gets past a missing provider. See the prop's doc.
+      if (
+        composerSubmitBlocked({
+          noProviderAvailable,
+          isSendDisabled,
+          allowsSubmitWithoutProvider:
+            noProviderAvailable && (allowsSubmitWithoutProvider?.(promptRef.current) ?? false),
+        })
+      ) {
         event?.preventDefault();
         return;
       }
@@ -1702,10 +1723,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [
       activeThreadId,
+      allowsSubmitWithoutProvider,
       blurMobileComposerAfterSend,
       isSendDisabled,
       noProviderAvailable,
       onSend,
+      promptRef,
       shouldBlurMobileComposerOnSubmit,
     ],
   );

@@ -59,3 +59,33 @@ describe("navigator turns", () => {
     }
   });
 });
+
+describe("navigator turns with execution context", () => {
+  const CONTEXT = "Linked Peer Loop executions (structured, read-only context)\n\n1. run run-77";
+  const framed = providerMessageTextForThread("navigator", OWNER_TEXT, CONTEXT);
+
+  it("puts the role frame first, the context next, and the owner's text last", () => {
+    expect(framed.startsWith(NAVIGATOR_PROVIDER_FRAME)).toBe(true);
+    expect(framed.endsWith(OWNER_TEXT)).toBe(true);
+    expect(framed.indexOf(CONTEXT)).toBeGreaterThan(NAVIGATOR_PROVIDER_FRAME.length - 1);
+    expect(framed.indexOf(CONTEXT)).toBeLessThan(framed.indexOf(OWNER_TEXT));
+    // Each part appears exactly once. A context inserted twice would read to a
+    // model as two different observations of the same run.
+    expect(framed.split(CONTEXT)).toHaveLength(2);
+    expect(framed.split(OWNER_TEXT)).toHaveLength(2);
+  });
+
+  it("is byte for byte the old framing when there is no context", () => {
+    // THE COMPATIBILITY BOUNDARY. A conversation that has launched nothing must
+    // not gain an empty section it would have to interpret.
+    const bare = providerMessageTextForThread("navigator", OWNER_TEXT);
+    expect(providerMessageTextForThread("navigator", OWNER_TEXT, null)).toBe(bare);
+    expect(providerMessageTextForThread("navigator", OWNER_TEXT, undefined)).toBe(bare);
+    expect(providerMessageTextForThread("navigator", OWNER_TEXT, "")).toBe(bare);
+  });
+
+  it("still sends a coding turn's text byte for byte, context or not", () => {
+    expect(providerMessageTextForThread("coding", OWNER_TEXT, CONTEXT)).toBe(OWNER_TEXT);
+    expect(providerMessageTextForThread(undefined, OWNER_TEXT, CONTEXT)).toBe(OWNER_TEXT);
+  });
+});

@@ -171,7 +171,12 @@ import {
   groupExecutionsByProposal,
   type ExecutableProposal,
 } from "~/navigatorExecution";
-import { consumeNavigatorConfirmation, routeNavigatorSend } from "~/navigatorConfirmation";
+import {
+  consumeNavigatorConfirmation,
+  NAVIGATOR_SEND_ROUTE,
+  routeNavigatorSend,
+  type NavigatorSendRoute,
+} from "~/navigatorConfirmation";
 import {
   navigatorExecutionKey,
   navigatorExecutionStore,
@@ -345,6 +350,26 @@ const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
 /** Stable identity for the common case: a thread with no Peer Loop executions. */
 const NO_PEER_LOOP_EXECUTIONS: ReadonlyArray<OrchestrationPeerLoopExecution> = [];
+
+/**
+ * Anything in the composer besides the text.
+ *
+ * One definition, so the send path and the composer's disable-reason seam
+ * cannot disagree about what "text only" means. A terminal context counts even
+ * when it has expired: the owner attached it, so this is not a bare
+ * confirmation.
+ */
+function composerSendContextHasAttachments(
+  sendCtx: ReturnType<NonNullable<ChatComposerHandle["getSendContext"]>>,
+): boolean {
+  return (
+    sendCtx.images.length > 0 ||
+    sendCtx.terminalContexts.length > 0 ||
+    sendCtx.elementContexts.length > 0 ||
+    sendCtx.previewAnnotations.length > 0 ||
+    sendCtx.reviewComments.length > 0
+  );
+}
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
   const composerAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -2285,6 +2310,75 @@ function ChatViewContent(props: ChatViewProps) {
           }
         : null,
     [activeProposedPlan, durableThreadIdForExecution, isNavigatorThread],
+  );
+  /*
+   * Is this send an exact confirmation of the current proposal?
+   *
+   * One resolver, two callers: the send path below, and the composer's
+   * disable-reason seam. Sharing it is the point — a second copy of these
+   * safeguards is a second place for them to drift apart.
+   */
+  const navigatorSendRouteFor = useCallback(
+    (input: { readonly text: string; readonly hasAttachments: boolean }): NavigatorSendRoute => {
+      if (confirmableProposal === null || durableThreadIdForExecution === null) {
+        return NAVIGATOR_SEND_ROUTE;
+      }
+      // Read at action time, not at render time: a failure or a pending request
+      // that landed since the last render must still block this.
+      const executionState = navigatorExecutionStore.read(
+        navigatorExecutionKey({
+          environmentId,
+          threadId: durableThreadIdForExecution,
+          proposedPlanId: confirmableProposal.id,
+        }),
+      );
+      return routeNavigatorSend({
+        text: input.text,
+        hasAttachments: input.hasAttachments,
+        purpose: activeThreadPurpose,
+        isDurableThread: true,
+        proposal: confirmableProposal,
+        availability: executeProposalAvailability({
+          purpose: activeThreadPurpose,
+          isDurableThread: true,
+          latestTurnSettled,
+          proposal: confirmableProposal,
+          executionCount: executionsByProposal.get(confirmableProposal.id)?.length ?? 0,
+          executing: executionState.pending,
+          lastAttemptDisposition: executionState.failure?.disposition ?? null,
+        }),
+      });
+    },
+    [
+      activeThreadPurpose,
+      confirmableProposal,
+      durableThreadIdForExecution,
+      environmentId,
+      executionsByProposal,
+      latestTurnSettled,
+    ],
+  );
+  /*
+   * Whether this exact text may submit with no provider configured.
+   *
+   * TRUE ONLY FOR AN ELIGIBLE CONFIRMATION. Executing a proposal calls Peer
+   * Loop's own operation and does not need the Navigator conversation's
+   * provider at all, so refusing the press because a provider is missing
+   * refuses the one action that would still work. Ordinary conversation keeps
+   * exactly the behaviour it has: no provider, no turn.
+   */
+  const allowsSubmitWithoutProvider = useCallback(
+    (text: string): boolean => {
+      const sendCtx = composerRef.current?.getSendContext();
+      if (!sendCtx) return false;
+      return (
+        navigatorSendRouteFor({
+          text,
+          hasAttachments: composerSendContextHasAttachments(sendCtx),
+        }).kind === "execute"
+      );
+    },
+    [composerRef, navigatorSendRouteFor],
   );
   /*
    * The sidebar shows whichever proposal the turn is about, and that can be a
@@ -4833,7 +4927,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
-    if (!sendCtx?.providerAvailable) return;
+    if (!sendCtx) return;
     const {
       images: composerImages,
       terminalContexts: composerTerminalContexts,
@@ -4864,69 +4958,53 @@ function ChatViewContent(props: ChatViewProps) {
     /*
      * A standalone confirmation of the current Execution Proposal.
      *
-     * CHECKED BEFORE THE PLAN FOLLOW-UP BRANCH, which would otherwise swallow
-     * it as a refinement turn. Every other outcome of `routeNavigatorSend`
-     * falls through to the existing path byte for byte — a coding thread, a
-     * draft, a conversation with no settled proposal, a proposal that cannot be
-     * executed, anything with an attachment, and any text that is not exactly
-     * one of the recognized phrases.
+     * CHECKED BEFORE THE PROVIDER-AVAILABILITY RETURN, and before the plan
+     * follow-up branch that would otherwise swallow it as a refinement turn.
+     * Executing calls Peer Loop's own operation and does not need the Navigator
+     * conversation's provider at all, so refusing the press because a provider
+     * is missing would refuse the one action that still works. Ordinary
+     * conversation keeps its existing behaviour: the provider check below is
+     * unchanged for everything that is not an exact eligible confirmation.
+     *
+     * Everything above this point is a pure read — the send context, the
+     * prompt ref, and the derived send state — so reordering the check moved
+     * no side effect earlier.
      */
-    if (confirmableProposal !== null && durableThreadIdForExecution !== null) {
-      const executionState = navigatorExecutionStore.read(
-        navigatorExecutionKey({
+    const navigatorSendRoute = navigatorSendRouteFor({
+      text: trimmed,
+      hasAttachments: composerSendContextHasAttachments(sendCtx),
+    });
+    /*
+     * Consumed as an action, not sent as a message.
+     *
+     * Nothing else moves: no provider turn, no optimistic owner message, no
+     * mode change, no navigation. The durable record of this action is the
+     * immutable proposal/run link the server writes and the child card that
+     * renders it — fabricating a message to stand in for it would put words
+     * in the owner's transcript that they never sent to anybody.
+     */
+    const consumedNavigatorConfirmation = await consumeNavigatorConfirmation({
+      route: navigatorSendRoute,
+      clearComposer: () => {
+        promptRef.current = "";
+        clearComposerDraftContent(composerDraftTarget);
+        composerRef.current?.resetCursorState();
+      },
+      // The same gate both Execute buttons use. A press and a phrase in the
+      // same tick resolve to one key and produce one RPC.
+      execute: (confirmed) => {
+        if (durableThreadIdForExecution === null) return Promise.resolve(null);
+        return executeNavigatorProposal({
           environmentId,
           threadId: durableThreadIdForExecution,
-          proposedPlanId: confirmableProposal.id,
-        }),
-      );
-      const route = routeNavigatorSend({
-        text: trimmed,
-        hasAttachments:
-          composerImages.length > 0 ||
-          composerTerminalContexts.length > 0 ||
-          composerElementContexts.length > 0 ||
-          composerPreviewAnnotations.length > 0 ||
-          composerReviewComments.length > 0,
-        purpose: activeThreadPurpose,
-        isDurableThread: true,
-        proposal: confirmableProposal,
-        availability: executeProposalAvailability({
-          purpose: activeThreadPurpose,
-          isDurableThread: true,
-          latestTurnSettled,
-          proposal: confirmableProposal,
-          executionCount: executionsByProposal.get(confirmableProposal.id)?.length ?? 0,
-          executing: executionState.pending,
-          lastAttemptDisposition: executionState.failure?.disposition ?? null,
-        }),
-      });
-      /*
-       * Consumed as an action, not sent as a message.
-       *
-       * Nothing else moves: no provider turn, no optimistic owner message, no
-       * mode change, no navigation. The durable record of this action is the
-       * immutable proposal/run link the server writes and the child card that
-       * renders it — fabricating a message to stand in for it would put words
-       * in the owner's transcript that they never sent to anybody.
-       */
-      const consumed = await consumeNavigatorConfirmation({
-        route,
-        clearComposer: () => {
-          promptRef.current = "";
-          clearComposerDraftContent(composerDraftTarget);
-          composerRef.current?.resetCursorState();
-        },
-        // The same gate both Execute buttons use. A press and a phrase in the
-        // same tick resolve to one key and produce one RPC.
-        execute: (confirmed) =>
-          executeNavigatorProposal({
-            environmentId,
-            threadId: durableThreadIdForExecution,
-            proposedPlanId: confirmed.id,
-          }),
-      });
-      if (consumed) return;
-    }
+          proposedPlanId: confirmed.id,
+        });
+      },
+    });
+    if (consumedNavigatorConfirmation) return;
+
+    // Ordinary conversation still needs somewhere to send it.
+    if (!sendCtx.providerAvailable) return;
     if (showPlanFollowUpPrompt && activeProposedPlan) {
       const followUp = resolvePlanFollowUpSubmission({
         draftText: trimmed,
@@ -6301,6 +6379,7 @@ function ChatViewContent(props: ChatViewProps) {
                             isConnecting={isConnecting}
                             isSendBusy={isSendBusy}
                             sendDisabledReason={threadDetailLoading ? "Messages loading" : null}
+                            allowsSubmitWithoutProvider={allowsSubmitWithoutProvider}
                             isPreparingWorktree={isPreparingWorktree}
                             environmentUnavailable={activeEnvironmentUnavailableState}
                             activePendingApproval={activePendingApproval}

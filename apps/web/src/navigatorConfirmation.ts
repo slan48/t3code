@@ -121,7 +121,10 @@ export type NavigatorSendRoute =
   | { readonly kind: "send" }
   | { readonly kind: "execute"; readonly proposal: ExecutableProposal };
 
-const SEND: NavigatorSendRoute = { kind: "send" };
+/** The existing path. Exported so a caller can return it without rebuilding it. */
+export const NAVIGATOR_SEND_ROUTE: NavigatorSendRoute = { kind: "send" };
+
+const SEND = NAVIGATOR_SEND_ROUTE;
 
 /**
  * Whether this send is a confirmation of the current proposal.
@@ -181,4 +184,29 @@ export async function consumeNavigatorConfirmation(input: {
   input.clearComposer();
   await input.execute(input.route.proposal);
   return true;
+}
+
+/* -------------------------------------------------- composer submission */
+
+/**
+ * Whether the composer must refuse this submission outright.
+ *
+ * It lives here because it exists only because of this feature. Executing a
+ * proposal calls Peer Loop's own operation and never touches the Navigator
+ * conversation's provider, so a composer that refuses the press for a missing
+ * provider refuses the one action that would still have worked. Widening the
+ * rule any further than "an exact eligible confirmation" would let ordinary
+ * messages be submitted with nowhere to send them.
+ *
+ * `isSendDisabled` still wins: that is the composer's own reason — messages
+ * loading, an image still compressing — and it is not about the provider.
+ */
+export function composerSubmitBlocked(input: {
+  readonly noProviderAvailable: boolean;
+  readonly isSendDisabled: boolean;
+  /** `routeNavigatorSend` said this text is an eligible confirmation. */
+  readonly allowsSubmitWithoutProvider: boolean;
+}): boolean {
+  if (input.isSendDisabled) return true;
+  return input.noProviderAvailable && !input.allowsSubmitWithoutProvider;
 }

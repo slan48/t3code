@@ -43,6 +43,7 @@ import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
 } from "../../serverSettings.ts";
+import { NavigatorExecutionContext } from "../../peerLoop/NavigatorExecutionContext.ts";
 import { providerMessageTextForThread } from "../navigatorProviderFrame.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
@@ -250,6 +251,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const navigatorExecutionContext = yield* NavigatorExecutionContext;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
@@ -1097,6 +1099,21 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    /*
+     * What this conversation's own Peer Loop runs are doing, if it has any.
+     *
+     * Read here, at the shared boundary, for the same reason the frame is: one
+     * read, one shape, every adapter. It never fails and never blocks — a
+     * coding thread and a Navigator thread with no links return null without
+     * touching Peer Loop at all.
+     */
+    const navigatorExecutionContextText = yield* navigatorExecutionContext.forThread({
+      id: thread.id,
+      purpose: thread.purpose,
+      projectId: thread.projectId,
+      peerLoopExecutions: thread.peerLoopExecutions,
+    });
+
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       /*
@@ -1107,7 +1124,11 @@ const make = Effect.gen(function* () {
        * is what was stored, what the timeline shows, and what the title
        * generation above already used.
        */
-      messageText: providerMessageTextForThread(thread.purpose, message.text),
+      messageText: providerMessageTextForThread(
+        thread.purpose,
+        message.text,
+        navigatorExecutionContextText,
+      ),
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }

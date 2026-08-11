@@ -45,6 +45,7 @@ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
+import * as NavigatorExecutionContext from "./peerLoop/NavigatorExecutionContext.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -384,8 +385,15 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // Core Services. The Peer Loop execution coordinator rides here because it
   // is coordination between two things that already exist — the orchestration
   // engine and the Peer Loop bridge — so it must sit above both, and it owns
-  // no state of its own.
-  Layer.provideMerge(Layer.mergeAll(PeerLoopExecutionCoordinator.layer, ServerSettingsLayerLive)),
+  // no state of its own. The Navigator execution context is the read-only half
+  // of the same relationship and sits in the same place for the same reason.
+  Layer.provideMerge(
+    Layer.mergeAll(
+      PeerLoopExecutionCoordinator.layer,
+      NavigatorExecutionContext.layer,
+      ServerSettingsLayerLive,
+    ),
+  ),
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),

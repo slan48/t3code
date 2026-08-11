@@ -21,9 +21,17 @@
  * every command that would change any of that. The frame shapes behaviour so
  * the conversation is useful; the server is what makes it safe.
  *
- * Deliberately constant: no repository transcript, no Peer Loop run state, no
- * secrets, no mutable execution summary. A frame that varied with external
- * state would be a channel for that state into every provider request.
+ * The role frame itself is deliberately constant: no repository transcript, no
+ * secrets, nothing that varies with external state. A frame that drifted would
+ * be an uncontrolled channel into every provider request.
+ *
+ * One clearly delimited section may follow it, and only one: a bounded,
+ * already-sanitized summary of the Peer Loop runs this conversation itself
+ * launched. It arrives as a finished string from `NavigatorExecutionContext`,
+ * which narrows Peer Loop's structured records down to the facts a model may
+ * see. This module does not read Peer Loop, and does not decide what is in that
+ * block — it decides where it goes and that a conversation without one is
+ * framed exactly as it was before the block existed.
  *
  * @module NavigatorProviderFrame
  */
@@ -54,18 +62,33 @@ export const NAVIGATOR_PROVIDER_FRAME = [
   "Executing a proposal is a separate, explicit action the Owner takes.",
 ].join("\n");
 
+/** What separates the frame, the optional context, and the owner's words. */
+const SECTION_SEPARATOR = "\n\n---\n\n";
+
 /**
  * The text this turn should send to the provider.
  *
  * Coding threads get the owner's message byte for byte — the same string the
- * adapter has always received — so nothing about an ordinary turn changes.
+ * adapter has always received — so nothing about an ordinary turn changes. A
+ * Navigator thread with no execution context is framed exactly as it was
+ * before this parameter existed, which is what keeps a conversation that has
+ * launched nothing free of an empty section it would have to interpret.
+ *
+ * The owner's text is always last, so the thing the model is answering is the
+ * thing closest to it.
  */
 export function providerMessageTextForThread(
   purpose: ThreadPurpose | undefined,
   ownerMessageText: string,
+  /** Already bounded and sanitized by `NavigatorExecutionContext`, or null. */
+  executionContext?: string | null,
 ): string {
   if (purpose !== "navigator") {
     return ownerMessageText;
   }
-  return `${NAVIGATOR_PROVIDER_FRAME}\n\n---\n\n${ownerMessageText}`;
+  const sections =
+    executionContext === undefined || executionContext === null || executionContext.length === 0
+      ? [NAVIGATOR_PROVIDER_FRAME, ownerMessageText]
+      : [NAVIGATOR_PROVIDER_FRAME, executionContext, ownerMessageText];
+  return sections.join(SECTION_SEPARATOR);
 }

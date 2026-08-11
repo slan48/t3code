@@ -795,6 +795,75 @@ and `plan`, owns no worktree, and the orchestration invariants refuse every
 command that would change that. The frame shapes behaviour so the conversation
 is useful; the server is what makes it safe.
 
+### What Navigator knows about its own runs
+
+A Navigator conversation that has launched runs should be able to answer "what
+happened with that?" without the Owner leaving for the inspector.
+`apps/server/src/peerLoop/NavigatorExecutionContext.ts` assembles that answer
+once per turn and hands it to the same shared boundary the role frame uses, so
+every adapter receives identical context and none of them grows Navigator
+logic. Orchestration supplies the immutable proposal/run links; **Peer Loop
+supplies every mutable fact, live, every turn.** Nothing is cached, and no run
+state is copied into T3 Code's own model.
+
+**It is a reader.** `listRuns` and the read-only snapshot `attachRun`, and
+nothing else. Start, resume, pause, recover, owner message and the event
+subscription are not called and not imported, and the service's tests make each
+of them die on contact so a context build that reached one fails loudly.
+
+**The zero-query boundary comes first.** A thread whose `purpose` is not
+`navigator` returns no context and touches neither the projection nor the
+bridge, so a coding turn's provider text is byte-for-byte what it always was. A
+Navigator thread with no `peerLoopExecutions` does the same, and its provider
+text is byte-for-byte the static frame it had before this existed. That matters
+because the first Peer Loop call is what spawns the bridge: an install that has
+never executed anything must not spawn `peer-loop` on an ordinary Navigator
+turn.
+
+**What one turn costs, at most.** One `listRuns`, scoped to the canonical
+`workspaceRoot` of the thread's own project — an unscoped list would return
+other projects' runs. At most eight links are described, newest first by link
+timestamp with the run id as a stable tie-break. Summaries are joined **strictly
+by linked run id**, so another run in the same project is never shown. At most
+four `attachRun` snapshots follow, at concurrency two, and only for links Peer
+Loop has just reported as DONE or OWNER_REQUIRED — the two states where a second
+read says something the list cannot. An ordinary working, paused, interrupted or
+failed child is list-only.
+
+**Narrowed by construction, then bounded.** `factsFromSummary` projects a run
+summary down to state, iteration, update time, halt _kind_, queued-owner-message
+count, and whether a live writer exists and belongs to this bridge. The project
+path, the adapter identity, the writer's pid and host, the halt message and the
+durable sequence are dropped before the serializer can see them — excluding a
+field by remembering not to print it is a rule somebody breaks later. From a
+snapshot, only the Reviewer's structured `summary` / `finalState` / recorded
+repo HEAD and branch, or the structured `ownerQuestion` / `whyOwnerIsRequired` /
+bounded `options`, are read. `lastBuilderTask`, `lastBuilderReport`,
+`ownerPolicyText` and the queued message bodies sit on the same object and are
+never touched: they are prose somebody else wrote, not a structured answer.
+Every field has a character bound, options have a count bound, and the whole
+block is capped at 12,000 characters with a deterministic truncation marker
+rather than a silent clip.
+
+**Degradation is one sentence, never a detail.** If the project cannot be
+resolved, the block says execution records are unavailable and no list is
+requested. If `listRuns` fails, the block says structured execution status is
+unavailable and the links are still named with no state claimed for them. If one
+`attachRun` fails, that run alone reads "structured detail unavailable". Nothing
+from the Cause reaches the provider — a bridge error is exactly the kind of text
+that carries paths and diagnostics — and nothing is retried inside the turn. In
+every case the turn proceeds: a conversation is not blocked because Peer Loop
+could not be read.
+
+**Explanation is not control.** The block leads with a heading that says these
+are observations, and tells the model in the words it reads that it may explain
+them in plain language but must not claim it approved, resumed, recovered,
+paused, messaged or changed any run — and that Owner decisions and recovery stay
+in T3 Code's explicit Peer Loop controls. The persisted owner message, the
+timeline and title generation are untouched, exactly as with the role frame:
+only the provider-visible string for that turn carries the context, and only
+when there are links to describe.
+
 ### Executing a proposal
 
 **The action is explicit, and the press is the confirmation.** An Execution
@@ -1006,10 +1075,9 @@ details" — where Peer Loop's explicit safe controls remain authoritative. Time
 use the same relative-time helper the Peer Loop index uses rather than exposing
 raw ISO instants.
 
-**Still forthcoming, and deliberately not present yet:** richer historical-run
-context for a Navigator conversation — an activity or event transcript, and
-Navigator's own narrated explanation of an `OWNER_REQUIRED` question in its own
-words — and the mobile Navigator UI.
+**Still forthcoming, and deliberately not present yet:** consulting a run's
+detailed activity or event transcript for questions the structured records
+cannot answer, and the mobile Navigator UI.
 
 Nothing else launches a run. The Execute action and the closed confirmation
 grammar described above are two inputs to one operation, and between them the
