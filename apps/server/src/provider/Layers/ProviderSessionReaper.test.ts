@@ -95,6 +95,7 @@ function makeReadModel(
       id: thread.id,
       projectId,
       title: `Thread ${thread.id}`,
+      purpose: "coding" as const,
       modelSelection: defaultModelSelection,
       interactionMode: "default" as const,
       runtimeMode: "full-access" as const,

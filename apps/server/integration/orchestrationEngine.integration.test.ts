@@ -142,6 +142,7 @@ const seedProjectAndThread = (harness: OrchestrationIntegrationHarness) =>
       threadId: THREAD_ID,
       projectId: PROJECT_ID,
       title: "Integration Thread",
+      purpose: "coding",
       modelSelection: {
         instanceId,
         model: defaultModel,
@@ -292,6 +293,7 @@ it.live.skipIf(!process.env.CODEX_BINARY_PATH)(
           threadId: THREAD_ID,
           projectId: PROJECT_ID,
           title: "Integration Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5.3-codex",

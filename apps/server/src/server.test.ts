@@ -168,6 +168,7 @@ const makeDefaultOrchestrationReadModel = () => {
         id: defaultThreadId,
         projectId: defaultProjectId,
         title: "Default Thread",
+        purpose: "coding" as const,
         modelSelection: defaultModelSelection,
         interactionMode: "default" as const,
         runtimeMode: "full-access" as const,
@@ -198,6 +199,7 @@ const makeDefaultOrchestrationThreadShell = (
     id: defaultThreadId,
     projectId: defaultProjectId,
     title: "Default Thread",
+    purpose: "coding" as const,
     modelSelection: defaultModelSelection,
     runtimeMode: "full-access",
     interactionMode: "default",
@@ -5801,6 +5803,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             id: ThreadId.make("thread-1"),
             projectId: ProjectId.make("project-a"),
             title: "Thread A",
+            purpose: "coding" as const,
             modelSelection: defaultModelSelection,
             interactionMode: "default" as const,
             runtimeMode: "full-access" as const,
@@ -7247,6 +7250,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 createThread: {
                   projectId: defaultProjectId,
                   title: "Bootstrap Thread",
+                  purpose: "coding" as const,
                   modelSelection: defaultModelSelection,
                   runtimeMode: "full-access",
                   interactionMode: "default",
@@ -7391,6 +7395,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               createThread: {
                 projectId: defaultProjectId,
                 title: "Bootstrap Thread",
+                purpose: "coding" as const,
                 modelSelection: defaultModelSelection,
                 runtimeMode: "full-access",
                 interactionMode: "default",
@@ -7512,6 +7517,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               createThread: {
                 projectId: defaultProjectId,
                 title: "Bootstrap Thread",
+                purpose: "coding" as const,
                 modelSelection: defaultModelSelection,
                 runtimeMode: "full-access",
                 interactionMode: "default",
@@ -7596,6 +7602,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               createThread: {
                 projectId: defaultProjectId,
                 title: "Bootstrap Thread",
+                purpose: "coding" as const,
                 modelSelection: defaultModelSelection,
                 runtimeMode: "full-access",
                 interactionMode: "default",

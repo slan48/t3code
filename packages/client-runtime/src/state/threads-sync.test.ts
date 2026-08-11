@@ -57,6 +57,7 @@ const BASE_THREAD: OrchestrationThread = {
   id: THREAD_ID,
   projectId: ProjectId.make("project-1"),
   title: "Cached thread",
+  purpose: "coding",
   modelSelection: {
     instanceId: ProviderInstanceId.make("codex"),
     model: "gpt-5.4",

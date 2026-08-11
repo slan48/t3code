@@ -47,6 +47,7 @@ describe("canonicalizeClientCommandTimestamps", () => {
         createThread: {
           projectId: ProjectId.make("project-1"),
           title: "Clock-safe thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5.4",
@@ -68,6 +69,50 @@ describe("canonicalizeClientCommandTimestamps", () => {
       throw new Error("Expected a thread.turn.start command");
     }
     expect(result.createdAt).toBe(serverReceivedAt);
+    expect(result.bootstrap?.createThread?.createdAt).toBe(serverReceivedAt);
+    expect(result.bootstrap?.createThread?.purpose).toBe("coding");
+  });
+
+  it("carries a navigator purpose through bootstrap canonicalization", () => {
+    // Only the timestamps are rewritten. The purpose the client asked for has
+    // to reach the decider intact, because that is where it is validated.
+    const command: ClientOrchestrationCommand = {
+      type: "thread.turn.start",
+      commandId: CommandId.make("command-3"),
+      threadId: ThreadId.make("thread-2"),
+      message: {
+        messageId: MessageId.make("message-2"),
+        role: "user",
+        text: "Plan this out",
+        attachments: [],
+      },
+      runtimeMode: "approval-required",
+      interactionMode: "plan",
+      bootstrap: {
+        createThread: {
+          projectId: ProjectId.make("project-1"),
+          title: "Navigator",
+          purpose: "navigator",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5.4",
+          },
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+          branch: null,
+          worktreePath: null,
+          createdAt: clientCreatedAt,
+        },
+      },
+      createdAt: clientCreatedAt,
+    };
+
+    const result = canonicalizeClientCommandTimestamps(command, serverReceivedAt);
+
+    if (result.type !== "thread.turn.start") {
+      throw new Error("Expected a thread.turn.start command");
+    }
+    expect(result.bootstrap?.createThread?.purpose).toBe("navigator");
     expect(result.bootstrap?.createThread?.createdAt).toBe(serverReceivedAt);
   });
 });

@@ -296,6 +296,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
     const baseThread = {
       projectId,
       title: "Run remote agent",
+      purpose: "coding",
       modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
       runtimeMode: "full-access",
       interactionMode: "default",
@@ -437,6 +438,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
           id: threadId,
           projectId,
           title: "Run remote agent",
+          purpose: "coding",
           modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
           runtimeMode: "full-access",
           interactionMode: "default",
@@ -595,6 +597,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
           id: threadId,
           projectId,
           title: "Run remote agent",
+          purpose: "coding",
           modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
           runtimeMode: "full-access",
           interactionMode: "default",

@@ -4859,6 +4859,7 @@ function ChatViewContent(props: ChatViewProps) {
                     createThread: {
                       projectId: activeProject.id,
                       title,
+                      purpose: "coding" as const,
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
                       interactionMode,
@@ -5362,6 +5363,7 @@ function ChatViewContent(props: ChatViewProps) {
         threadId: nextThreadId,
         projectId: activeProject.id,
         title: nextThreadTitle,
+        purpose: "coding",
         modelSelection: nextThreadModelSelection,
         runtimeMode,
         interactionMode: "default",

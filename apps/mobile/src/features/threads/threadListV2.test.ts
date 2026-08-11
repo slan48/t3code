@@ -33,6 +33,7 @@ function makeThread(
     environmentId,
     projectId: ProjectId.make("project-1"),
     modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+    purpose: "coding",
     runtimeMode: "full-access",
     interactionMode: "default",
     branch: null,

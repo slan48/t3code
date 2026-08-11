@@ -57,6 +57,7 @@ const readModel: OrchestrationReadModel = {
       id: ThreadId.make("thread-1"),
       projectId: ProjectId.make("project-a"),
       title: "Thread A",
+      purpose: "coding",
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5-codex",
@@ -82,6 +83,7 @@ const readModel: OrchestrationReadModel = {
       id: ThreadId.make("thread-2"),
       projectId: ProjectId.make("project-b"),
       title: "Thread B",
+      purpose: "coding",
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5-codex",
@@ -161,6 +163,7 @@ describe("commandInvariants", () => {
           threadId: ThreadId.make("thread-3"),
           projectId: ProjectId.make("project-a"),
           title: "new",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -185,6 +188,7 @@ describe("commandInvariants", () => {
             threadId: ThreadId.make("thread-1"),
             projectId: ProjectId.make("project-a"),
             title: "dup",
+            purpose: "coding",
             modelSelection: {
               instanceId: ProviderInstanceId.make("codex"),
               model: "gpt-5-codex",

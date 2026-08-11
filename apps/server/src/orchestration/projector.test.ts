@@ -77,6 +77,9 @@ describe("orchestration projector", () => {
         id: "thread-1",
         projectId: "project-1",
         title: "demo",
+        // The event above carries no purpose, exactly as every historical
+        // thread.created does. The contract default supplies it.
+        purpose: "coding",
         modelSelection: {
           instanceId: "codex",
           model: "gpt-5-codex",

@@ -229,6 +229,7 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
           threadId: createdThreadId,
           projectId: nextProjectId,
           title: "New thread",
+          purpose: "coding",
           modelSelection: nextProjectDefaultModelSelection,
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "full-access",

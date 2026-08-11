@@ -381,6 +381,7 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
           title: "Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -400,6 +401,7 @@ describe("CheckpointReactor", () => {
                   threadId: ThreadId.make("thread-2"),
                   projectId: asProjectId("project-1"),
                   title: "Thread 2",
+                  purpose: "coding",
                   modelSelection: {
                     instanceId: ProviderInstanceId.make("codex"),
                     model: "gpt-5-codex",

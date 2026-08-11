@@ -26,6 +26,7 @@ const baseThread: OrchestrationThread = {
   id: ThreadId.make("thread-1"),
   projectId: ProjectId.make("project-1"),
   title: "Test Thread",
+  purpose: "coding",
   modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
   runtimeMode: "full-access",
   interactionMode: "default",
@@ -84,6 +85,7 @@ describe("applyThreadDetailEvent", () => {
           threadId: ThreadId.make("thread-2"),
           projectId: ProjectId.make("project-1"),
           title: "New Thread",
+          purpose: "coding",
           modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
           runtimeMode: "full-access",
           interactionMode: "default",
@@ -101,6 +103,41 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.branch).toBe("main");
         expect(result.thread.messages).toEqual([]);
         expect(result.thread.session).toBeNull();
+        expect(result.thread.purpose).toBe("coding");
+      }
+    });
+
+    it("keeps a navigator thread's purpose off the event", () => {
+      // The reducer is the last hop before the UI. Dropping `purpose` here
+      // would silently present a navigator conversation as an ordinary
+      // coding thread.
+      const result = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 1,
+        occurredAt: "2026-04-01T01:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-3"),
+        type: "thread.created",
+        payload: {
+          threadId: ThreadId.make("thread-3"),
+          projectId: ProjectId.make("project-1"),
+          title: "Navigator",
+          purpose: "navigator",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "approval-required",
+          interactionMode: "plan",
+          branch: null,
+          worktreePath: null,
+          createdAt: "2026-04-01T01:00:00.000Z",
+          updatedAt: "2026-04-01T01:00:00.000Z",
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.purpose).toBe("navigator");
+        expect(result.thread.runtimeMode).toBe("approval-required");
+        expect(result.thread.interactionMode).toBe("plan");
       }
     });
   });

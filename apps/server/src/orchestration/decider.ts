@@ -13,12 +13,17 @@ import { OrchestrationCommandInvariantError } from "./Errors.ts";
 import {
   listThreadsByProjectId,
   requireActiveProjectWorkspaceRootAbsent,
+  requireNavigatorApprovalDecisionAllowed,
+  requireNavigatorCheckoutUnchanged,
+  requireNavigatorModeUnchanged,
+  requireNotNavigatorThread,
   requireProject,
   requireProjectAbsent,
   requireThread,
   requireThreadArchived,
   requireThreadAbsent,
   requireThreadNotArchived,
+  requireValidNavigatorCreation,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
 
@@ -355,6 +360,16 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      // A navigator thread is locked to planning here, at the only moment the
+      // combination can be established: `purpose` never changes afterwards.
+      yield* requireValidNavigatorCreation({
+        commandType: command.type,
+        purpose: command.purpose,
+        runtimeMode: command.runtimeMode,
+        interactionMode: command.interactionMode,
+        branch: command.branch,
+        worktreePath: command.worktreePath,
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
@@ -367,6 +382,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           projectId: command.projectId,
           title: command.title,
+          purpose: command.purpose,
           modelSelection: command.modelSelection,
           runtimeMode: command.runtimeMode,
           interactionMode: command.interactionMode,
@@ -636,6 +652,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      yield* requireNavigatorCheckoutUnchanged({
+        commandType: command.type,
+        thread,
+        branch: command.branch,
+        worktreePath: command.worktreePath,
+      });
       const branch =
         command.branch !== undefined &&
         command.expectedBranch !== undefined &&
@@ -703,10 +725,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.runtime-mode.set": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
+      });
+      yield* requireNavigatorModeUnchanged({
+        commandType: command.type,
+        thread,
+        runtimeMode: command.runtimeMode,
       });
       const occurredAt = yield* nowIso;
       return {
@@ -726,10 +753,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.interaction-mode.set": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
+      });
+      yield* requireNavigatorModeUnchanged({
+        commandType: command.type,
+        thread,
+        interactionMode: command.interactionMode,
       });
       const occurredAt = yield* nowIso;
       return {
@@ -884,10 +916,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.approval.respond": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
+      });
+      // Accepting is the one answer that would let a read-only thread act.
+      // Declining and cancelling stay open so a pending request can be cleared.
+      yield* requireNavigatorApprovalDecisionAllowed({
+        commandType: command.type,
+        thread,
+        decision: command.decision,
       });
       return {
         ...(yield* withEventBase({
@@ -936,10 +975,16 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.checkpoint.revert": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
+      });
+      yield* requireNotNavigatorThread({
+        commandType: command.type,
+        thread,
+        reason:
+          "Reverting a checkpoint rewinds a coding thread's worktree, and a navigator thread has none.",
       });
       return {
         ...(yield* withEventBase({

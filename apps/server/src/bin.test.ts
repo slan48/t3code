@@ -508,6 +508,7 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
           threadId: ThreadId.make("thread-cli-force-remove"),
           projectId: project!.id,
           title: "Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",

@@ -42,6 +42,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     environmentId,
     projectId,
     title: "Thread",
+    purpose: "coding",
     modelSelection: {
       instanceId: ProviderInstanceId.make("codex"),
       model: "gpt-5.4",
@@ -93,6 +94,7 @@ describe("buildLoadingThreadFromShell", () => {
       id: threadId,
       projectId,
       title: "Loading thread",
+      purpose: "coding",
       modelSelection: {
         instanceId: ProviderInstanceId.make("codex"),
         model: "gpt-5.4",

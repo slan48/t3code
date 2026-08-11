@@ -65,6 +65,7 @@ export function buildProjectThreadStartTurnInput(spec: ProjectThreadStartTurnSpe
       createThread: {
         projectId: spec.projectId,
         title,
+        purpose: "coding" as const,
         modelSelection: spec.modelSelection,
         runtimeMode: spec.runtimeMode,
         interactionMode: spec.interactionMode,

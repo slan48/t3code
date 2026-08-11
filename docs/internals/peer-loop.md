@@ -515,6 +515,45 @@ Web, desktop-wrapped web and a remote browser are all covered by this one
 surface. The shared client-runtime foundation stays available for a native
 mobile screen later; there is none in this increment.
 
+## Navigator threads
+
+Navigator is a planning conversation and it is **not** a Peer Loop concept. It
+reuses the ordinary durable T3 Code primitives — a project, a thread, its
+messages and its proposed plans — with one immutable piece of metadata on the
+thread: `purpose`, either `coding` or `navigator`. There is no Navigator table,
+no second message store, no second plan store and no second orchestration
+engine. A Navigator thread is a thread.
+
+`purpose` is `coding` everywhere it is absent. Commands, `thread.created`
+payloads, thread snapshots and the `projection_threads` row all decode it with a
+default, and migration 036 adds the column with `NOT NULL DEFAULT 'coding'`, so
+every thread and every orchestration event written before this existed keeps
+working with no rewrite of the event log.
+
+What the server enforces, in `commandInvariants.ts` rather than in a UI default,
+so a client that sends the command anyway is refused with a typed
+`OrchestrationCommandInvariantError`:
+
+- a `navigator` thread may only be **created** with `runtimeMode:
+"approval-required"` (T3 Code's existing read-only sandbox mapping),
+  `interactionMode: "plan"`, no branch and no worktree;
+- it may not later be moved off either mode — setting the value it already has
+  stays valid, because an idempotent set protects nothing by failing;
+- it may not be given a branch or a worktree afterwards either;
+- `accept` and `acceptForSession` approval responses are refused, because an
+  accepted approval is the one answer that lets a read-only thread act.
+  `decline` and `cancel` stay allowed so a pending request can be cleared;
+- checkpoint revert is refused: it rewinds a coding thread's worktree, and a
+  Navigator thread has none.
+
+`coding` threads are untouched by all of it.
+
+**This metadata duplicates nothing about Peer Loop.** It carries no run
+lifecycle, no owner policy, no halt reason, no recovery decision and no live
+writer. Peer Loop owns every one of those for its own runs, over its own
+protocol, and a thread's purpose says nothing about them. Linking a Navigator
+conversation to a Peer Loop run is later work and is not modelled here.
+
 ## What must not happen
 
 1. **A T3 Code decision.** Forward intent, render facts. The Reviewer decides and

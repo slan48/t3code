@@ -75,6 +75,9 @@ export function buildLocalDraftThread(
     environmentId: draftThread.environmentId,
     projectId: draftThread.projectId,
     title: "New thread",
+    // A locally drafted thread is an ordinary coding thread. Navigator threads
+    // are created deliberately and are not drafted here.
+    purpose: "coding",
     modelSelection: fallbackModelSelection,
     runtimeMode: draftThread.runtimeMode,
     interactionMode: draftThread.interactionMode,

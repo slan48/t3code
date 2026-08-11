@@ -899,6 +899,7 @@ const makeWsRpcLayer = (
                 threadId: command.threadId,
                 projectId: bootstrap.createThread.projectId,
                 title: bootstrap.createThread.title,
+                purpose: bootstrap.createThread.purpose,
                 modelSelection: bootstrap.createThread.modelSelection,
                 runtimeMode: bootstrap.createThread.runtimeMode,
                 interactionMode: bootstrap.createThread.interactionMode,

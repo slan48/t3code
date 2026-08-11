@@ -245,6 +245,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           threadId: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
           title: "Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -342,6 +343,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           threadId: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
           title: "Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -420,6 +422,7 @@ it.layer(NodeServices.layer)("decider project scripts", (it) => {
           threadId: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
           title: "Thread",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",

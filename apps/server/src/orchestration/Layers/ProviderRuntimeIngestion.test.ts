@@ -273,6 +273,7 @@ describe("ProviderRuntimeIngestion", () => {
         threadId: ThreadId.make("thread-1"),
         projectId: asProjectId("project-1"),
         title: "Thread",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1163,6 +1164,7 @@ describe("ProviderRuntimeIngestion", () => {
         threadId: sourceThreadId,
         projectId: asProjectId("project-1"),
         title: "Plan Source",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1198,6 +1200,7 @@ describe("ProviderRuntimeIngestion", () => {
         threadId: targetThreadId,
         projectId: asProjectId("project-1"),
         title: "Plan Target",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1351,6 +1354,7 @@ describe("ProviderRuntimeIngestion", () => {
           threadId: sourceThreadId,
           projectId: asProjectId("project-1"),
           title: "Plan Source",
+          purpose: "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -1589,6 +1593,7 @@ describe("ProviderRuntimeIngestion", () => {
         threadId: sourceThreadId,
         projectId: asProjectId("project-1"),
         title: "Plan Source",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1624,6 +1629,7 @@ describe("ProviderRuntimeIngestion", () => {
         threadId: targetThreadId,
         projectId: asProjectId("project-1"),
         title: "Plan Target",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",

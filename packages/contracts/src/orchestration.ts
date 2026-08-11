@@ -125,6 +125,45 @@ export const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 export const ProviderInteractionMode = Schema.Literals(["default", "plan"]);
 export type ProviderInteractionMode = typeof ProviderInteractionMode.Type;
 export const DEFAULT_PROVIDER_INTERACTION_MODE: ProviderInteractionMode = "default";
+
+/**
+ * What a thread is for, decided once when it is created and never after.
+ *
+ * `coding` is every thread T3 Code has ever written: an agent conversation that
+ * may read, write and run things in a project. `navigator` is a planning
+ * conversation — the same durable thread, messages and proposed plans, held to
+ * read-only behaviour by the server rather than by a UI default.
+ *
+ * This is thread metadata and nothing more. It does not carry a lifecycle, a
+ * policy or an owner decision; Peer Loop owns all of those for its own runs and
+ * this field says nothing about them.
+ */
+export const ThreadPurpose = Schema.Literals(["coding", "navigator"]);
+export type ThreadPurpose = typeof ThreadPurpose.Type;
+export const DEFAULT_THREAD_PURPOSE: ThreadPurpose = "coding";
+
+/**
+ * `purpose` as every persisted, evented and wire-level struct carries it.
+ *
+ * A decoding default rather than a required field, because every command,
+ * event and snapshot written before this existed has no `purpose` at all and
+ * all of them are ordinary coding threads. Reading them back has to keep
+ * working with no rewrite of the orchestration event log.
+ */
+export const ThreadPurposeWithDefault = ThreadPurpose.pipe(
+  Schema.withDecodingDefault(Effect.succeed(DEFAULT_THREAD_PURPOSE)),
+);
+
+/**
+ * The only runtime mode a Navigator thread may run in.
+ *
+ * `approval-required` is T3 Code's existing read-only sandbox mapping: the
+ * provider has to ask before anything leaves the conversation. Navigator reuses
+ * it rather than inventing a second notion of read-only.
+ */
+export const NAVIGATOR_RUNTIME_MODE: RuntimeMode = "approval-required";
+/** Navigator threads plan; they do not implement. */
+export const NAVIGATOR_INTERACTION_MODE: ProviderInteractionMode = "plan";
 export const ProviderRequestKind = Schema.Literals(["command", "file-read", "file-change"]);
 export type ProviderRequestKind = typeof ProviderRequestKind.Type;
 export const AssistantDeliveryMode = Schema.Literals(["buffered", "streaming"]);
@@ -352,6 +391,7 @@ export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -410,6 +450,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -556,6 +597,7 @@ const ThreadCreateCommand = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode.pipe(
@@ -658,6 +700,7 @@ const ThreadInteractionModeSetCommand = Schema.Struct({
 const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
@@ -966,6 +1009,7 @@ export const ThreadCreatedPayload = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   interactionMode: ProviderInteractionMode.pipe(

@@ -134,6 +134,7 @@ describe("OrchestrationEngine", () => {
           id: ThreadId.make("thread-bootstrap"),
           projectId: asProjectId("project-bootstrap"),
           title: "Bootstrap Thread",
+          purpose: "coding" as const,
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -264,6 +265,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-1"),
         projectId: asProjectId("project-1"),
         title: "Thread",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -324,6 +326,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-archive"),
         projectId: asProjectId("project-archive"),
         title: "Archive me",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -417,6 +420,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-replay"),
         projectId: asProjectId("project-replay"),
         title: "replay",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -485,6 +489,7 @@ describe("OrchestrationEngine", () => {
           threadId: ThreadId.make("thread-stream"),
           projectId: asProjectId("project-stream"),
           title: "domain-stream",
+          purpose: "coding" as const,
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -536,6 +541,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-branch-race"),
         projectId: asProjectId("project-branch-race"),
         title: "Branch Race Thread",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -589,6 +595,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-worktree-bootstrap"),
         projectId: asProjectId("project-worktree-bootstrap"),
         title: "Worktree Bootstrap Thread",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -643,6 +650,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-ack"),
         projectId: asProjectId("project-ack"),
         title: "Ack Thread",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -680,6 +688,7 @@ describe("OrchestrationEngine", () => {
           threadId: ThreadId.make("thread-missing-project"),
           projectId: asProjectId("project-missing"),
           title: "Missing Project Thread",
+          purpose: "coding" as const,
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -731,6 +740,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-turn-diff"),
         projectId: asProjectId("project-turn-diff"),
         title: "Turn diff thread",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -852,6 +862,7 @@ describe("OrchestrationEngine", () => {
           threadId: ThreadId.make("thread-flaky-fail"),
           projectId: asProjectId("project-flaky"),
           title: "flaky-fail",
+          purpose: "coding" as const,
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
@@ -872,6 +883,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-flaky-ok"),
         projectId: asProjectId("project-flaky"),
         title: "flaky-ok",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -954,6 +966,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-atomic"),
         projectId: asProjectId("project-atomic"),
         title: "atomic",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1097,6 +1110,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-sync"),
         projectId: asProjectId("project-sync"),
         title: "sync-before",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1185,6 +1199,7 @@ describe("OrchestrationEngine", () => {
         threadId: ThreadId.make("thread-duplicate"),
         projectId: asProjectId("project-duplicate"),
         title: "duplicate",
+        purpose: "coding" as const,
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5-codex",
@@ -1205,6 +1220,7 @@ describe("OrchestrationEngine", () => {
           threadId: ThreadId.make("thread-duplicate"),
           projectId: asProjectId("project-duplicate"),
           title: "duplicate",
+          purpose: "coding" as const,
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",

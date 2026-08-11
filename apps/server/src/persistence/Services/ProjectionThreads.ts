@@ -15,6 +15,7 @@ import {
   ProviderInteractionMode,
   RuntimeMode,
   ThreadId,
+  ThreadPurposeWithDefault,
   TurnId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
@@ -28,6 +29,10 @@ export const ProjectionThread = Schema.Struct({
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
+  // Rows written before migration 036 are backfilled to 'coding' by the column
+  // default, so the decoding default here only covers a row read back before
+  // that migration has run — never a rewrite of one.
+  purpose: ThreadPurposeWithDefault,
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,

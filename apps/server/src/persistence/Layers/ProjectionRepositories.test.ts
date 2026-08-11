@@ -79,6 +79,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         threadId: ThreadId.make("thread-null-options"),
         projectId: ProjectId.make("project-null-options"),
         title: "Null options thread",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("claudeAgent"),
           model: "claude-opus-4-6",
@@ -141,6 +142,7 @@ projectionRepositoriesLayer("Projection repositories", (it) => {
         threadId: ThreadId.make("thread-settled"),
         projectId: ProjectId.make("project-1"),
         title: "Settled thread",
+        purpose: "coding",
         modelSelection: {
           instanceId: ProviderInstanceId.make("codex"),
           model: "gpt-5.4",

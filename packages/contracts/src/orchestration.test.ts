@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  DEFAULT_THREAD_PURPOSE,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationEvent,
@@ -908,6 +909,173 @@ it.effect("ModelSelection rejects malformed instance ids", () =>
       decodeModelSelection({
         instanceId: "1invalid", // must start with a letter
         model: "x",
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+/* --------------------------------------------------------- thread purpose */
+
+/*
+ * Every command, event and snapshot T3 Code has ever written predates
+ * `purpose`. None of them is rewritten, so all of them have to decode — and
+ * they have to decode as `coding`, because that is what they are.
+ */
+
+it.effect("decodes a thread.create command written before purpose existed as coding", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeOrchestrationCommand({
+      type: "thread.create",
+      commandId: "cmd-1",
+      threadId: "thread-1",
+      projectId: "project-1",
+      title: "Historical thread",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual(parsed.type, "thread.create");
+    if (parsed.type === "thread.create") {
+      assert.strictEqual(parsed.purpose, DEFAULT_THREAD_PURPOSE);
+      assert.strictEqual(parsed.purpose, "coding");
+    }
+  }),
+);
+
+it.effect("decodes a thread.created payload written before purpose existed as coding", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decodeThreadCreatedPayload({
+      threadId: "thread-1",
+      projectId: "project-1",
+      title: "Historical thread",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual(parsed.purpose, "coding");
+  }),
+);
+
+it.effect("defaults purpose to coding when decoding historical thread snapshots", () =>
+  Effect.gen(function* () {
+    const common = {
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Historical thread",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+      session: null,
+    };
+    const thread = yield* decodeOrchestrationThread({
+      ...common,
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+    });
+    const shell = yield* decodeOrchestrationThreadShell({
+      ...common,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    });
+
+    assert.strictEqual(thread.purpose, "coding");
+    assert.strictEqual(shell.purpose, "coding");
+  }),
+);
+
+it.effect("carries an explicit navigator purpose through commands, events and snapshots", () =>
+  Effect.gen(function* () {
+    const command = yield* decodeOrchestrationCommand({
+      type: "thread.create",
+      commandId: "cmd-1",
+      threadId: "thread-1",
+      projectId: "project-1",
+      title: "Navigator",
+      purpose: "navigator",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "approval-required",
+      interactionMode: "plan",
+      branch: null,
+      worktreePath: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(command.type === "thread.create" ? command.purpose : null, "navigator");
+
+    const payload = yield* decodeThreadCreatedPayload({
+      threadId: "thread-1",
+      projectId: "project-1",
+      title: "Navigator",
+      purpose: "navigator",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "approval-required",
+      interactionMode: "plan",
+      branch: null,
+      worktreePath: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(payload.purpose, "navigator");
+
+    const shell = yield* decodeOrchestrationThreadShell({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Navigator",
+      purpose: "navigator",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "approval-required",
+      interactionMode: "plan",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    });
+    assert.strictEqual(shell.purpose, "navigator");
+  }),
+);
+
+it.effect("refuses a purpose it does not know", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeThreadCreatedPayload({
+        threadId: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        purpose: "peer-loop",
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
       }),
     );
     assert.strictEqual(result._tag, "Failure");
