@@ -23,13 +23,20 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   createNavigatorExecutionStore,
+  createSnapshotRefreshLedger,
   describeExecutionResultFailure,
   navigatorExecutionKey,
+  navigatorSnapshotKey,
 } from "./navigatorExecutionCommand";
 
+const ENVIRONMENT_ID = "environment-local";
 const THREAD_ID = ThreadId.make("thread-navigator-1");
 const PLAN_ID = "plan-1";
-const KEY = navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: PLAN_ID });
+const KEY = navigatorExecutionKey({
+  environmentId: ENVIRONMENT_ID,
+  threadId: THREAD_ID,
+  proposedPlanId: PLAN_ID,
+});
 
 const EXECUTION: OrchestrationPeerLoopExecution = {
   runId: "run-77",
@@ -79,8 +86,16 @@ describe("the per-proposal gate", () => {
     const fromTimeline = vi.fn(() => gate.promise);
     const fromSidebar = vi.fn(() => gate.promise);
 
-    const timelineKey = navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: PLAN_ID });
-    const sidebarKey = navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: PLAN_ID });
+    const timelineKey = navigatorExecutionKey({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: PLAN_ID,
+    });
+    const sidebarKey = navigatorExecutionKey({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: PLAN_ID,
+    });
     expect(sidebarKey).toBe(timelineKey);
 
     const first = store.execute(timelineKey, { run: fromTimeline });
@@ -96,7 +111,11 @@ describe("the per-proposal gate", () => {
 
   it("keeps two different proposals independent", () => {
     const store = createNavigatorExecutionStore();
-    const otherKey = navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: "plan-2" });
+    const otherKey = navigatorExecutionKey({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: "plan-2",
+    });
     const gate = deferred<AsyncResult.AsyncResult<PeerLoopExecuteProposalResult, unknown>>();
     const first = vi.fn(() => gate.promise);
     const second = vi.fn(() => gate.promise);
@@ -110,7 +129,13 @@ describe("the per-proposal gate", () => {
     // conversation is put into a pending or blocked state by it.
     expect(store.read(KEY).pending).toBe(true);
     expect(
-      store.read(navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: "plan-3" })),
+      store.read(
+        navigatorExecutionKey({
+          environmentId: ENVIRONMENT_ID,
+          threadId: THREAD_ID,
+          proposedPlanId: "plan-3",
+        }),
+      ),
     ).toEqual({ pending: false, failure: null, link: null });
     gate.resolve(AsyncResult.success(RESULT));
   });
@@ -160,7 +185,7 @@ describe("the per-proposal gate", () => {
     expect(store.isBusy(KEY)).toBe(false);
   });
 
-  it("settles a defect instead of staying pending for ever", async () => {
+  it("settles a defect as an unknown outcome rather than staying pending", async () => {
     const store = createNavigatorExecutionStore();
     const run = vi.fn(async () => {
       throw new Error("socket exploded");
@@ -168,7 +193,13 @@ describe("the per-proposal gate", () => {
     await store.execute(KEY, { run });
     expect(run).toHaveBeenCalledTimes(1);
     expect(store.read(KEY).pending).toBe(false);
-    expect(store.read(KEY).failure?.presentation.title).toBe("Execute could not be sent");
+    // A throw out of the RPC layer proves nothing about the server. The failure
+    // says the result is unknown, and the exception text is never shown.
+    expect(store.read(KEY).failure?.mayHaveStarted).toBe(true);
+    expect(store.read(KEY).failure?.presentation.title).toBe(
+      "Execute was sent, and the result is unknown",
+    );
+    expect(store.read(KEY).failure?.presentation.detail).not.toContain("socket exploded");
     expect(store.isBusy(KEY)).toBe(false);
   });
 
@@ -216,10 +247,180 @@ describe("which failure this was", () => {
     expect(failure.inspectorRunId).toBe("run-5");
   });
 
-  it("does not dress a dropped connection as a Peer Loop refusal", () => {
+  it("treats a dropped connection as unknown, not as a refusal and not as safe", () => {
+    // A LOST RESPONSE IS NOT A REFUSAL. The request may have reached the
+    // coordinator, started a run and recorded the link while the answer was in
+    // flight. Claiming "nothing started" here is the guess that forks a session.
     const failure = describeExecutionResultFailure(failWith(new Error("socket closed")));
     expect(failure.presentation.code).toBeNull();
-    expect(failure.mayHaveStarted).toBe(false);
-    expect(failure.presentation.detail).toContain("no run was started");
+    expect(failure.mayHaveStarted).toBe(true);
+    expect(failure.presentation.mayHaveApplied).toBe(true);
+    expect(failure.presentation.detail).toContain("cannot say whether a run started");
+    expect(failure.presentation.detail).not.toContain("socket closed");
+    // No run id to point at, so the owner is sent to the inspector index.
+    expect(failure.inspectorRunId).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------ environments */
+
+describe("two environments, the same ids", () => {
+  // A local checkout and a cloud environment of the same project routinely
+  // carry the same thread and proposal ids. Keyed without the environment,
+  // one machine's pending Execute would render on the other.
+  const OTHER_ENVIRONMENT = "environment-cloud";
+  const otherKey = navigatorExecutionKey({
+    environmentId: OTHER_ENVIRONMENT,
+    threadId: THREAD_ID,
+    proposedPlanId: PLAN_ID,
+  });
+
+  it("does not collide", () => {
+    expect(otherKey).not.toBe(KEY);
+  });
+
+  it("gates, fails and retains independently", async () => {
+    const store = createNavigatorExecutionStore();
+    const gate = deferred<AsyncResult.AsyncResult<PeerLoopExecuteProposalResult, unknown>>();
+    const here = vi.fn(() => gate.promise);
+    const there = vi.fn(async () =>
+      failWith(
+        new PeerLoopCommandRefusedError({
+          code: "CONTROL_UNAVAILABLE",
+          detail: "another process",
+          data: null,
+        }),
+      ),
+    );
+
+    void store.execute(KEY, { run: here });
+    await store.execute(otherKey, { run: there });
+
+    // Both ran: the first environment's gate did not refuse the second.
+    expect(here).toHaveBeenCalledTimes(1);
+    expect(there).toHaveBeenCalledTimes(1);
+    expect(store.isBusy(KEY)).toBe(true);
+    expect(store.isBusy(otherKey)).toBe(false);
+    expect(store.read(KEY).pending).toBe(true);
+    expect(store.read(KEY).failure).toBeNull();
+    expect(store.read(otherKey).pending).toBe(false);
+    expect(store.read(otherKey).failure?.presentation.code).toBe("CONTROL_UNAVAILABLE");
+
+    gate.resolve(AsyncResult.success(RESULT));
+  });
+
+  it("keeps retained links apart", async () => {
+    const store = createNavigatorExecutionStore();
+    await store.execute(KEY, { run: async () => AsyncResult.success(RESULT) });
+    expect(store.read(KEY).link).toEqual(EXECUTION);
+    // The other environment has not executed anything and must not inherit a
+    // link, or its conversation would show a run that is not on that machine.
+    expect(store.read(otherKey).link).toBeNull();
+    store.releaseLink(KEY);
+    expect(store.read(KEY).link).toBeNull();
+  });
+});
+
+/* ---------------------------------------------------------- cleanup */
+
+describe("what the store keeps", () => {
+  it("holds nothing for a conversation that has done nothing", () => {
+    const store = createNavigatorExecutionStore();
+    expect(store.read(KEY)).toEqual({ pending: false, failure: null, link: null });
+    expect(store.size()).toBe(0);
+  });
+
+  it("evicts an entry once its link is durable, however it became idle", async () => {
+    // The bug this replaces: releasing a link produced a NEW object that was
+    // idle by every meaning that matters but was not the shared constant, so
+    // the identity check kept it for ever.
+    const store = createNavigatorExecutionStore();
+    await store.execute(KEY, { run: async () => AsyncResult.success(RESULT) });
+    expect(store.size()).toBe(1);
+    store.releaseLink(KEY);
+    expect(store.size()).toBe(0);
+  });
+
+  it("evicts an entry once a failure is dismissed", async () => {
+    const store = createNavigatorExecutionStore();
+    await store.execute(KEY, {
+      run: async () =>
+        failWith(
+          new PeerLoopExecutionCoordinationError({
+            reason: "proposal-not-found",
+            detail: "internal",
+            threadId: THREAD_ID,
+            proposedPlanId: PLAN_ID as OrchestrationPeerLoopExecution["proposedPlanId"],
+            runId: null,
+            mayHaveStarted: false,
+          }),
+        ),
+    });
+    expect(store.size()).toBe(1);
+    store.dismissFailure(KEY);
+    expect(store.size()).toBe(0);
+  });
+
+  it("does not grow as conversation after conversation catches up", async () => {
+    const store = createNavigatorExecutionStore();
+    for (let index = 0; index < 50; index += 1) {
+      const key = navigatorExecutionKey({
+        environmentId: ENVIRONMENT_ID,
+        threadId: ThreadId.make(`thread-${index}`),
+        proposedPlanId: `plan-${index}`,
+      });
+      await store.execute(key, { run: async () => AsyncResult.success(RESULT) });
+      store.releaseLink(key);
+    }
+    expect(store.size()).toBe(0);
+  });
+
+  it("keeps a settled failure that may have left a run behind", async () => {
+    // Safety information. It is not dropped because a card unmounted, or the
+    // next render would offer Execute for a run that may already exist.
+    const store = createNavigatorExecutionStore();
+    await store.execute(KEY, {
+      run: async () => {
+        throw new Error("socket exploded");
+      },
+    });
+    expect(store.size()).toBe(1);
+    expect(store.read(KEY).failure?.mayHaveStarted).toBe(true);
+  });
+});
+
+/* -------------------------------------------------- snapshot refresh */
+
+describe("who refreshes a shared snapshot", () => {
+  const KEY_A = navigatorSnapshotKey({ environmentId: "environment-local", runId: "run-77" });
+
+  it("lets exactly one copy claim each revision", () => {
+    const ledger = createSnapshotRefreshLedger();
+    // Both the timeline copy and the sidebar copy see the same new `updatedAt`
+    // in the same tick. One `run.attach`, not two.
+    expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(true);
+    expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(false);
+    expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(false);
+  });
+
+  it("claims again when the summary actually moves", () => {
+    const ledger = createSnapshotRefreshLedger();
+    ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z");
+    expect(ledger.claim(KEY_A, "2026-03-01T10:06:00.000Z")).toBe(true);
+    expect(ledger.claim(KEY_A, "2026-03-01T10:06:00.000Z")).toBe(false);
+  });
+
+  it("keeps runs and environments apart", () => {
+    const ledger = createSnapshotRefreshLedger();
+    const other = navigatorSnapshotKey({ environmentId: "environment-cloud", runId: "run-77" });
+    expect(other).not.toBe(KEY_A);
+    ledger.claim(KEY_A, "rev-1");
+    expect(ledger.claim(other, "rev-1")).toBe(true);
+    expect(
+      ledger.claim(
+        navigatorSnapshotKey({ environmentId: "environment-local", runId: "run-9" }),
+        "rev-1",
+      ),
+    ).toBe(true);
   });
 });

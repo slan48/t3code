@@ -812,10 +812,27 @@ about execution at all.
 
 **Two visible controls, one gate.** The action appears in both the timeline
 proposal card and the Plan sidebar, from the same component. The gate lives in
-a module-level store keyed by conversation and proposal
-(`apps/web/src/state/navigatorExecutionCommand.ts`), so the two controls are the
-same control: a synchronous second press — from either place — is refused before
-an RPC exists. A hook-local flag would have given one proposal two gates.
+a module-level store (`apps/web/src/state/navigatorExecutionCommand.ts`) keyed
+by a length-prefixed **environment, conversation, proposal** triple, so the two
+controls are the same control: a synchronous second press — from either place —
+is refused before an RPC exists. A hook-local flag would have given one proposal
+two gates.
+
+The environment is part of that identity, not decoration. Thread ids and
+proposal ids are T3 Code's, and a local checkout and a cloud environment of the
+same project routinely carry the same ones. Keyed without it, an Execute pending
+on one machine would render as pending on the other, and a retained link from
+one would be reconciled against the other's read model.
+
+**Idle entries are evicted structurally.** An entry with no pending request, no
+failure and no retained link is deleted rather than kept, and idleness is
+detected by _shape_ — comparing against a shared constant looked equivalent and
+was not, because releasing a retained link produces a fresh, equal object that
+was then kept for ever. A pending request and a settled failure are never
+evicted here: a failure that may have left a run behind is safety information,
+and dropping it because a card unmounted would re-offer Execute on the next
+render. The store exposes a read-only `size()` so a test can prove the retention
+does not grow as conversations come and go.
 
 **The request is two ids.** `buildExecuteProposalRequest` produces the
 environment wrapper and `{ threadId, proposedPlanId }`. No objective, no project
@@ -829,11 +846,23 @@ decision.
 defects. Both error families survive with their structure: a Peer Loop refusal
 keeps its code and the run a duplicate-run refusal names, a timeout keeps
 `mayHaveApplied`, and a `PeerLoopExecutionCoordinationError` gets bounded
-per-reason owner wording plus its structured `runId` and `mayHaveStarted`.
-`link-not-confirmed` says a run exists that T3 Code could not record, says not
-to press Execute again, links straight to `/peer-loop/$runId` — and **removes
-the Execute button**, because offering it beside that warning would invite a
-second run.
+per-reason owner wording plus its structured `runId` and `mayHaveStarted`, which
+is authoritative in both directions. `link-not-confirmed` says a run exists that
+T3 Code could not record, says not to press Execute again, links straight to
+`/peer-loop/$runId` — and **removes the Execute button**, because offering it
+beside that warning would invite a second run.
+
+**An unclassified failure is unknown, not safe.** A dropped socket, a lost
+response or an unexpected throw out of the RPC layer proves nothing about the
+server: `peerLoop.executeProposal` may have reached the coordinator, started a
+run and recorded the link while the answer was in flight. Saying "no run was
+started" there would be a guess whose cost is a second Reviewer session, so
+these are reported as an unknown outcome, marked may-have-started, never
+retried, and the Execute action is withheld until the owner has looked. With no
+run id to name, the notice links to the Peer Loop inspector **index** — "go and
+see whether one exists" is the only honest instruction. Only a _typed_ pre-start
+refusal re-enables Execute. Nothing from the cause, the exception or the
+transport is shown.
 
 **Immediate result, then the durable link.** The reply carries the association
 T3 Code persisted, and it is retained locally until the identical link — same
@@ -855,20 +884,57 @@ pause, resume, recovery, owner-approval or owner-message control — those need
 the run's live control snapshot and stay in the advanced inspector, which the
 card links to.
 
-**Observation is conditional.** `selectNavigatorRunListAtom` returns a
-query-nothing atom unless the conversation has at least one link, durable or
-just returned. Opening `/navigator`, its sidebar entry, a Navigator draft or a
-Navigator conversation that has never executed anything therefore issues no Peer
-Loop RPC and cannot spawn the bridge. When a link does exist, the read is the
-existing five-second run-summary poll, keyed to the **thread's own environment**
-— run ids are per-machine, and another environment's list would match a link
-against a stranger's run. No run is attached or subscribed to from here, and a
-new link triggers one re-read rather than waiting out the poll.
+**Observation is conditional, at two levels.** `selectNavigatorRunListAtom`
+returns a query-nothing atom unless the conversation has at least one link,
+durable or just returned. Opening `/navigator`, its sidebar entry, a Navigator
+draft or a Navigator conversation that has never executed anything therefore
+issues no Peer Loop RPC and cannot spawn the bridge. When a link does exist, the
+read is the existing five-second run-summary poll, keyed to the **thread's own
+environment** — run ids are per-machine, and another environment's list would
+match a link against a stranger's run. A new link triggers one re-read rather
+than waiting out the poll.
+
+Above that, `selectNavigatorSnapshotAtom` reads one run's durable snapshot
+through the existing read-only `peerLoop.attachRun`, and **only for the two
+attention states where structured detail tells the owner something the run list
+cannot: DONE and OWNER_REQUIRED.** An ordinary working, paused, failed,
+driverless or interrupted child card is run-list-only; attaching for every
+historical child would cost a bridge request per card for information nobody
+asked for. The snapshot atom is keyed by environment _and_ run, so the timeline
+copy and the sidebar copy of one execution share a single request, and a
+refresh ledger lets only the first copy to notice a new summary `updatedAt`
+re-read it — one `run.attach` per change, not one per rendered copy. Nothing
+polls the snapshot and nothing opens `run.subscribeEvents`.
+
+**Structured DONE and OWNER_REQUIRED, from the inspector's own helpers.**
+`describeCompletionFromRecord` and `describeOwnerDecisionFromRecord` were split
+out of the advanced inspector's `describeCompletion` / `describeOwnerDecision`
+so a child card reading a snapshot produces exactly the wording, bounds and
+option limits the inspector produces. Precedence is unchanged where it applies:
+the inspector still prefers a live outcome when its subscription has one, and a
+child card — which has no subscription — uses `lastReviewerDecision` alone. A
+finished execution foregrounds the Reviewer's summary and final state and shows
+Peer Loop's own recorded repository HEAD; no commit list is invented and no git
+history is walked from the browser. A waiting execution shows the structured
+question, why an owner is needed, and the bounded options, and says plainly that
+it is waiting. Nothing is read from a Builder report, a Builder task, a prompt
+or activity text, and a driverless or interrupted run is never described as
+asking an owner question. Where Peer Loop reports the state but recorded no
+structured decision, the card keeps the status and says the detail is missing; a
+failed snapshot read says only that additional details are unavailable and
+leaves the run-list status untouched.
+
+**The card still carries no controls.** Answering an OWNER_REQUIRED question is
+a live command against Peer Loop's control snapshot, which a child card does not
+have, so it links to `/peer-loop/$runId` — "Review and respond in execution
+details" — where Peer Loop's explicit safe controls remain authoritative. Timestamps
+use the same relative-time helper the Peer Loop index uses rather than exposing
+raw ISO instants.
 
 **Still forthcoming, and deliberately not present yet:** natural-language
-confirmation of an agreed proposal, richer structured run context and the DONE
-return summary inside the conversation, Navigator's own explanation of
-`OWNER_REQUIRED`, and the mobile Navigator UI.
+confirmation of an agreed proposal, an activity or event transcript inside the
+conversation, Navigator's own narrated explanation of an `OWNER_REQUIRED`
+question in its own words, and the mobile Navigator UI.
 
 Nothing else launches a run. The explicit Execute action described above is the
 only way a Navigator conversation starts one, and the link it records is the

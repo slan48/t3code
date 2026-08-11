@@ -29,17 +29,24 @@ import type {
   PeerLoopError,
   PeerLoopExecutionCoordinationError,
   PeerLoopExecutionFailureReason,
+  PeerLoopRunStateFile,
   PeerLoopRunSummary,
   ThreadId,
   ThreadPurpose,
 } from "@t3tools/contracts";
 
+import { formatRelative } from "./agentRunFormat";
 import {
+  describeCompletionFromRecord,
   describeError,
+  describeOwnerDecisionFromRecord,
   describeRunAttention,
   existingRunIdFromRefusal,
+  type PeerLoopAttentionKey,
   type PeerLoopAttentionPresentation,
+  type PeerLoopCompletion,
   type PeerLoopErrorPresentation,
+  type PeerLoopOwnerDecision,
 } from "./peerLoopPresentation";
 
 /* --------------------------------------------------------- eligibility */
@@ -64,7 +71,14 @@ export type ExecuteProposalBlockedReason =
   /** Already implemented the ordinary way, by a coding thread. */
   | "already-implemented"
   /** This client is executing it right now. */
-  | "executing";
+  | "executing"
+  /**
+   * The last attempt's outcome is not known.
+   *
+   * A run may exist. Offering Execute again would be an invitation to start a
+   * second one, so the action is withheld until the owner has looked.
+   */
+  | "outcome-unknown";
 
 export interface ExecuteProposalAvailability {
   readonly canExecute: boolean;
@@ -103,6 +117,14 @@ export function executeProposalAvailability(input: {
   readonly executionCount: number;
   /** True while this client's own Execute request is outstanding. */
   readonly executing: boolean;
+  /**
+   * True when the last attempt may have left a run behind.
+   *
+   * Includes both the typed cases Peer Loop is explicit about and every
+   * unclassified client failure, because a lost response cannot prove the
+   * server did nothing.
+   */
+  readonly lastAttemptMayHaveStarted: boolean;
 }): ExecuteProposalAvailability {
   if (input.purpose !== "navigator") return blocked("not-a-navigator-thread");
   if (!input.isDurableThread) return blocked("draft-conversation");
@@ -113,6 +135,7 @@ export function executeProposalAvailability(input: {
     return blocked("already-implemented");
   }
   if (input.executing) return blocked("executing");
+  if (input.lastAttemptMayHaveStarted) return blocked("outcome-unknown");
   return AVAILABLE;
 }
 
@@ -258,6 +281,46 @@ export function selectNavigatorRunListAtom<A>(input: {
   return input.runsAtomFor(input.environmentId);
 }
 
+/**
+ * The attention states where a structured snapshot tells the owner something
+ * the run list cannot.
+ *
+ * Deliberately two. `DONE` has a Reviewer summary, a final state and a
+ * repository HEAD the list does not carry; `OWNER_REQUIRED` has the question
+ * itself. An ordinary working run has nothing extra worth a second RPC, and
+ * attaching to every historical child run would cost one bridge request per
+ * card for information nobody asked for.
+ */
+const SNAPSHOT_WORTH_READING: ReadonlySet<PeerLoopAttentionKey> = new Set([
+  "done",
+  "owner-decision",
+]);
+
+export function executionSnapshotIsUseful(status: NavigatorExecutionStatus): boolean {
+  return status.kind === "summary" && SNAPSHOT_WORTH_READING.has(status.attention.key);
+}
+
+/**
+ * Which snapshot atom a child execution reads. Usually none.
+ *
+ * Same shape and same reason as the run list: a factory rather than an atom,
+ * so "never asked for" is observable. Keyed by environment *and* run, so the
+ * timeline copy and the sidebar copy of one execution share a single
+ * `peerLoop.attachRun` rather than issuing two bridge requests for the same
+ * answer.
+ */
+export function selectNavigatorSnapshotAtom<A>(input: {
+  readonly environmentId: EnvironmentId | null;
+  readonly runId: string;
+  readonly wanted: boolean;
+  readonly snapshotAtomFor: (environmentId: EnvironmentId, runId: string) => A;
+  /** What to read when there is nothing to observe. Must query nothing. */
+  readonly none: A;
+}): A {
+  if (!input.wanted || input.environmentId === null) return input.none;
+  return input.snapshotAtomFor(input.environmentId, input.runId);
+}
+
 /* -------------------------------------------------------- child cards */
 
 export type NavigatorExecutionStatus =
@@ -265,6 +328,9 @@ export type NavigatorExecutionStatus =
       readonly kind: "summary";
       readonly attention: PeerLoopAttentionPresentation;
       readonly iteration: number;
+      /** Peer Loop's own `updatedAt`, already relative. Null if unparseable. */
+      readonly updatedLabel: string | null;
+      /** Peer Loop's structured `updatedAt`. The snapshot's refresh trigger. */
       readonly updatedAt: string;
       readonly queuedOwnerMessages: number;
     }
@@ -300,6 +366,8 @@ export function describeExecution(input: {
   readonly link: OrchestrationPeerLoopExecution;
   readonly runs: ReadonlyArray<PeerLoopRunSummary>;
   readonly unreadable: ReadonlyArray<string>;
+  /** For the relative label. Passed in so this stays pure and testable. */
+  readonly nowMs: number;
 }): NavigatorExecutionPresentation {
   const summary = input.runs.find((run) => run.runId === input.link.runId) ?? null;
   const base = { runId: input.link.runId, linkedAt: input.link.createdAt } as const;
@@ -310,6 +378,9 @@ export function describeExecution(input: {
         kind: "summary",
         attention: describeRunAttention(summary),
         iteration: summary.iteration,
+        // The same relative helper the Peer Loop index uses, so "23m ago"
+        // reads the same on both surfaces and no raw ISO reaches the owner.
+        updatedLabel: formatRelative(summary.updatedAt, input.nowMs),
         updatedAt: summary.updatedAt,
         queuedOwnerMessages: summary.queuedOwnerMessages,
       },
@@ -318,6 +389,96 @@ export function describeExecution(input: {
   if (input.unreadable.includes(input.link.runId))
     return { ...base, status: { kind: "unreadable" } };
   return { ...base, status: { kind: "unavailable" } };
+}
+
+/* -------------------------------------------------- structured detail */
+
+/**
+ * A run's durable snapshot as this card sees it.
+ *
+ * `peerLoop.attachRun` and nothing else: a read-only snapshot, no event
+ * subscription, no activity replay. `state` is Peer Loop's own run state file.
+ */
+export interface NavigatorExecutionSnapshot {
+  readonly status: "absent" | "loading" | "failed" | "ready";
+  readonly state: PeerLoopRunStateFile | null;
+}
+
+export const NO_EXECUTION_SNAPSHOT: NavigatorExecutionSnapshot = {
+  status: "absent",
+  state: null,
+};
+
+/**
+ * The extra, structured paragraph under a child execution's status line.
+ *
+ * Only two attention states produce one, and both come from Peer Loop's own
+ * `lastReviewerDecision` through the helpers the advanced inspector uses. When
+ * the snapshot has not arrived, failed, or carries no structured decision, that
+ * is said — the status line above it is never weakened or second-guessed.
+ */
+export type NavigatorExecutionDetail =
+  | { readonly kind: "none" }
+  | { readonly kind: "loading" }
+  /** The snapshot read failed. The run-list status stands unchanged. */
+  | { readonly kind: "unavailable" }
+  | {
+      readonly kind: "completion";
+      readonly completion: PeerLoopCompletion;
+      /** Peer Loop's own recorded HEAD. Never derived by walking git here. */
+      readonly head: string | null;
+      readonly branch: string | null;
+    }
+  /** Peer Loop says DONE and recorded no structured completion decision. */
+  | { readonly kind: "completion-missing" }
+  | { readonly kind: "owner-required"; readonly decision: PeerLoopOwnerDecision }
+  /** Waiting on the owner, with no structured question recorded. */
+  | { readonly kind: "owner-required-missing" };
+
+/** A git object id is short; anything longer is not one, so it is bounded. */
+export const NAVIGATOR_HEAD_DISPLAY_CHARS = 40;
+
+const boundedRef = (value: string | null | undefined): string | null => {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.length <= NAVIGATOR_HEAD_DISPLAY_CHARS
+    ? trimmed
+    : `${trimmed.slice(0, NAVIGATOR_HEAD_DISPLAY_CHARS - 1)}…`;
+};
+
+export function describeExecutionDetail(input: {
+  readonly status: NavigatorExecutionStatus;
+  readonly snapshot: NavigatorExecutionSnapshot;
+}): NavigatorExecutionDetail {
+  // A driverless or interrupted run is NOT a run asking an owner a question,
+  // and this is where that stays true: nothing outside the two useful states
+  // gets a structured block at all.
+  if (!executionSnapshotIsUseful(input.status)) return { kind: "none" };
+  if (input.snapshot.status === "absent") return { kind: "none" };
+  if (input.snapshot.status === "loading") return { kind: "loading" };
+  if (input.snapshot.status === "failed") return { kind: "unavailable" };
+
+  const state = input.snapshot.state;
+  if (state === null) return { kind: "unavailable" };
+  const decision = state.lastReviewerDecision;
+  const attention = input.status.kind === "summary" ? input.status.attention.key : "none";
+
+  if (attention === "done") {
+    const completion = describeCompletionFromRecord(decision);
+    if (completion === null) return { kind: "completion-missing" };
+    return {
+      kind: "completion",
+      completion,
+      head: boundedRef(state.repo?.head),
+      branch: boundedRef(state.repo?.branch),
+    };
+  }
+
+  const owner = describeOwnerDecisionFromRecord(decision);
+  return owner === null
+    ? { kind: "owner-required-missing" }
+    : { kind: "owner-required", decision: owner };
 }
 
 /* ------------------------------------------------------------- failures */
@@ -423,32 +584,27 @@ export function describePeerLoopExecutionError(error: PeerLoopError): NavigatorE
   };
 }
 
-/** The connection failed before Peer Loop was involved. Nothing was started. */
-export const EXECUTION_SEND_FAILED: NavigatorExecutionFailure = {
-  presentation: {
-    title: "Execute could not be sent",
-    detail: `The connection to this environment failed, so no run was started. ${NEVER_RETRIED}`,
-    code: null,
-    tone: "warning",
-    mayHaveApplied: false,
-  },
-  inspectorRunId: null,
-  mayHaveStarted: false,
-};
-
 /**
- * An unexpected throw out of the RPC layer.
+ * A failure nothing typed explains: a dropped socket, a lost response, an
+ * unexpected throw out of the RPC layer.
  *
- * Bounded and generic: whatever a defect carries was never meant for a remote
- * client. It is stated as possibly-started because this path cannot prove
- * otherwise, and it is still never retried.
+ * STATED AS UNKNOWN, NOT AS "NOTHING HAPPENED". A request that never came back
+ * is not a request the server refused: `peerLoop.executeProposal` may have
+ * reached the coordinator, started a run and recorded the link while the answer
+ * was in flight. Claiming "no run was started" here would be a guess, and the
+ * cost of being wrong is a second Reviewer session. So the outcome is reported
+ * as unknown, Execute is withheld, nothing is retried, and the owner is sent to
+ * the Peer Loop inspector — with no run id to link to, that means its index.
+ *
+ * Bounded and generic on purpose: whatever a defect or a transport error
+ * carried was never meant for a remote client, and none of it is shown.
  */
-export const EXECUTION_SEND_FAILED_UNEXPECTEDLY: NavigatorExecutionFailure = {
+export const EXECUTION_RESULT_UNKNOWN: NavigatorExecutionFailure = {
   presentation: {
-    title: "Execute could not be sent",
+    title: "Execute was sent, and the result is unknown",
     detail:
-      "Something went wrong sending this. Check Peer Loop before trying again — a run may exist. " +
-      NEVER_RETRIED,
+      "The connection failed before Peer Loop's answer arrived, so T3 Code cannot say whether a " +
+      `run started. Check Peer Loop before trying again. ${NEVER_RETRIED}`,
     code: null,
     tone: "warning",
     mayHaveApplied: true,
@@ -456,3 +612,23 @@ export const EXECUTION_SEND_FAILED_UNEXPECTEDLY: NavigatorExecutionFailure = {
   inspectorRunId: null,
   mayHaveStarted: true,
 };
+
+/* ----------------------------------------------------- inspector target */
+
+/**
+ * Where a failure sends the owner to look.
+ *
+ * A named run wins. Failing that, anything that may have started a run goes to
+ * the inspector index — "go and see whether one exists" is the only honest
+ * instruction when T3 Code does not know. A failure that provably started
+ * nothing sends the owner nowhere; there is nothing to look at.
+ */
+export type NavigatorInspectorTarget =
+  | { readonly kind: "run"; readonly runId: string }
+  | { readonly kind: "index" }
+  | { readonly kind: "none" };
+
+export function inspectorTargetFor(failure: NavigatorExecutionFailure): NavigatorInspectorTarget {
+  if (failure.inspectorRunId !== null) return { kind: "run", runId: failure.inspectorRunId };
+  return failure.mayHaveStarted ? { kind: "index" } : { kind: "none" };
+}

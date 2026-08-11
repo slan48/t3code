@@ -10,6 +10,7 @@ import type {
   EnvironmentId,
   OrchestrationPeerLoopExecution,
   OrchestrationProposedPlanId,
+  PeerLoopRunStateFile,
   PeerLoopRunSummary,
 } from "@t3tools/contracts";
 import {
@@ -25,18 +26,27 @@ import {
   buildExecuteProposalRequest,
   describeCoordinationError,
   describeExecution,
+  describeExecutionDetail,
   describePeerLoopExecutionError,
   executeProposalAvailability,
+  executionSnapshotIsUseful,
+  EXECUTION_RESULT_UNKNOWN,
   groupExecutionsByProposal,
+  inspectorTargetFor,
   localLinkIsDurable,
+  NO_EXECUTION_SNAPSHOT,
   reconcileExecutionLinks,
   selectNavigatorRunListAtom,
+  selectNavigatorSnapshotAtom,
   showsExecutionArea,
+  type NavigatorExecutionSnapshot,
 } from "./navigatorExecution";
 
 const ENVIRONMENT_ID = "environment-local" as EnvironmentId;
 const THREAD_ID = ThreadId.make("thread-navigator-1");
 const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
+/** Fixed, so the relative-time label is deterministic. */
+const NOW_MS = Date.parse("2026-03-01T10:20:00.000Z");
 
 const proposal = (
   overrides: Partial<{ implementedAt: string | null; implementationThreadId: string | null }> = {},
@@ -53,6 +63,7 @@ const eligible = {
   proposal: proposal(),
   executionCount: 0,
   executing: false,
+  lastAttemptMayHaveStarted: false,
 };
 
 const link = (input: {
@@ -161,6 +172,15 @@ describe("execute eligibility", () => {
         proposal: proposal({ implementationThreadId: "thread-coding-9" }),
       }).blockedReason,
     ).toBe("already-implemented");
+  });
+
+  it("withholds the action while the last attempt's outcome is unknown", () => {
+    // A lost response is not proof the server did nothing. Offering Execute
+    // again here is how one intent becomes two Reviewer sessions.
+    expect(executeProposalAvailability({ ...eligible, lastAttemptMayHaveStarted: true })).toEqual({
+      canExecute: false,
+      blockedReason: "outcome-unknown",
+    });
   });
 
   it("reports an in-flight request as its own reason, not as unavailable", () => {
@@ -299,6 +319,7 @@ describe("child execution cards", () => {
       link: link({ runId: "run-1" }),
       runs: input.runs ?? [],
       unreadable: input.unreadable ?? [],
+      nowMs: NOW_MS,
     });
 
   it("reads an active run from Peer Loop's structured summary", () => {
@@ -342,6 +363,7 @@ describe("child execution cards", () => {
         link: link({ runId: "run-1" }),
         runs: [summary({ state: "error" })],
         unreadable: [],
+        nowMs: NOW_MS,
       }).status,
     ).toMatchObject({ kind: "summary", attention: { key: "failed" } });
     expect(
@@ -349,6 +371,7 @@ describe("child execution cards", () => {
         link: link({ runId: "run-1" }),
         runs: [summary({ state: "done" })],
         unreadable: [],
+        nowMs: NOW_MS,
       }).status,
     ).toMatchObject({ kind: "summary", attention: { key: "done" } });
   });
@@ -463,5 +486,287 @@ describe("Peer Loop's own failures on this call", () => {
     expect(failure.presentation.mayHaveApplied).toBe(true);
     expect(failure.mayHaveStarted).toBe(true);
     expect(failure.presentation.detail).toContain("Nothing was retried");
+  });
+});
+
+/* ------------------------------------------------ ambiguous failures */
+
+describe("a failure nothing typed explains", () => {
+  it("says the result is unknown rather than that nothing started", () => {
+    expect(EXECUTION_RESULT_UNKNOWN.mayHaveStarted).toBe(true);
+    expect(EXECUTION_RESULT_UNKNOWN.presentation.mayHaveApplied).toBe(true);
+    expect(EXECUTION_RESULT_UNKNOWN.presentation.detail).toContain(
+      "cannot say whether a run started",
+    );
+    expect(EXECUTION_RESULT_UNKNOWN.presentation.detail).toContain("Nothing was retried");
+    // Bounded and generic: no cause, no exception text, no transport detail.
+    expect((EXECUTION_RESULT_UNKNOWN.presentation.detail ?? "").length).toBeLessThan(400);
+    expect(EXECUTION_RESULT_UNKNOWN.presentation.code).toBeNull();
+  });
+
+  it("sends the owner to the inspector index when there is no run to name", () => {
+    expect(inspectorTargetFor(EXECUTION_RESULT_UNKNOWN)).toEqual({ kind: "index" });
+  });
+
+  it("names the run when the failure knew one", () => {
+    expect(
+      inspectorTargetFor(
+        describeCoordinationError(
+          new PeerLoopExecutionCoordinationError({
+            reason: "link-not-confirmed",
+            detail: "internal",
+            threadId: THREAD_ID,
+            proposedPlanId: PLAN_ID,
+            runId: "run-77",
+            mayHaveStarted: true,
+          }),
+        ),
+      ),
+    ).toEqual({ kind: "run", runId: "run-77" });
+  });
+
+  it("sends the owner nowhere when the failure proves nothing started", () => {
+    // A typed pre-start coordination refusal is authoritative: there is no run
+    // to look at, and the owner may safely press Execute again once the cause
+    // is fixed.
+    const failure = describeCoordinationError(
+      new PeerLoopExecutionCoordinationError({
+        reason: "project-not-found",
+        detail: "internal",
+        threadId: THREAD_ID,
+        proposedPlanId: PLAN_ID,
+        runId: null,
+        mayHaveStarted: false,
+      }),
+    );
+    expect(inspectorTargetFor(failure)).toEqual({ kind: "none" });
+    expect(
+      executeProposalAvailability({
+        ...eligible,
+        lastAttemptMayHaveStarted: failure.mayHaveStarted,
+      }).canExecute,
+    ).toBe(true);
+  });
+});
+
+/* ------------------------------------------- conditional snapshot read */
+
+describe("when a structured snapshot is worth reading", () => {
+  const statusFor = (run: PeerLoopRunSummary) =>
+    describeExecution({
+      link: link({ runId: "run-1" }),
+      runs: [run],
+      unreadable: [],
+      nowMs: NOW_MS,
+    }).status;
+
+  it("reads one for DONE and for OWNER_REQUIRED", () => {
+    expect(executionSnapshotIsUseful(statusFor(summary({ state: "done" })))).toBe(true);
+    expect(executionSnapshotIsUseful(statusFor(summary({ state: "owner_required" })))).toBe(true);
+  });
+
+  it("reads none for an ordinary working run, or a driverless or failed one", () => {
+    // One `run.attach` per historical child card, for information nobody asked
+    // for, is exactly what this avoids.
+    expect(executionSnapshotIsUseful(statusFor(summary()))).toBe(false);
+    expect(executionSnapshotIsUseful(statusFor(summary({ liveWriter: null })))).toBe(false);
+    expect(executionSnapshotIsUseful(statusFor(summary({ state: "error" })))).toBe(false);
+    expect(executionSnapshotIsUseful(statusFor(summary({ state: "interrupted" })))).toBe(false);
+    expect(executionSnapshotIsUseful(statusFor(summary({ state: "paused" })))).toBe(false);
+  });
+
+  it("reads none for a run the list does not carry at all", () => {
+    expect(
+      executionSnapshotIsUseful(
+        describeExecution({
+          link: link({ runId: "run-1" }),
+          runs: [],
+          unreadable: [],
+          nowMs: NOW_MS,
+        }).status,
+      ),
+    ).toBe(false);
+  });
+
+  it("never asks for a snapshot atom it does not want", () => {
+    const none = Symbol("no-query");
+    const snapshotAtomFor = vi.fn(() => Symbol("snapshot"));
+    expect(
+      selectNavigatorSnapshotAtom({
+        environmentId: ENVIRONMENT_ID,
+        runId: "run-1",
+        wanted: false,
+        snapshotAtomFor,
+        none,
+      }),
+    ).toBe(none);
+    expect(
+      selectNavigatorSnapshotAtom({
+        environmentId: null,
+        runId: "run-1",
+        wanted: true,
+        snapshotAtomFor,
+        none,
+      }),
+    ).toBe(none);
+    expect(snapshotAtomFor).not.toHaveBeenCalled();
+  });
+
+  it("keys the snapshot by environment and run, so two copies share one", () => {
+    const snapshot = Symbol("snapshot");
+    const snapshotAtomFor = vi.fn(() => snapshot);
+    const read = () =>
+      selectNavigatorSnapshotAtom({
+        environmentId: ENVIRONMENT_ID,
+        runId: "run-1",
+        wanted: true,
+        snapshotAtomFor,
+        none: Symbol("no-query"),
+      });
+    expect(read()).toBe(snapshot);
+    expect(read()).toBe(snapshot);
+    expect(snapshotAtomFor).toHaveBeenCalledWith(ENVIRONMENT_ID, "run-1");
+  });
+});
+
+/* --------------------------------------------------- structured detail */
+
+describe("the structured block under a child card", () => {
+  const statusFor = (run: PeerLoopRunSummary) =>
+    describeExecution({
+      link: link({ runId: "run-1" }),
+      runs: [run],
+      unreadable: [],
+      nowMs: NOW_MS,
+    }).status;
+
+  const ready = (
+    decision: PeerLoopRunStateFile["lastReviewerDecision"],
+    repo: PeerLoopRunStateFile["repo"] = null,
+  ): NavigatorExecutionSnapshot => ({
+    status: "ready",
+    state: {
+      schemaVersion: 1,
+      runId: "run-1",
+      projectPath: "/repos/demo",
+      state: "done",
+      iteration: 5,
+      createdAt: "2026-03-01T09:00:00.000Z",
+      updatedAt: "2026-03-01T10:05:00.000Z",
+      ownerPolicyText: "",
+      builderSessionId: null,
+      reviewerThreadId: null,
+      repo,
+      lastBuilderTask: "do not read me",
+      lastBuilderReport: "do not read me either",
+      lastReviewerDecision: decision,
+      queuedOwnerMessages: [],
+      inFlight: null,
+      haltReason: null,
+      stopRequested: false,
+      adapters,
+      safetyLimit: null,
+      lastSequence: 20,
+    } as PeerLoopRunStateFile,
+  });
+
+  it("has nothing to add for an ordinary working run", () => {
+    expect(
+      describeExecutionDetail({ status: statusFor(summary()), snapshot: NO_EXECUTION_SNAPSHOT }),
+    ).toEqual({ kind: "none" });
+  });
+
+  it("never describes a driverless or interrupted run as asking a question", () => {
+    // The realistic mistake: "needs attention" collapsing into "needs an
+    // answer". A run nobody is driving is not a run with a question.
+    for (const run of [
+      summary({ liveWriter: null }),
+      summary({ state: "interrupted" }),
+      summary({ state: "error" }),
+    ]) {
+      const detail = describeExecutionDetail({
+        status: statusFor(run),
+        snapshot: ready({
+          decision: "OWNER_REQUIRED",
+          summary: "s",
+          ownerQuestion: "q",
+          whyOwnerIsRequired: "w",
+          options: ["a"],
+        }),
+      });
+      expect(detail).toEqual({ kind: "none" });
+    }
+  });
+
+  it("says the details are loading, then that they are unavailable", () => {
+    const done = statusFor(summary({ state: "done" }));
+    expect(
+      describeExecutionDetail({ status: done, snapshot: { status: "loading", state: null } }),
+    ).toEqual({ kind: "loading" });
+    expect(
+      describeExecutionDetail({ status: done, snapshot: { status: "failed", state: null } }),
+    ).toEqual({ kind: "unavailable" });
+  });
+
+  it("foregrounds the structured DONE summary, final state and HEAD", () => {
+    const detail = describeExecutionDetail({
+      status: statusFor(summary({ state: "done" })),
+      snapshot: ready(
+        { decision: "DONE", summary: "Backfill shipped.", finalState: "Green on main." },
+        {
+          head: "abc123def456",
+          branch: "main",
+          worktreeDigest: null,
+          isGitRepo: true,
+          capturedAt: "2026-03-01T10:05:00.000Z",
+        },
+      ),
+    });
+    expect(detail).toEqual({
+      kind: "completion",
+      completion: { summary: "Backfill shipped.", finalState: "Green on main." },
+      // Peer Loop's own recorded HEAD. Nothing walks git from the browser.
+      head: "abc123def456",
+      branch: "main",
+    });
+  });
+
+  it("keeps DONE and says the completion summary is missing", () => {
+    expect(
+      describeExecutionDetail({
+        status: statusFor(summary({ state: "done" })),
+        snapshot: ready(null),
+      }),
+    ).toEqual({ kind: "completion-missing" });
+  });
+
+  it("shows the structured owner question, why, and bounded options", () => {
+    const detail = describeExecutionDetail({
+      status: statusFor(summary({ state: "owner_required" })),
+      snapshot: ready({
+        decision: "OWNER_REQUIRED",
+        summary: "Blocked on a choice.",
+        ownerQuestion: "Which database should the backfill target?",
+        whyOwnerIsRequired: "Both are in use and only you know which is canonical.",
+        options: ["Primary", "Replica"],
+      }),
+    });
+    expect(detail).toEqual({
+      kind: "owner-required",
+      decision: {
+        question: "Which database should the backfill target?",
+        why: "Both are in use and only you know which is canonical.",
+        options: ["Primary", "Replica"],
+      },
+    });
+  });
+
+  it("says so when Peer Loop is waiting and recorded no question", () => {
+    expect(
+      describeExecutionDetail({
+        status: statusFor(summary({ state: "owner_required" })),
+        snapshot: ready({ decision: "CONTINUE", summary: "s", builderTask: "t" }),
+      }),
+    ).toEqual({ kind: "owner-required-missing" });
   });
 });

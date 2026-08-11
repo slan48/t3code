@@ -28,14 +28,20 @@ import { cn } from "~/lib/utils";
 import {
   compactRunId,
   describeExecution,
+  describeExecutionDetail,
   executeProposalAvailability,
+  executionSnapshotIsUseful,
+  inspectorTargetFor,
   showsExecutionArea,
   type ExecutableProposal,
+  type NavigatorExecutionDetail,
+  type NavigatorExecutionFailure,
   type NavigatorExecutionPresentation,
 } from "~/navigatorExecution";
 import {
   useNavigatorExecution,
   useNavigatorExecutionRuns,
+  useNavigatorExecutionSnapshot,
 } from "~/state/navigatorExecutionCommand";
 import { Button } from "../ui/button";
 import { PeerLoopPill } from "../peerLoop/PeerLoopPrimitives";
@@ -109,6 +115,9 @@ function ProposalExecutionArea({
     proposal,
     executionCount: executions.length,
     executing: state.pending,
+    // An unknown outcome counts. A lost response is not proof the server did
+    // nothing, and Execute stays withheld until the owner has looked.
+    lastAttemptMayHaveStarted: state.failure?.mayHaveStarted === true,
   });
 
   const onExecute = useCallback(() => {
@@ -129,14 +138,14 @@ function ProposalExecutionArea({
   /*
    * A failure that may have left a run behind takes the action away.
    *
-   * `link-not-confirmed` and a timeout both mean Peer Loop may already be
-   * running this proposal, and offering an Execute button directly beside "do
-   * not press this again" is an invitation to fork the Reviewer's session. The
-   * inspector link in the notice is the way forward from here.
+   * `link-not-confirmed`, a timeout, and every unclassified transport failure
+   * all mean Peer Loop may already be running this proposal. Offering an
+   * Execute button directly beside that warning is an invitation to fork the
+   * Reviewer's session; the inspector link in the notice is the way forward.
+   * `executeProposalAvailability` already refuses these, so this is the same
+   * answer read off the reason it gave.
    */
-  const showsAction =
-    (availability.canExecute && failure?.mayHaveStarted !== true) ||
-    availability.blockedReason === "executing";
+  const showsAction = availability.canExecute || availability.blockedReason === "executing";
   if (!showsAction && failure === null && executions.length === 0) return null;
 
   return (
@@ -182,15 +191,7 @@ function ProposalExecutionArea({
               {failure.presentation.code}
             </p>
           )}
-          {failure.inspectorRunId === null ? null : (
-            <Link
-              to="/peer-loop/$runId"
-              params={{ runId: failure.inspectorRunId }}
-              className="font-mono text-xs break-all underline underline-offset-2"
-            >
-              {failure.inspectorRunId}
-            </Link>
-          )}
+          <FailureInspectorLink failure={failure} />
         </div>
       )}
 
@@ -198,8 +199,9 @@ function ProposalExecutionArea({
         <ul className="flex min-w-0 flex-col gap-2">
           {executions.map((link) => (
             <li key={`${link.proposedPlanId}:${link.runId}`} className="min-w-0">
-              <NavigatorExecutionCard
-                presentation={describeExecution({ link, runs, unreadable })}
+              <NavigatorExecutionChild
+                environmentId={context.environmentId}
+                presentation={describeExecution({ link, runs, unreadable, nowMs: Date.now() })}
               />
             </li>
           ))}
@@ -208,6 +210,66 @@ function ProposalExecutionArea({
     </div>
   );
 }
+
+/**
+ * Where a failed Execute sends the owner.
+ *
+ * A named run when there is one; otherwise, for anything that may have started
+ * a run, the inspector index — "go and see whether one exists" is the only
+ * honest instruction when T3 Code cannot say. A failure that provably started
+ * nothing links nowhere.
+ */
+const FailureInspectorLink = memo(function FailureInspectorLink({
+  failure,
+}: {
+  readonly failure: NavigatorExecutionFailure;
+}) {
+  const target = inspectorTargetFor(failure);
+  if (target.kind === "none") return null;
+  if (target.kind === "run") {
+    return (
+      <Link
+        to="/peer-loop/$runId"
+        params={{ runId: target.runId }}
+        className="font-mono text-xs break-all underline underline-offset-2"
+      >
+        {target.runId}
+      </Link>
+    );
+  }
+  return (
+    <Link to="/peer-loop" className="text-xs underline underline-offset-2">
+      Check Peer Loop for a new run
+    </Link>
+  );
+});
+
+/**
+ * One child execution, with its structured snapshot if it has one worth reading.
+ *
+ * The snapshot hook lives here rather than in the list above so each execution
+ * owns exactly one, and so an ordinary working run mounts an atom that queries
+ * nothing at all.
+ */
+const NavigatorExecutionChild = memo(function NavigatorExecutionChild({
+  environmentId,
+  presentation,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly presentation: NavigatorExecutionPresentation;
+}) {
+  const wanted = executionSnapshotIsUseful(presentation.status);
+  const snapshot = useNavigatorExecutionSnapshot({
+    environmentId,
+    runId: presentation.runId,
+    wanted,
+    // Peer Loop's own `updatedAt`. A change to it is the only thing that
+    // re-reads the snapshot; nothing polls and nothing watches activity.
+    revision: presentation.status.kind === "summary" ? presentation.status.updatedAt : null,
+  });
+  const detail = describeExecutionDetail({ status: presentation.status, snapshot });
+  return <NavigatorExecutionCard presentation={presentation} detail={detail} />;
+});
 
 /**
  * One child execution.
@@ -219,8 +281,10 @@ function ProposalExecutionArea({
  */
 export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
   presentation,
+  detail = NO_DETAIL,
 }: {
   readonly presentation: NavigatorExecutionPresentation;
+  readonly detail?: NavigatorExecutionDetail;
 }) {
   const { status } = presentation;
   return (
@@ -242,7 +306,8 @@ export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
       {status.kind === "summary" ? (
         <>
           <p className="text-xs text-muted-foreground tabular-nums">
-            Iteration {status.iteration} · updated {status.updatedAt}
+            Iteration {status.iteration}
+            {status.updatedLabel === null ? "" : ` · updated ${status.updatedLabel}`}
             {status.queuedOwnerMessages > 0
               ? ` · ${status.queuedOwnerMessages} message(s) queued`
               : ""}
@@ -259,6 +324,8 @@ export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
         </p>
       )}
 
+      <NavigatorExecutionDetailBlock detail={detail} />
+
       {/*
         The link out, and only the link. Pause, resume, recovery and owner
         approval need the run's live control snapshot; duplicating them here
@@ -269,8 +336,107 @@ export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
         params={{ runId: presentation.runId }}
         className="self-start text-xs underline underline-offset-2"
       >
-        Open execution details
+        {detail.kind === "owner-required" || detail.kind === "owner-required-missing"
+          ? "Review and respond in execution details"
+          : "Open execution details"}
       </Link>
+    </div>
+  );
+});
+
+const NO_DETAIL: NavigatorExecutionDetail = { kind: "none" };
+
+/**
+ * The structured paragraph under a child execution's status line.
+ *
+ * Peer Loop's own `lastReviewerDecision`, through the same helpers the advanced
+ * inspector uses. Nothing here is read from a Builder report, a Builder task, a
+ * prompt or the activity feed, and the run-list status above is never softened
+ * by what this block cannot find.
+ */
+const NavigatorExecutionDetailBlock = memo(function NavigatorExecutionDetailBlock({
+  detail,
+}: {
+  readonly detail: NavigatorExecutionDetail;
+}) {
+  if (detail.kind === "none") return null;
+
+  if (detail.kind === "loading") {
+    return <p className="text-xs text-muted-foreground">Reading the structured details…</p>;
+  }
+
+  if (detail.kind === "unavailable") {
+    // Only the extra detail is missing. The status above came from the run
+    // list and stands exactly as it did.
+    return (
+      <p className="text-xs text-muted-foreground">
+        Additional structured details are unavailable right now.
+      </p>
+    );
+  }
+
+  if (detail.kind === "completion-missing") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Peer Loop reports this run as done and recorded no structured completion summary.
+      </p>
+    );
+  }
+
+  if (detail.kind === "completion") {
+    return (
+      <div className="flex min-w-0 flex-col gap-1 rounded-md bg-muted/40 px-2.5 py-2">
+        {detail.completion.summary === null ? null : (
+          <p className="text-xs text-foreground">{detail.completion.summary}</p>
+        )}
+        {detail.completion.finalState === null ? null : (
+          <p className="text-xs text-muted-foreground">
+            Final state: {detail.completion.finalState}
+          </p>
+        )}
+        {/*
+          Peer Loop's own recorded HEAD. No commit list is invented and no git
+          history is walked from the browser to produce one.
+        */}
+        {detail.head === null ? null : (
+          <p className="font-mono text-xs break-all text-muted-foreground">
+            HEAD {detail.head}
+            {detail.branch === null ? "" : ` · ${detail.branch}`}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (detail.kind === "owner-required-missing") {
+    return (
+      <p className="text-xs text-muted-foreground">
+        This execution is waiting for you. Peer Loop recorded no structured question for it.
+      </p>
+    );
+  }
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1 rounded-md bg-muted/40 px-2.5 py-2">
+      <p className="text-xs text-muted-foreground">
+        This execution is paused and waiting for your decision.
+      </p>
+      <p className="text-xs text-foreground">{detail.decision.question}</p>
+      <p className="text-xs text-muted-foreground">{detail.decision.why}</p>
+      {detail.decision.options.length === 0 ? null : (
+        <ul className="flex min-w-0 list-disc flex-col gap-0.5 ps-4">
+          {detail.decision.options.map((option) => (
+            <li key={option} className="text-xs text-muted-foreground">
+              {option}
+            </li>
+          ))}
+        </ul>
+      )}
+      {/*
+        No inline approve, recover, resume, pause or owner message. Answering is
+        a live command against Peer Loop's control snapshot, and the inspector
+        is where those controls know whether Peer Loop would accept them.
+      */}
     </div>
   );
 });

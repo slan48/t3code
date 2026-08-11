@@ -36,14 +36,16 @@ import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 
 import {
   buildExecuteProposalRequest,
   describeCoordinationError,
+  NO_EXECUTION_SNAPSHOT,
+  selectNavigatorSnapshotAtom,
+  type NavigatorExecutionSnapshot,
   describePeerLoopExecutionError,
-  EXECUTION_SEND_FAILED,
-  EXECUTION_SEND_FAILED_UNEXPECTEDLY,
+  EXECUTION_RESULT_UNKNOWN,
   localLinkIsDurable,
   reconcileExecutionLinks,
   selectNavigatorRunListAtom,
@@ -72,11 +74,22 @@ export const IDLE_NAVIGATOR_EXECUTION: NavigatorExecutionState = {
   link: null,
 };
 
-/** Length-prefixed, so no conversation/proposal pair can be spelled two ways. */
+/**
+ * Environment, conversation, proposal — length-prefixed, so no triple can be
+ * spelled two ways.
+ *
+ * THE ENVIRONMENT IS PART OF THE IDENTITY. Thread ids and proposal ids are
+ * T3 Code's, and two environments can hold the same one: a local checkout and
+ * a cloud environment of the same project routinely do. Keyed without it, an
+ * Execute pending on one machine would render as pending on the other, and a
+ * retained link from one would be reconciled against the other's read model.
+ */
 export const navigatorExecutionKey = (input: {
+  readonly environmentId: string;
   readonly threadId: string;
   readonly proposedPlanId: string;
-}): string => `${input.threadId.length}:${input.threadId}:${input.proposedPlanId}`;
+}): string =>
+  `${input.environmentId.length}:${input.environmentId}:${input.threadId.length}:${input.threadId}:${input.proposedPlanId}`;
 
 /** Hoisted: `Schema.is` compiles a checker, and every failed command runs it. */
 const isPeerLoopError = Schema.is(PeerLoopError);
@@ -93,11 +106,16 @@ const isCoordinationError = Schema.is(PeerLoopExecutionCoordinationError);
 export function describeExecutionResultFailure(
   result: AsyncResult.AsyncResult<unknown, unknown>,
 ): NavigatorExecutionFailure {
-  if (!AsyncResult.isFailure(result)) return EXECUTION_SEND_FAILED;
+  // Not a failure at all: only reachable if a caller misuses this. Treated as
+  // unknown rather than as success, because guessing the other way is the one
+  // that starts a second run.
+  if (!AsyncResult.isFailure(result)) return EXECUTION_RESULT_UNKNOWN;
   const error = Option.getOrNull(Cause.findErrorOption(result.cause));
   if (error !== null && isCoordinationError(error)) return describeCoordinationError(error);
   if (error !== null && isPeerLoopError(error)) return describePeerLoopExecutionError(error);
-  return EXECUTION_SEND_FAILED;
+  // Nothing typed explains this. A dropped connection is not evidence that the
+  // server did nothing, so the outcome is unknown rather than "not started".
+  return EXECUTION_RESULT_UNKNOWN;
 }
 
 export interface NavigatorExecutionRunner {
@@ -118,8 +136,26 @@ export function createNavigatorExecutionStore() {
   const listeners = new Set<() => void>();
   let version = 0;
 
+  /*
+   * Idle is a SHAPE, not an object identity.
+   *
+   * Comparing against the shared constant looked equivalent and was not: a
+   * released retained link produces a fresh `{pending: false, failure: null,
+   * link: null}`, which is idle by every meaning that matters and was kept for
+   * ever. One entry per proposal ever executed in a session is small, and it
+   * still grows without bound over a long session, so idleness is detected
+   * structurally and the entry goes.
+   *
+   * A pending request and a settled failure are NOT idle and are never evicted
+   * here — a failure that may have left a run behind is safety information, and
+   * dropping it because a card unmounted would re-offer Execute on the next
+   * render.
+   */
+  const isIdle = (state: NavigatorExecutionState): boolean =>
+    !state.pending && state.failure === null && state.link === null;
+
   const publish = (key: string, state: NavigatorExecutionState): void => {
-    if (state === IDLE_NAVIGATOR_EXECUTION) states.delete(key);
+    if (isIdle(state)) states.delete(key);
     else states.set(key, state);
     version += 1;
     for (const listener of listeners) listener();
@@ -139,6 +175,14 @@ export function createNavigatorExecutionStore() {
       };
     },
     isBusy: (key: string): boolean => inFlight.has(key),
+    /**
+     * How many entries are being retained.
+     *
+     * A read-only seam so a test can prove the store does not accumulate idle
+     * entries as conversations come and go. Production callers get `read`; the
+     * map itself is never handed out.
+     */
+    size: (): number => states.size,
 
     /**
      * Send one Execute request, or refuse.
@@ -173,7 +217,7 @@ export function createNavigatorExecutionStore() {
         // unhandled rejection. Settled here, generically, and not retried.
         publish(key, {
           pending: false,
-          failure: EXECUTION_SEND_FAILED_UNEXPECTEDLY,
+          failure: EXECUTION_RESULT_UNKNOWN,
           link: read(key).link,
         });
         return null;
@@ -228,6 +272,7 @@ export function useNavigatorExecution(input: {
     reportFailure: false,
   });
   const key = navigatorExecutionKey({
+    environmentId: input.environmentId,
     threadId: input.threadId,
     proposedPlanId: input.proposedPlanId,
   });
@@ -263,6 +308,7 @@ export function useNavigatorExecution(input: {
  * produced it.
  */
 export function useRetainedExecutionLinks(input: {
+  readonly environmentId: EnvironmentId | null;
   readonly threadId: ThreadId | null;
   readonly proposedPlanIds: ReadonlyArray<OrchestrationProposedPlanId>;
 }): ReadonlyArray<OrchestrationPeerLoopExecution> {
@@ -271,12 +317,12 @@ export function useRetainedExecutionLinks(input: {
     navigatorExecutionStore.version,
     navigatorExecutionStore.version,
   );
-  const { threadId, proposedPlanIds } = input;
-  if (threadId === null) return EMPTY_LINKS;
+  const { environmentId, threadId, proposedPlanIds } = input;
+  if (environmentId === null || threadId === null) return EMPTY_LINKS;
   const links: OrchestrationPeerLoopExecution[] = [];
   for (const proposedPlanId of proposedPlanIds) {
     const link = navigatorExecutionStore.read(
-      navigatorExecutionKey({ threadId, proposedPlanId }),
+      navigatorExecutionKey({ environmentId, threadId, proposedPlanId }),
     ).link;
     if (link !== null) links.push(link);
   }
@@ -296,25 +342,33 @@ const EMPTY_LINKS: ReadonlyArray<OrchestrationPeerLoopExecution> = [];
  * effect rather than during render keeps the store out of React's render pass.
  */
 export function useNavigatorExecutionLinks(input: {
+  readonly environmentId: EnvironmentId | null;
   readonly threadId: ThreadId | null;
   readonly durable: ReadonlyArray<OrchestrationPeerLoopExecution>;
   readonly proposedPlanIds: ReadonlyArray<OrchestrationProposedPlanId>;
 }): ReadonlyArray<OrchestrationPeerLoopExecution> {
   const retained = useRetainedExecutionLinks({
+    environmentId: input.environmentId,
     threadId: input.threadId,
     proposedPlanIds: input.proposedPlanIds,
   });
-  const { threadId, durable } = input;
+  const { environmentId, threadId, durable } = input;
 
   useEffect(() => {
-    if (threadId === null) return;
+    if (environmentId === null || threadId === null) return;
     for (const link of retained) {
       if (!localLinkIsDurable(durable, link)) continue;
+      // Releasing writes an idle state, which the store evicts structurally —
+      // so a conversation that has caught up leaves no entry behind.
       navigatorExecutionStore.releaseLink(
-        navigatorExecutionKey({ threadId, proposedPlanId: link.proposedPlanId }),
+        navigatorExecutionKey({
+          environmentId,
+          threadId,
+          proposedPlanId: link.proposedPlanId,
+        }),
       );
     }
-  }, [durable, retained, threadId]);
+  }, [durable, environmentId, retained, threadId]);
 
   return useMemo(() => reconcileExecutionLinks(durable, retained), [durable, retained]);
 }
@@ -382,4 +436,110 @@ export function useNavigatorExecutionRuns(input: {
     }),
     [observed, refresh, value],
   );
+}
+
+/* ------------------------------------------------------ run snapshots */
+
+/**
+ * An atom that queries nothing, in place of a run snapshot.
+ *
+ * Read whenever a child execution has no structured detail worth fetching, so
+ * an ordinary working run — or a conversation with no links at all — issues no
+ * `peerLoop.attachRun`.
+ */
+const NO_SNAPSHOT_ATOM = Atom.make(AsyncResult.initial<never, never>(false)).pipe(
+  Atom.withLabel("navigator-execution-snapshot:none"),
+);
+
+/**
+ * One run's durable snapshot, keyed by environment and run.
+ *
+ * `peerLoop.attachRun` is the existing read-only snapshot method; nothing new
+ * is added on the server and no event subscription is opened. The atom family
+ * keys on the argument, so the timeline copy and the sidebar copy of the same
+ * execution read one atom and issue one bridge request.
+ */
+const navigatorSnapshotAtomFor = (environmentId: EnvironmentId, runId: string) =>
+  peerLoopEnvironment.attach({ environmentId, input: { runId } });
+
+type NavigatorSnapshotAtom = ReturnType<typeof navigatorSnapshotAtomFor> | typeof NO_SNAPSHOT_ATOM;
+
+/**
+ * Who gets to refresh a shared snapshot when its run summary moves.
+ *
+ * Both copies of an execution see the same new `updatedAt` in the same tick and
+ * would both refresh the atom they share — two `run.attach` calls for one
+ * change. The first to claim a (run, revision) pair does it; the second finds
+ * the pair already claimed and does nothing.
+ */
+export function createSnapshotRefreshLedger() {
+  const claimed = new Map<string, string>();
+  return {
+    /** True for the first caller of each (key, revision). False afterwards. */
+    claim: (key: string, revision: string): boolean => {
+      if (claimed.get(key) === revision) return false;
+      claimed.set(key, revision);
+      return true;
+    },
+    size: (): number => claimed.size,
+    reset: (): void => claimed.clear(),
+  } as const;
+}
+
+export const snapshotRefreshLedger = createSnapshotRefreshLedger();
+
+/** Length-prefixed, like every other composite key in this module. */
+export const navigatorSnapshotKey = (input: {
+  readonly environmentId: string;
+  readonly runId: string;
+}): string => `${input.environmentId.length}:${input.environmentId}:${input.runId}`;
+
+/**
+ * The structured snapshot behind one child execution, when it is worth reading.
+ *
+ * `wanted` is the caller's answer to "does this run's attention state have
+ * structured detail an owner needs" — DONE and OWNER_REQUIRED, and nothing
+ * else. When it is false this reads an atom that queries nothing.
+ *
+ * `revision` is the run summary's own `updatedAt`. A change to it re-reads the
+ * snapshot exactly once across every mounted copy; nothing here polls, and
+ * nothing subscribes to the run's activity.
+ */
+export function useNavigatorExecutionSnapshot(input: {
+  readonly environmentId: EnvironmentId | null;
+  readonly runId: string;
+  readonly wanted: boolean;
+  readonly revision: string | null;
+}): NavigatorExecutionSnapshot {
+  const snapshotAtom = selectNavigatorSnapshotAtom<NavigatorSnapshotAtom>({
+    environmentId: input.environmentId,
+    runId: input.runId,
+    wanted: input.wanted,
+    snapshotAtomFor: navigatorSnapshotAtomFor,
+    none: NO_SNAPSHOT_ATOM,
+  });
+  const result = useAtomValue(snapshotAtom);
+  const refresh = useAtomRefresh(snapshotAtom);
+
+  const { environmentId, runId, wanted, revision } = input;
+  const observedRevision = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wanted || environmentId === null || revision === null) return;
+    const key = navigatorSnapshotKey({ environmentId: String(environmentId), runId });
+    const first = observedRevision.current === null;
+    const changed = observedRevision.current !== revision;
+    observedRevision.current = revision;
+    const claimed = snapshotRefreshLedger.claim(key, revision);
+    // Mounting the atom already issues the read; only a later revision needs a
+    // refresh, and only the first copy to notice it performs one.
+    if (!first && changed && claimed) refresh();
+  }, [environmentId, refresh, revision, runId, wanted]);
+
+  return useMemo(() => {
+    if (!wanted || environmentId === null) return NO_EXECUTION_SNAPSHOT;
+    if (AsyncResult.isFailure(result)) return { status: "failed", state: null };
+    const value = Option.getOrNull(AsyncResult.value(result));
+    if (value === null) return { status: "loading", state: null };
+    return { status: "ready", state: value.state };
+  }, [environmentId, result, wanted]);
 }

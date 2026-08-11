@@ -29,7 +29,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
-import { describeExecution } from "~/navigatorExecution";
+import { describeExecution, type NavigatorExecutionDetail } from "~/navigatorExecution";
 import { navigatorExecutionKey, navigatorExecutionStore } from "~/state/navigatorExecutionCommand";
 import { ProposedPlanCard } from "../chat/ProposedPlanCard";
 import {
@@ -42,14 +42,17 @@ const ENVIRONMENT_ID = "environment-local" as EnvironmentId;
 const THREAD_ID = ThreadId.make("thread-navigator-1");
 const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
 const PLAN = "# Split the migration\n\n1. Add the column.\n2. Backfill.";
+/** Fixed, so the relative-time label is deterministic. */
+const NOW_MS = Date.parse("2026-03-01T10:20:00.000Z");
 
 /** Router-aware rendering: every execution surface links to the inspector. */
 async function render(node: React.ReactNode): Promise<string> {
   const rootRoute = createRootRoute({ component: () => node });
   const indexRoute = createRoute({ getParentRoute: () => rootRoute, path: "/" });
+  const peerLoopRoute = createRoute({ getParentRoute: () => rootRoute, path: "/peer-loop" });
   const runRoute = createRoute({ getParentRoute: () => rootRoute, path: "/peer-loop/$runId" });
   const router = createRouter({
-    routeTree: rootRoute.addChildren([indexRoute, runRoute]),
+    routeTree: rootRoute.addChildren([indexRoute, peerLoopRoute, runRoute]),
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
   await router.load();
@@ -203,7 +206,11 @@ describe("a failure the owner has to act on", () => {
   const seedFailure = async (error: unknown) => {
     navigatorExecutionStore.reset();
     await navigatorExecutionStore.execute(
-      navigatorExecutionKey({ threadId: THREAD_ID, proposedPlanId: PLAN_ID }),
+      navigatorExecutionKey({
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
+        proposedPlanId: PLAN_ID,
+      }),
       { run: async () => AsyncResult.failure(Cause.fail(error)) },
     );
   };
@@ -284,6 +291,7 @@ describe("a child execution card", () => {
           link: link({ runId: "run-77" }),
           runs: input.runs ?? [],
           unreadable: input.unreadable ?? [],
+          nowMs: NOW_MS,
         })}
       />,
     );
@@ -397,5 +405,197 @@ describe("the proposal card it hangs off", () => {
     expect(markup).toContain("Plan actions");
     expect(markup).toContain("Open execution details");
     expect(markup).not.toContain('disabled=""');
+  });
+
+  it("keeps them usable while structured child context loads and after it settles", async () => {
+    // Refining the proposal is the whole point of the conversation, and a
+    // child run — loading, working, or waiting on the owner — must not take it
+    // away. Nothing about execution reaches the card's own controls.
+    for (const detail of [
+      { kind: "loading" },
+      { kind: "unavailable" },
+      {
+        kind: "owner-required",
+        decision: { question: "q", why: "w", options: ["a"] },
+      },
+      {
+        kind: "completion",
+        completion: { summary: "s", finalState: "f" },
+        head: "abc123",
+        branch: "main",
+      },
+    ] as ReadonlyArray<NavigatorExecutionDetail>) {
+      const markup = await render(
+        <ProposedPlanCard
+          planMarkdown={PLAN}
+          environmentId={ENVIRONMENT_ID}
+          cwd={undefined}
+          workspaceRoot="/repos/demo"
+          executionArea={
+            <NavigatorExecutionCard
+              presentation={describeExecution({
+                link: link({ runId: "run-77" }),
+                runs: [summary({ state: "done" })],
+                unreadable: [],
+                nowMs: NOW_MS,
+              })}
+              detail={detail}
+            />
+          }
+        />,
+      );
+      expect(markup, detail.kind).toContain("Plan actions");
+      expect(markup, detail.kind).not.toContain('disabled=""');
+    }
+  });
+});
+
+/* ------------------------------------------------- structured detail */
+
+describe("a finished child execution", () => {
+  const doneCard = (detail: NavigatorExecutionDetail) =>
+    render(
+      <NavigatorExecutionCard
+        presentation={describeExecution({
+          link: link({ runId: "run-77" }),
+          runs: [summary({ state: "done" })],
+          unreadable: [],
+          nowMs: NOW_MS,
+        })}
+        detail={detail}
+      />,
+    );
+
+  it("foregrounds the Reviewer's summary, final state and the recorded HEAD", async () => {
+    const markup = await doneCard({
+      kind: "completion",
+      completion: { summary: "Backfill shipped.", finalState: "Green on main." },
+      head: "abc123def456",
+      branch: "main",
+    });
+    expect(markup).toContain("Done");
+    expect(markup).toContain("Backfill shipped.");
+    expect(markup).toContain("Final state: Green on main.");
+    // Peer Loop's own HEAD. No commit list, and no git walked from a browser.
+    expect(markup).toContain("abc123def456");
+    expect(markup).toContain("main");
+    // Deeper inspection stays one link away.
+    expect(markup).toContain("Open execution details");
+  });
+
+  it("keeps the DONE status when there is no structured completion", async () => {
+    const markup = await doneCard({ kind: "completion-missing" });
+    expect(markup).toContain("Done");
+    expect(markup).toContain("recorded no structured completion summary");
+  });
+
+  it("keeps the DONE status when the snapshot could not be read", async () => {
+    // The status came from the run list and is untouched by a failed attach.
+    const markup = await doneCard({ kind: "unavailable" });
+    expect(markup).toContain("Done");
+    expect(markup).toContain("Additional structured details are unavailable");
+  });
+
+  it("says the details are loading without changing the status", async () => {
+    const markup = await doneCard({ kind: "loading" });
+    expect(markup).toContain("Done");
+    expect(markup).toContain("Reading the structured details");
+  });
+});
+
+describe("a child execution waiting on the owner", () => {
+  const ownerCard = (detail: NavigatorExecutionDetail) =>
+    render(
+      <NavigatorExecutionCard
+        presentation={describeExecution({
+          link: link({ runId: "run-77" }),
+          runs: [
+            summary({
+              state: "owner_required",
+              haltReason: { kind: "OWNER_REQUIRED", message: "Which database?" },
+            }),
+          ],
+          unreadable: [],
+          nowMs: NOW_MS,
+        })}
+        detail={detail}
+      />,
+    );
+
+  const decided: NavigatorExecutionDetail = {
+    kind: "owner-required",
+    decision: {
+      question: "Which database should the backfill target?",
+      why: "Both are in use and only you know which is canonical.",
+      options: ["Primary", "Replica"],
+    },
+  };
+
+  it("shows the question, the reason, and the options", async () => {
+    const markup = await ownerCard(decided);
+    expect(markup).toContain("The Reviewer needs your decision");
+    expect(markup).toContain("waiting for your decision");
+    expect(markup).toContain("Which database should the backfill target?");
+    expect(markup).toContain("only you know which is canonical");
+    expect(markup).toContain("Primary");
+    expect(markup).toContain("Replica");
+  });
+
+  it("offers no way to answer here, and says where to", async () => {
+    const markup = await ownerCard(decided);
+    // Answering is a live command against Peer Loop's control snapshot. This
+    // card cannot know whether Peer Loop would accept one.
+    for (const control of [
+      "Approve",
+      "Resume",
+      "Pause",
+      "Recover",
+      "Abandon",
+      "Send message",
+      "<button",
+      "<textarea",
+      "<input",
+    ]) {
+      expect(markup).not.toContain(control);
+    }
+    expect(markup).toContain("Review and respond in execution details");
+    expect(markup).toContain('href="/peer-loop/run-77"');
+  });
+
+  it("does not invent a question when Peer Loop recorded none", async () => {
+    const markup = await ownerCard({ kind: "owner-required-missing" });
+    expect(markup).toContain("The Reviewer needs your decision");
+    expect(markup).toContain("recorded no structured question");
+  });
+});
+
+/* --------------------------------------------- an unknown outcome */
+
+describe("an Execute whose result is unknown", () => {
+  it("says so, withholds the button, and points at the inspector index", async () => {
+    navigatorExecutionStore.reset();
+    await navigatorExecutionStore.execute(
+      navigatorExecutionKey({
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
+        proposedPlanId: PLAN_ID,
+      }),
+      {
+        run: async () => {
+          throw new Error("socket exploded");
+        },
+      },
+    );
+    const markup = await render(
+      <NavigatorProposalExecution context={context()} proposal={proposal} />,
+    );
+    expect(markup).toContain("the result is unknown");
+    // A run may exist. Pressing again would be how one intent becomes two.
+    expect(markup).not.toContain("Execute with Peer Loop");
+    // No run id to name, so the owner is sent to the list to look.
+    expect(markup).toContain('href="/peer-loop"');
+    expect(markup).toContain("Check Peer Loop for a new run");
+    expect(markup).not.toContain("socket exploded");
+    navigatorExecutionStore.reset();
   });
 });

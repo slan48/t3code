@@ -2223,6 +2223,7 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const durableThreadIdForExecution = isServerThread ? (activeThread?.id ?? null) : null;
   const executionLinks = useNavigatorExecutionLinks({
+    environmentId,
     threadId: durableThreadIdForExecution,
     durable: activeThread?.peerLoopExecutions ?? NO_PEER_LOOP_EXECUTIONS,
     proposedPlanIds: navigatorProposedPlanIds,

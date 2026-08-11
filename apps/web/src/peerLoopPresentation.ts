@@ -17,6 +17,7 @@ import {
   type PeerLoopError,
   type PeerLoopEvent,
   type PeerLoopHaltKind,
+  type PeerLoopReviewerDecision,
   type PeerLoopRunStateFile,
   type PeerLoopRunSummary,
   type PeerLoopTransportStatus,
@@ -775,9 +776,25 @@ export function describeOwnerDecision(view: PeerLoopRunView): PeerLoopOwnerDecis
       options: boundedOptions(outcome.options),
     };
   }
+  return describeOwnerDecisionFromRecord(view.state?.lastReviewerDecision ?? null);
+}
 
-  const decision = view.state?.lastReviewerDecision ?? null;
-  if (decision === null || decision.decision !== "OWNER_REQUIRED") return null;
+/**
+ * The same question, from a durable state file alone.
+ *
+ * Split out for a caller that has a snapshot and no subscription — a Navigator
+ * child execution card reads `peerLoop.attachRun` and never attaches to the
+ * event stream, so it has a `lastReviewerDecision` and no live outcome. It must
+ * still read exactly as the advanced inspector does, which is why this is the
+ * same function rather than a second one that drifts.
+ *
+ * The precedence above is unchanged: where there IS a live outcome it wins.
+ */
+export function describeOwnerDecisionFromRecord(
+  decision: PeerLoopReviewerDecision | null | undefined,
+): PeerLoopOwnerDecision | null {
+  if (decision === null || decision === undefined) return null;
+  if (decision.decision !== "OWNER_REQUIRED") return null;
   return {
     question: truncate(decision.ownerQuestion, PEER_LOOP_OWNER_TEXT_CHARS),
     why: truncate(decision.whyOwnerIsRequired, PEER_LOOP_OWNER_TEXT_CHARS),
@@ -863,11 +880,23 @@ export function describeCompletion(view: PeerLoopRunView): PeerLoopCompletion | 
 
   const outcome = view.outcome;
   if (outcome?.kind === "done") return completed(outcome.summary, outcome.finalState);
-  const decision = view.state?.lastReviewerDecision ?? null;
-  if (decision !== null && decision.decision === "DONE") {
-    return completed(decision.summary, decision.finalState);
-  }
-  return null;
+  return describeCompletionFromRecord(view.state?.lastReviewerDecision ?? null);
+}
+
+/**
+ * How a run finished, from a durable state file alone. Same wording, same
+ * bounds, same refusal to derive anything from a run state of "done" on its
+ * own — that says it finished, not how. See {@link describeOwnerDecisionFromRecord}.
+ */
+export function describeCompletionFromRecord(
+  decision: PeerLoopReviewerDecision | null | undefined,
+): PeerLoopCompletion | null {
+  if (decision === null || decision === undefined) return null;
+  if (decision.decision !== "DONE") return null;
+  return {
+    summary: nonEmpty(truncate(decision.summary, PEER_LOOP_COMPLETION_SUMMARY_CHARS)),
+    finalState: nonEmpty(truncate(decision.finalState, PEER_LOOP_FINAL_STATE_CHARS)),
+  };
 }
 
 const nonEmpty = (value: string): string | null => (value.length === 0 ? null : value);
