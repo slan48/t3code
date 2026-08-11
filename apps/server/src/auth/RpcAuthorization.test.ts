@@ -3,6 +3,7 @@ import {
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  PEER_LOOP_WS_METHODS,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -56,8 +57,19 @@ describe("RPC authorization scopes", () => {
       WS_METHODS.peerLoopSendOwnerMessage,
       WS_METHODS.peerLoopPauseRun,
       WS_METHODS.peerLoopRecoverRun,
+      // Executing a proposal calls `startRun` underneath: same agents, same
+      // subscription capacity, same scope.
+      WS_METHODS.peerLoopExecuteProposal,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
+  it("declares a scope for every Peer Loop method the group registers", () => {
+    // Coupled to the method table rather than a hand-kept list, so a new Peer
+    // Loop RPC cannot reach production unauthorized.
+    for (const method of Object.values(PEER_LOOP_WS_METHODS)) {
+      expect(() => requiredScopeForRpcMethod(method)).not.toThrow();
     }
   });
 

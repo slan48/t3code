@@ -579,8 +579,63 @@ fact ("a coding thread picked this plan up") and are left alone. Deleting a
 projected thread drops its association rows so the read model keeps no orphans;
 it does not delete a Peer Loop run or anything Peer Loop wrote.
 
-Nothing launches a run yet, and there is no Navigator UI. This increment is the
-association and its history.
+### Executing a proposal: `peerLoop.executeProposal`
+
+The server operation behind the future Execute action.
+`PeerLoopExecutionCoordinator` (`apps/server/src/peerLoop/ExecutionCoordinator.ts`)
+is coordination between two things that already exist — the orchestration engine
+and the Peer Loop bridge — and owns no lifecycle of its own.
+
+The sequence, in order, and each step matters:
+
+1. **Validate against T3 Code's own read model.** The thread is active and its
+   purpose is `navigator`; the proposal exists on _that_ thread; it has no
+   `peerLoopExecutions` link already; it is not already implemented the ordinary
+   way (`implementedAt` / `implementationThreadId`); the project is active and
+   supplies the canonical `workspaceRoot`. Every refusal happens here, before
+   Peer Loop is touched, so a rejected Execute leaves nothing behind.
+2. **One `PeerLoopService.startRun` call.** The input is built server-side:
+   `projectPath` is the project's own workspace root, `objective` is the
+   proposal's `planMarkdown` verbatim, the optional safety limit is forwarded,
+   and `newRun` is never set. A client sends only a thread id, a proposal id and
+   that limit — it cannot name a directory, substitute an objective, waive Peer
+   Loop's duplicate-run preflight, or supply a run id.
+3. **Record the immutable link**, by dispatching the internal
+   `thread.peer-loop-execution.link` command with the run id Peer Loop returned
+   and a server-generated command id and timestamp.
+
+Attempts are serialized per `(threadId, proposedPlanId)`, and validation is
+re-read **inside** that critical section. Two simultaneous Execute presses on
+one proposal therefore produce one run: the second finds the link the first
+recorded and is refused as already executed. The gate is per proposal rather
+than global so two different proposals do not queue behind each other's bridge
+spawn, and its map is reference-counted so it stays bounded.
+
+**Partial failure is explicit.** Peer Loop's own errors travel back untouched —
+a `PROJECT_HAS_UNFINISHED_RUN` refusal keeps its code, a timeout keeps
+`mayHaveApplied` — and a timed-out start is never retried, because Peer Loop may
+already have started the run and a second start would fork a session. If the
+link dispatch fails, the thread is re-read once: if that exact proposal/run pair
+is now durably visible the operation succeeded, and otherwise the caller gets a
+typed `PeerLoopExecutionCoordinationError` with `reason: "link-not-confirmed"`,
+the structured `runId`, and `mayHaveStarted: true` — so recovery is a deliberate
+act on a run the owner can open, not a guess. Nothing auto-resumes, nothing
+starts a second run, and nothing touches Peer Loop's recovery state. Every
+pre-start reason carries `mayHaveStarted: false` and says plainly that no run
+was started. Details come from a fixed sentence per reason plus the ids the
+caller supplied: no SQL, no stack, no path beyond the project the authorized
+client already sees, no provider output.
+
+The method is scoped `AuthOrchestrationOperateScope`, like `startRun` it calls
+underneath — it makes agents act and spends subscription capacity. Peer Loop
+observation methods stay read-scoped and the existing explicit controls are
+unchanged.
+
+There is **no UI** for this, and no natural-language confirmation: the operation
+is invoked explicitly and nothing infers agreement from prose.
+
+Nothing else launches a run, and there is no Navigator UI. The link and its
+history are described above.
 
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live

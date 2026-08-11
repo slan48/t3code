@@ -92,6 +92,11 @@ import {
   PeerLoopSubscribeEventsInput,
   PeerLoopSubscriptionEvent,
 } from "./peerLoop.ts";
+import {
+  PeerLoopExecuteProposalInput,
+  PeerLoopExecuteProposalResult,
+  PeerLoopExecutionCoordinationError,
+} from "./peerLoopExecution.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -262,6 +267,7 @@ export const WS_METHODS = {
   peerLoopPauseRun: PEER_LOOP_WS_METHODS.pauseRun,
   peerLoopRecoverRun: PEER_LOOP_WS_METHODS.recoverRun,
   peerLoopSubscribeEvents: PEER_LOOP_WS_METHODS.subscribeEvents,
+  peerLoopExecuteProposal: PEER_LOOP_WS_METHODS.executeProposal,
 
   // Server meta
   serverProbe: "server.probe",
@@ -876,6 +882,24 @@ export const WsPeerLoopRecoverRunRpc = Rpc.make(WS_METHODS.peerLoopRecoverRun, {
   error: peerLoopError,
 });
 
+/**
+ * Execute an agreed Navigator proposal.
+ *
+ * The error channel keeps Peer Loop's own errors alongside the coordination
+ * error rather than flattening them: a duplicate-run refusal and a timeout that
+ * may already have applied are Peer Loop's answers and have to reach the client
+ * intact, while a T3 Code validation failure is a different kind of fact.
+ */
+export const WsPeerLoopExecuteProposalRpc = Rpc.make(WS_METHODS.peerLoopExecuteProposal, {
+  payload: PeerLoopExecuteProposalInput,
+  success: PeerLoopExecuteProposalResult,
+  error: Schema.Union([
+    PeerLoopError,
+    PeerLoopExecutionCoordinationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
 export const WsPeerLoopSubscribeEventsRpc = Rpc.make(WS_METHODS.peerLoopSubscribeEvents, {
   payload: PeerLoopSubscribeEventsInput,
   success: PeerLoopSubscriptionEvent,
@@ -988,6 +1012,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPeerLoopPauseRunRpc,
   WsPeerLoopRecoverRunRpc,
   WsPeerLoopSubscribeEventsRpc,
+  WsPeerLoopExecuteProposalRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

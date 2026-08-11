@@ -11,7 +11,13 @@ import * as Layer from "effect/Layer";
 import { Atom } from "effect/unstable/reactivity";
 import { describe, expect, it } from "vite-plus/test";
 
-import { createPeerLoopEnvironmentAtoms, PEER_LOOP_EVENTS_IDLE_TTL_MS } from "./peerLoop.ts";
+import { WS_METHODS } from "@t3tools/contracts";
+
+import {
+  createPeerLoopEnvironmentAtoms,
+  createPeerLoopEnvironmentCommands,
+  PEER_LOOP_EVENTS_IDLE_TTL_MS,
+} from "./peerLoop.ts";
 
 const environmentId = "env-1" as never;
 
@@ -22,6 +28,7 @@ const environmentId = "env-1" as never;
  * and reading `idleTTL` is how that configuration is observable.
  */
 const atoms = createPeerLoopEnvironmentAtoms(Atom.runtime(Layer.empty) as never);
+const commands = createPeerLoopEnvironmentCommands(Atom.runtime(Layer.empty) as never);
 
 describe("Peer Loop atom lifetimes", () => {
   it("disposes a run's event subscription as soon as nothing observes it", () => {
@@ -52,5 +59,30 @@ describe("Peer Loop atom lifetimes", () => {
     expect(again).toBe(first);
     expect(moved).not.toBe(first);
     expect(other).not.toBe(first);
+  });
+});
+
+describe("Peer Loop commands", () => {
+  it("exposes every owner control as its own typed command", () => {
+    // One command per method, so the server authorizes each separately and a
+    // client cannot invent a method name.
+    for (const command of [
+      commands.startRun,
+      commands.resumeRun,
+      commands.sendOwnerMessage,
+      commands.pauseRun,
+      commands.recoverRun,
+      commands.executeProposal,
+    ]) {
+      expect(command).toBeDefined();
+    }
+  });
+
+  it("offers executing an agreed proposal, distinct from starting a run", () => {
+    // Two different operations: `startRun` names a project and an objective,
+    // `executeProposal` names a thread and a proposal and lets the server
+    // derive both. There is no UI on the second one yet.
+    expect(commands.executeProposal).not.toBe(commands.startRun);
+    expect(WS_METHODS.peerLoopExecuteProposal).toBe("peerLoop.executeProposal");
   });
 });

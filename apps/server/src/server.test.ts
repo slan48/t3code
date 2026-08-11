@@ -94,6 +94,7 @@ import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
+import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -743,6 +744,12 @@ const buildAppUnderTest = (options?: {
               Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
             subscribeEvents: () => Stream.empty,
             diagnostics: Effect.succeed([]),
+          }),
+          // Same reason: the WS surface must build without a Peer Loop, and
+          // executing a proposal must never start one from a test.
+          Layer.mock(PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator)({
+            executeProposal: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),

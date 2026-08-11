@@ -44,6 +44,7 @@ import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
+import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -380,8 +381,11 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
 );
 
 const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
-  // Core Services
-  Layer.provideMerge(ServerSettingsLayerLive),
+  // Core Services. The Peer Loop execution coordinator rides here because it
+  // is coordination between two things that already exist — the orchestration
+  // engine and the Peer Loop bridge — so it must sit above both, and it owns
+  // no state of its own.
+  Layer.provideMerge(Layer.mergeAll(PeerLoopExecutionCoordinator.layer, ServerSettingsLayerLive)),
   Layer.provideMerge(CheckpointingLayerLive),
   Layer.provideMerge(SourceControlProviderRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),

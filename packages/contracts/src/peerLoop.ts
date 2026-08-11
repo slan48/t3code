@@ -918,6 +918,15 @@ export const PEER_LOOP_WS_METHODS = {
   pauseRun: "peerLoop.pauseRun",
   recoverRun: "peerLoop.recoverRun",
   subscribeEvents: "peerLoop.subscribeEvents",
+  /**
+   * Execute one agreed Navigator Execution Proposal as a run.
+   *
+   * Coordination, not a second start path: the server derives the project and
+   * the objective from its own read model. Its input and result live in
+   * `peerLoopExecution.ts`, which is allowed to know about orchestration
+   * types; this module stays a pure bridge contract.
+   */
+  executeProposal: "peerLoop.executeProposal",
 } as const;
 
 /**

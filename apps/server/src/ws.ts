@@ -73,6 +73,7 @@ import {
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
@@ -368,6 +369,8 @@ const makeWsRpcLayer = (
       const previewManager = yield* PreviewManager.PreviewManager;
       const agentRuns = yield* AgentRunsService.AgentRunsService;
       const peerLoop = yield* PeerLoopService.PeerLoopService;
+      const peerLoopExecutionCoordinator =
+        yield* PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -2001,6 +2004,16 @@ const makeWsRpcLayer = (
           observeRpcStream(WS_METHODS.peerLoopSubscribeEvents, peerLoop.subscribeEvents(input), {
             "rpc.aggregate": "peer-loop",
           }),
+        // The one Peer Loop method that is not a pass-through: T3 Code
+        // validates the Navigator proposal against its own read model, asks
+        // Peer Loop to start the run, and records the link. Peer Loop's own
+        // errors still come back untouched.
+        [WS_METHODS.peerLoopExecuteProposal]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.peerLoopExecuteProposal,
+            peerLoopExecutionCoordinator.executeProposal(input),
+            { "rpc.aggregate": "peer-loop" },
+          ),
         [WS_METHODS.previewList]: (input) =>
           observeRpcEffect(WS_METHODS.previewList, previewManager.list(input), {
             "rpc.aggregate": "preview",

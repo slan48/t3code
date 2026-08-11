@@ -116,5 +116,19 @@ export function createPeerLoopEnvironmentCommands<R, E>(
       label: "peer-loop:recover-run",
       tag: WS_METHODS.peerLoopRecoverRun,
     }),
+    /**
+     * Execute one agreed Navigator Execution Proposal.
+     *
+     * Sends a thread and a proposal id and nothing else: the server derives the
+     * project and the objective from its own record, so a client cannot aim a
+     * run at another directory or substitute a plan that was never reviewed.
+     *
+     * The reply carries Peer Loop's start result and the recorded link, so the
+     * run id is available immediately. There is no UI on this yet.
+     */
+    executeProposal: createEnvironmentRpcCommand(runtime, {
+      label: "peer-loop:execute-proposal",
+      tag: WS_METHODS.peerLoopExecuteProposal,
+    }),
   };
 }
