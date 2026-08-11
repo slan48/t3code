@@ -8,6 +8,10 @@ import {
   ProviderDriverKind,
   type OrchestrationEvent,
   type OrchestrationThread,
+  type PeerLoopListRunsInput,
+  type PeerLoopRunStateFile,
+  type PeerLoopRunSummary,
+  type PeerLoopStartRunInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -54,6 +58,8 @@ import { RuntimeReceiptBusTest } from "../src/orchestration/Layers/RuntimeReceip
 import { OrchestrationReactorLive } from "../src/orchestration/Layers/OrchestrationReactor.ts";
 import { ProviderCommandReactorLive } from "../src/orchestration/Layers/ProviderCommandReactor.ts";
 import * as NavigatorExecutionContext from "../src/peerLoop/NavigatorExecutionContext.ts";
+import * as PeerLoopExecutionCoordinator from "../src/peerLoop/ExecutionCoordinator.ts";
+import { PeerLoopService } from "../src/peerLoop/Service.ts";
 import { ProviderRuntimeIngestionLive } from "../src/orchestration/Layers/ProviderRuntimeIngestion.ts";
 import {
   OrchestrationEngineService,
@@ -183,6 +189,10 @@ export interface OrchestrationIntegrationHarness {
   readonly checkpointStore: CheckpointStore.CheckpointStore["Service"];
   readonly checkpointRepository: ProjectionCheckpointRepository["Service"];
   readonly pendingApprovalRepository: ProjectionPendingApprovalRepository["Service"];
+  /** The recording fake bridge. Its call lists are the point. */
+  readonly peerLoop: PeerLoopFake;
+  /** The real coordinator, over that fake bridge. */
+  readonly peerLoopExecutionCoordinator: PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinatorShape;
   readonly waitForThread: (
     threadId: string,
     predicate: (thread: OrchestrationThread) => boolean,
@@ -221,9 +231,48 @@ export interface OrchestrationIntegrationHarness {
   readonly dispose: Effect.Effect<void, never>;
 }
 
+/**
+ * A fake Peer Loop bridge, and a record of everything asked of it.
+ *
+ * Mutable so a test can advance the run between turns — Peer Loop is the source
+ * of every mutable run fact, so "the run finished" is expressed here and
+ * nowhere else. `calls` is the point of the whole thing: an integration test
+ * that only asserted on rendered strings could not tell the difference between
+ * a read-only context build and one that had quietly started something.
+ */
+export interface PeerLoopFakeCalls {
+  readonly startRun: Array<PeerLoopStartRunInput>;
+  readonly listRuns: Array<PeerLoopListRunsInput>;
+  readonly attachRun: Array<string>;
+  readonly resumeRun: Array<string>;
+  readonly pauseRun: Array<string>;
+  readonly recoverRun: Array<string>;
+  readonly sendOwnerMessage: Array<string>;
+  readonly subscribeEvents: Array<string>;
+}
+
+export interface PeerLoopFake {
+  readonly calls: PeerLoopFakeCalls;
+  /** What `listRuns` reports. Set by the test as the fake run progresses. */
+  readonly setRuns: (runs: ReadonlyArray<PeerLoopRunSummary>) => void;
+  /** What `attachRun` reports, by run id. */
+  readonly setSnapshot: (runId: string, state: PeerLoopRunStateFile) => void;
+  /** The run id the next `startRun` returns. */
+  readonly setNextRunId: (runId: string) => void;
+}
+
 interface MakeOrchestrationIntegrationHarnessOptions {
   readonly provider?: ProviderDriverKind;
   readonly realCodex?: boolean;
+  /**
+   * Wire a recording fake Peer Loop, the real `NavigatorExecutionContext` and
+   * the real `PeerLoopExecutionCoordinator`.
+   *
+   * Off by default, and the default stays a stub that dies on a Navigator
+   * path: a harness that silently tolerated an unconfigured Navigator turn
+   * would make the zero-call assertions meaningless.
+   */
+  readonly peerLoop?: boolean;
 }
 
 export const makeOrchestrationIntegrationHarness = (
@@ -324,20 +373,130 @@ export const makeOrchestrationIntegrationHarness = (
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
     } as unknown as TextGenerationShape);
     /*
-     * The integration harness runs coding threads, which never reach Peer Loop
-     * at all. A stub that dies on use is therefore the honest wiring: if this
-     * harness ever grows a Navigator turn, it fails loudly rather than
-     * silently exercising a service nobody configured.
+     * Peer Loop, faked and recorded — or absent and fatal.
+     *
+     * Off by default the harness runs coding threads, which never reach Peer
+     * Loop at all, and a stub that dies on a Navigator path is the honest
+     * wiring: a harness that tolerated an unconfigured Navigator turn would
+     * make every zero-call assertion vacuous.
+     *
+     * On, the fake records every method and the REAL `NavigatorExecutionContext`
+     * and `PeerLoopExecutionCoordinator` sit on top of it. Nothing about which
+     * methods get called, in what order, or with what arguments is faked.
      */
-    const navigatorExecutionContextLayer = Layer.succeed(
-      NavigatorExecutionContext.NavigatorExecutionContext,
-      {
-        forThread: (thread) =>
-          thread.purpose === "navigator"
-            ? Effect.die("navigator execution context is not configured in this harness")
-            : Effect.succeed(null),
+    const peerLoopRuns: { current: ReadonlyArray<PeerLoopRunSummary> } = { current: [] };
+    const peerLoopSnapshots = new Map<string, PeerLoopRunStateFile>();
+    const peerLoopNextRunId = { current: "run-1" };
+    const peerLoopCalls: PeerLoopFakeCalls = {
+      startRun: [],
+      listRuns: [],
+      attachRun: [],
+      resumeRun: [],
+      pauseRun: [],
+      recoverRun: [],
+      sendOwnerMessage: [],
+      subscribeEvents: [],
+    };
+    const peerLoopFake: PeerLoopFake = {
+      calls: peerLoopCalls,
+      setRuns: (runs) => {
+        peerLoopRuns.current = runs;
       },
-    );
+      setSnapshot: (runId, state) => {
+        peerLoopSnapshots.set(runId, state);
+      },
+      setNextRunId: (runId) => {
+        peerLoopNextRunId.current = runId;
+      },
+    };
+    const peerLoopServiceLayer = Layer.mock(PeerLoopService)({
+      status: () => Effect.die("peer loop status is not part of this harness"),
+      listRuns: (input) => {
+        peerLoopCalls.listRuns.push(input);
+        return Effect.succeed({ runs: peerLoopRuns.current, unreadable: [] });
+      },
+      attachRun: (input) => {
+        peerLoopCalls.attachRun.push(input.runId);
+        const state = peerLoopSnapshots.get(input.runId);
+        return state === undefined
+          ? Effect.die(`no fake snapshot for run '${input.runId}'`)
+          : Effect.succeed({
+              runId: input.runId,
+              state,
+              control: {
+                available: false,
+                reason: "not_attached" as const,
+                resumable: true,
+                liveWriter: null,
+              },
+              eventHighWaterMark: 0,
+              replayFromSeq: 0,
+              live: false,
+            });
+      },
+      startRun: (input) => {
+        peerLoopCalls.startRun.push(input);
+        const runId = peerLoopNextRunId.current;
+        return Effect.succeed({
+          runId,
+          state: {
+            state: "reviewer_working" as const,
+            iteration: 0,
+            haltReason: null,
+            inFlight: null,
+          },
+          control: {
+            available: true,
+            reason: "live_in_this_bridge" as const,
+            resumable: false,
+            liveWriter: null,
+          },
+          eventHighWaterMark: 0,
+          replayFromSeq: 0,
+          live: true,
+          projectPath: input.projectPath,
+          awaitingOwnerObjective: false,
+        } as never);
+      },
+      /*
+       * The mutations and the subscription record AND die. Recording makes the
+       * zero-call assertion readable; dying makes an accidental call fail the
+       * test that provoked it rather than pass quietly.
+       */
+      resumeRun: (input) => {
+        peerLoopCalls.resumeRun.push(input.runId);
+        return Effect.die("resumeRun must not be reached by the Navigator loop");
+      },
+      pauseRun: (input) => {
+        peerLoopCalls.pauseRun.push(input.runId);
+        return Effect.die("pauseRun must not be reached by the Navigator loop");
+      },
+      recoverRun: (input) => {
+        peerLoopCalls.recoverRun.push(input.runId);
+        return Effect.die("recoverRun must not be reached by the Navigator loop");
+      },
+      sendOwnerMessage: (input) => {
+        peerLoopCalls.sendOwnerMessage.push(input.runId);
+        return Effect.die("sendOwnerMessage must not be reached by the Navigator loop");
+      },
+      subscribeEvents: (input) => {
+        peerLoopCalls.subscribeEvents.push(input.runId);
+        return Stream.die("subscribeEvents must not be reached by the Navigator loop");
+      },
+      diagnostics: Effect.succeed([]),
+    });
+    const navigatorExecutionContextLayer =
+      options?.peerLoop === true
+        ? // `ProjectionSnapshotQuery` deliberately stays a requirement here so it
+          // is satisfied by the same `runtimeServicesLayer` everything else
+          // reads — a locally provided copy would be a second database.
+          NavigatorExecutionContext.layer.pipe(Layer.provide(peerLoopServiceLayer))
+        : Layer.succeed(NavigatorExecutionContext.NavigatorExecutionContext, {
+            forThread: (thread) =>
+              thread.purpose === "navigator"
+                ? Effect.die("navigator execution context is not configured in this harness")
+                : Effect.succeed(null),
+          });
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
       Layer.provideMerge(navigatorExecutionContextLayer),
       Layer.provideMerge(runtimeServicesLayer),
@@ -390,7 +549,17 @@ export const makeOrchestrationIntegrationHarness = (
         }),
       ),
     );
-    const layer = Layer.empty.pipe(
+    /*
+     * The real coordinator, over the same fake bridge and the same projection.
+     *
+     * Execution is the one place the loop leaves orchestration, and it is the
+     * step most worth exercising for real: the validation, the at-most-once
+     * gate and the immutable link are all its own.
+     */
+    const peerLoopExecutionCoordinatorLayer = PeerLoopExecutionCoordinator.layer.pipe(
+      Layer.provide(peerLoopServiceLayer),
+    );
+    const baseLayer = Layer.empty.pipe(
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(orchestrationReactorLayer),
       Layer.provideMerge(providerRegistryLayer),
@@ -400,6 +569,16 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
       Layer.provideMerge(NodeServices.layer),
     );
+    /*
+     * The coordinator sits ABOVE the runtime: it coordinates the orchestration
+     * engine and the Peer Loop bridge, so both have to exist before it does.
+     *
+     * Always wired, unlike the context service. Nothing reaches it without an
+     * explicit call from a test — no reactor does — so there is no accidental
+     * path for it to make loud, and always having it keeps the recorded call
+     * list available to the control tests that assert it stays empty.
+     */
+    const layer = peerLoopExecutionCoordinatorLayer.pipe(Layer.provideMerge(baseLayer));
 
     const runtime = ManagedRuntime.make(layer);
     const engine = yield* tryRuntimePromise("load OrchestrationEngine service", () =>
@@ -427,6 +606,13 @@ export const makeOrchestrationIntegrationHarness = (
     ).pipe(Effect.orDie);
     const runtimeReceiptBus = yield* tryRuntimePromise("load RuntimeReceiptBus service", () =>
       runtime.runPromise(Effect.service(RuntimeReceiptBus)),
+    ).pipe(Effect.orDie);
+    const peerLoopExecutionCoordinator = yield* tryRuntimePromise(
+      "load PeerLoopExecutionCoordinator service",
+      () =>
+        runtime.runPromise(
+          Effect.service(PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator),
+        ),
     ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
@@ -568,6 +754,8 @@ export const makeOrchestrationIntegrationHarness = (
       checkpointStore,
       checkpointRepository,
       pendingApprovalRepository,
+      peerLoop: peerLoopFake,
+      peerLoopExecutionCoordinator,
       waitForThread,
       waitForDomainEvent,
       waitForPendingApproval,

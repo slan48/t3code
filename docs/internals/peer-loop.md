@@ -847,13 +847,16 @@ rather than a silent clip.
 
 **Degradation is one sentence, never a detail.** If the project cannot be
 resolved, the block says execution records are unavailable and no list is
-requested. If `listRuns` fails, the block says structured execution status is
-unavailable and the links are still named with no state claimed for them. If one
-`attachRun` fails, that run alone reads "structured detail unavailable". Nothing
-from the Cause reaches the provider — a bridge error is exactly the kind of text
-that carries paths and diagnostics — and nothing is retried inside the turn. In
-every case the turn proceeds: a conversation is not blocked because Peer Loop
-could not be read.
+requested. If `listRuns` fails the block is that one neutral sentence and
+nothing else — no entries, no per-run claims, no attach attempts. A failed read
+says T3 Code could not ask; it does not say a run is missing or unreadable, and
+those two answers belong to a list that actually succeeded. A successful list
+that genuinely omits a linked run, or names one unreadable, still says so
+explicitly per run. If one `attachRun` fails, that run alone reads "structured
+detail unavailable". Nothing from the error reaches the provider — a bridge
+failure is exactly the kind of text that carries paths and diagnostics — and
+nothing is retried inside the turn. In every case the turn proceeds: a
+conversation is not blocked because Peer Loop could not be read.
 
 **Explanation is not control.** The block leads with a heading that says these
 are observations, and tells the model in the words it reads that it may explain
@@ -1077,7 +1080,19 @@ raw ISO instants.
 
 **Still forthcoming, and deliberately not present yet:** consulting a run's
 detailed activity or event transcript for questions the structured records
-cannot answer, and the mobile Navigator UI.
+cannot answer, and the mobile Navigator UI. Neither exists today, and the
+Navigator surface does not pretend otherwise.
+
+**The whole loop has one integration test.**
+`apps/server/integration/navigatorExecutionLoop.integration.test.ts` drives
+conversation → proposal → execution → durable link → structured DONE and
+OWNER_REQUIRED context → continued conversation against the real engine,
+decider, event store, projectors, ingestion, provider-command reactor,
+coordinator and context service, over disposable SQLite. Only the provider
+adapter and the Peer Loop bridge are fakes, and the bridge is a recorder: the
+test asserts exactly one `startRun` and zero `resumeRun`, `pauseRun`,
+`recoverRun`, `sendOwnerMessage` and `subscribeEvents` calls across the entire
+loop.
 
 Nothing else launches a run. The Execute action and the closed confirmation
 grammar described above are two inputs to one operation, and between them the
@@ -1087,8 +1102,10 @@ thing T3 Code keeps about it.
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live
 writer. Peer Loop owns every one of those for its own runs, over its own
-protocol, and a thread's purpose says nothing about them. Linking a Navigator
-conversation to a Peer Loop run is later work and is not modelled here.
+protocol, and a thread's purpose says nothing about them. The link between a
+Navigator conversation and a Peer Loop run _is_ modelled — an immutable run id,
+proposal id and timestamp, and nothing more — and everything mutable about that
+run is read live from Peer Loop on the turn that needs it.
 
 ## What must not happen
 

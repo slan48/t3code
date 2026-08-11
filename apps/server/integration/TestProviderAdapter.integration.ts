@@ -187,6 +187,15 @@ export interface TestProviderAdapterHarness {
   readonly queueTurnResponseForNextSession: (
     response: TestTurnResponse,
   ) => Effect.Effect<void, never>;
+  /**
+   * Every string this adapter was actually asked to send, in order.
+   *
+   * The provider-visible text is the only place a Navigator role frame or an
+   * execution-context block exists — the persisted message deliberately does
+   * not carry them — so an integration test that wants to assert on either has
+   * to read it here rather than from the read model.
+   */
+  readonly getSentTurnInputs: (threadId: ThreadId) => ReadonlyArray<string>;
   readonly getStartCount: () => number;
   readonly getRollbackCalls: (threadId: ThreadId) => ReadonlyArray<number>;
   readonly getInterruptCalls: (threadId: ThreadId) => ReadonlyArray<TurnId | undefined>;
@@ -232,6 +241,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
     const sessions = new Map<ThreadId, SessionState>();
     const queuedResponsesForNextSession: TestTurnResponse[] = [];
     const interruptCallsBySession = new Map<ThreadId, Array<TurnId | undefined>>();
+    const sentTurnInputsBySession = new Map<ThreadId, Array<string>>();
     const approvalResponsesBySession = new Map<
       ThreadId,
       Array<{
@@ -303,6 +313,10 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
         if (!state) {
           return yield* missingSessionEffect(provider, input.threadId);
         }
+
+        const sentInputs = sentTurnInputsBySession.get(input.threadId) ?? [];
+        sentInputs.push(input.input ?? "");
+        sentTurnInputsBySession.set(input.threadId, sentInputs);
 
         state.turnCount += 1;
         const turnCount = state.turnCount;
@@ -538,6 +552,10 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
 
     const getStartCount = (): number => sessionCount;
 
+    const getSentTurnInputs = (threadId: ThreadId): ReadonlyArray<string> => [
+      ...(sentTurnInputsBySession.get(threadId) ?? []),
+    ];
+
     const getInterruptCalls = (threadId: ThreadId): ReadonlyArray<TurnId | undefined> => {
       const calls = interruptCallsBySession.get(threadId);
       if (!calls) {
@@ -568,6 +586,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       provider,
       queueTurnResponse,
       queueTurnResponseForNextSession,
+      getSentTurnInputs,
       getStartCount,
       getRollbackCalls,
       getInterruptCalls,

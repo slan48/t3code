@@ -109,6 +109,80 @@ Builder report, a prompt or the activity feed.
 
 Web, the desktop app and a browser on your phone all use exactly this surface.
 
+## Planning with Navigator
+
+**Navigator** is the other half of this, and it is a conversation rather than a
+console. It is where you think out loud about a piece of work — compare
+approaches, argue with yourself, change your mind — with an agent that plans and
+never builds. **Peer Loop**, the page described above, is the advanced execution
+inspector: it is where runs are actually driven and where every decision that
+changes something lives.
+
+Open **Navigator** from the sidebar and start a conversation in one of your
+projects. A project can have several going at once; they are ordinary durable
+conversations that survive restarts, and they do not appear in your coding
+thread lists.
+
+### Execution Proposals
+
+As you talk, Navigator keeps one **Execution Proposal** up to date — the plan as
+it currently stands. It is a plan, not a commitment. Navigator does not edit
+files, run commands, or start anything, and **discussing an approach is never
+authorization to execute it.** You can say "let's do it after we swap the
+database first" and nothing happens; that is a sentence about the future, and it
+is treated as one.
+
+### Handing a proposal to Peer Loop
+
+Two ways, and they are the same action:
+
+- press **Execute with Peer Loop** on the proposal, in the conversation or in
+  the plan sidebar; or
+- say one of a short, fixed list of standalone confirmations — `let's do it` or
+  `hagamos eso`, and a couple of equally unambiguous alternatives like
+  `execute the proposal`.
+
+The phrase has to be the whole message, with nothing attached to it. Case,
+spacing, a typographic apostrophe and a trailing full stop are all fine.
+Anything longer, a question, a negation, a quote or a phrase with a condition
+bolted on goes to Navigator as ordinary conversation. The list is deliberately
+short: the difference between a sentence and an authorization is a Reviewer and
+a Builder working in your repository.
+
+Either way, the objective Peer Loop receives is **the proposal you were looking
+at**, not the words you typed. A proposal that has already been executed, or
+that a coding thread already implemented, does not offer the action again.
+
+### Watching it from the conversation
+
+Once a run exists, it appears as a **child execution card** under the proposal
+it came from: the run, what Peer Loop says it is doing, and a link into the
+execution details.
+
+The conversation keeps working the whole time. You can ask what is happening,
+plan the next piece, or refine a different proposal while a run is going; asking
+about a run never touches it.
+
+- When the run **finishes**, ask what changed and Navigator answers from Peer
+  Loop's own record: the Reviewer's summary, the final state, and the commit the
+  repository was left on.
+- When the Reviewer needs **you**, Navigator can tell you the exact question, why
+  it cannot decide, and the options it offered — and then point you at the
+  execution details.
+
+Navigator reads. It never approves, resumes, recovers, pauses or sends an owner
+message, and it will tell you that rather than claim it did. **Approving,
+answering, pausing, resuming and resolving an interrupted turn all happen in the
+execution details**, using the controls described earlier on this page.
+
+### When an Execute does not come back
+
+If a run started but T3 Code could not confirm the link, or the request timed out
+or the connection dropped mid-flight, the conversation says the outcome is
+unknown and **takes the Execute action away**. Nothing is retried for you: a
+second Execute would start a second run rather than repeat the first. Open Peer
+Loop and see what is actually there before deciding.
+
 ## What you can do
 
 - **See runs** for a project: state, iteration, when they last moved, and whether
