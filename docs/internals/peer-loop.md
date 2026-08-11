@@ -588,8 +588,8 @@ and the Peer Loop bridge — and owns no lifecycle of its own.
 
 The sequence, in order, and each step matters:
 
-1. **Validate against T3 Code's own read model.** The thread is active and its
-   purpose is `navigator`; the proposal exists on _that_ thread; it has no
+1. **Validate against the engine's committed command state.** The thread is
+   active and its purpose is `navigator`; the proposal exists on _that_ thread; it has no
    `peerLoopExecutions` link already; it is not already implemented the ordinary
    way (`implementedAt` / `implementationThreadId`); the project is active and
    supplies the canonical `workspaceRoot`. Every refusal happens here, before
@@ -604,19 +604,47 @@ The sequence, in order, and each step matters:
    `thread.peer-loop-execution.link` command with the run id Peer Loop returned
    and a server-generated command id and timestamp.
 
+#### At-most-once, and what it actually rests on
+
 Attempts are serialized per `(threadId, proposedPlanId)`, and validation is
 re-read **inside** that critical section. Two simultaneous Execute presses on
 one proposal therefore produce one run: the second finds the link the first
 recorded and is refused as already executed. The gate is per proposal rather
 than global so two different proposals do not queue behind each other's bridge
-spawn, and its map is reference-counted so it stays bounded.
+spawn; its map is reference-counted so it stays bounded; and its key is
+length-prefixed rather than separator-joined, because any separator is a byte
+that could appear inside an id and the resulting collision would be silent.
+
+**Serialization alone is not enough — the re-read has to be against the right
+source.** It reads `OrchestrationEngineService.getThreadById` /
+`getProjectById`, the engine's own committed command state, and **not**
+`ProjectionSnapshotQuery`. The SQL projection is eventually consistent with
+respect to `dispatch`: its projectors catch up separately, so a request that
+took the gate immediately after the first one's link command committed can read
+a projected thread that still shows no link, conclude the proposal was never
+executed, and start a second run. The engine's read model is seeded from replay
+at startup and advanced inside the same transaction that appends the event,
+before `dispatch` resolves — so a request that waited behind the gate is
+guaranteed to see the link the previous one recorded.
+
+The coordinator therefore has exactly **one** validation source, and
+`ProjectionSnapshotQuery` is not in its dependency graph at all. Keeping the
+projection as a second opinion would reintroduce the race the moment anything
+read it. The same reasoning applies to the post-dispatch re-read below: asking
+the projection there would report `link-not-confirmed` for a link that is
+committed and merely not yet projected.
+
+Those engine accessors are narrow and server-internal — one entity by id, no
+wire contract, no client method — and they return whatever the read model
+holds, including soft-deleted entities. "Active" is the coordinator's rule, so
+the coordinator is where the `deletedAt` check lives.
 
 **Partial failure is explicit.** Peer Loop's own errors travel back untouched —
 a `PROJECT_HAS_UNFINISHED_RUN` refusal keeps its code, a timeout keeps
 `mayHaveApplied` — and a timed-out start is never retried, because Peer Loop may
 already have started the run and a second start would fork a session. If the
-link dispatch fails, the thread is re-read once: if that exact proposal/run pair
-is now durably visible the operation succeeded, and otherwise the caller gets a
+link dispatch fails, the thread is re-read once from that same committed state:
+if that exact proposal/run pair is now committed the operation succeeded, and otherwise the caller gets a
 typed `PeerLoopExecutionCoordinationError` with `reason: "link-not-confirmed"`,
 the structured `runId`, and `mayHaveStarted: true` — so recovery is a deliberate
 act on a run the owner can open, not a guess. Nothing auto-resumes, nothing

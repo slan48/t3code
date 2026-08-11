@@ -17,12 +17,25 @@
  * Peer Loop reports, and has no lifecycle of its own — after step 3 it is done
  * with the run forever.
  *
+ * AT-MOST-ONCE, AND WHY IT ACTUALLY HOLDS:
+ *
  * Attempts are serialized per `(threadId, proposedPlanId)` and validation is
- * re-read *inside* that critical section. Two Execute presses on one proposal
- * therefore produce one run: the second finds the link the first recorded and
- * is refused as already executed. Serializing per proposal rather than
- * globally keeps two different proposals from queueing behind each other's
- * bridge spawn.
+ * re-read *inside* that critical section — against `OrchestrationEngineService`,
+ * the engine's own committed command state, and never against the SQL
+ * projection. That distinction is the whole guarantee. The projection is
+ * eventually consistent with respect to `dispatch`: its projectors catch up
+ * separately, so a second Execute arriving right after the first one's link
+ * command committed could read a projected thread with no link on it, conclude
+ * the proposal had never been executed, and start a second run. The engine's
+ * read model is advanced inside the append transaction and before `dispatch`
+ * resolves, so a request that waited behind the gate is guaranteed to see the
+ * link the previous one recorded, and is refused as already executed.
+ *
+ * There is deliberately only ONE validation source. Keeping the projection as
+ * a second opinion would reintroduce the race the moment anything read it.
+ *
+ * Serializing per proposal rather than globally keeps two different proposals
+ * from queueing behind each other's bridge spawn.
  *
  * @module PeerLoopExecutionCoordinator
  */
@@ -47,7 +60,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
-import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { PeerLoopService } from "./Service.ts";
 
@@ -122,11 +134,23 @@ interface ExecutionGate {
   users: number;
 }
 
+/**
+ * A collision-proof key for a `(threadId, proposedPlanId)` pair.
+ *
+ * Length-prefixed rather than separator-joined. Any separator — a space, a
+ * slash, even a NUL — is a byte that could in principle appear inside an id,
+ * and the failure it buys is silent: two different pairs sharing one gate, or
+ * two identical pairs landing on different gates and serializing against
+ * nothing at all. Prefixing each part with its length removes the question
+ * rather than arguing about which byte is safe.
+ */
+export const executionGateKey = (threadId: string, proposedPlanId: string): string =>
+  `${threadId.length}:${threadId}${proposedPlanId.length}:${proposedPlanId}`;
+
 /* ---------------------------------------------------------------- make */
 
 export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* () {
   const peerLoop = yield* PeerLoopService;
-  const snapshotQuery = yield* ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const crypto = yield* Crypto.Crypto;
 
@@ -186,13 +210,14 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
         runId: runId ?? null,
       });
 
-    // A read-model failure is a T3 Code fault and says nothing a client can
-    // act on beyond "not now" — the underlying error stays in the logs.
-    const threadOption = yield* snapshotQuery
-      .getThreadDetailById(input.threadId)
-      .pipe(Effect.mapError(() => fail("coordination-failed")));
+    // The engine's committed state, not the SQL projection: see the module
+    // note. This is the read the at-most-once promise rests on.
+    const threadOption = yield* orchestrationEngine.getThreadById(input.threadId);
 
-    if (Option.isNone(threadOption)) {
+    // A soft-deleted thread is not an active thread. The projection filtered
+    // these out in SQL; the engine hands back what it holds, so the "active"
+    // half of the rule lives here where it can be read.
+    if (Option.isNone(threadOption) || threadOption.value.deletedAt !== null) {
       return yield* fail("navigator-thread-not-found");
     }
     const thread = threadOption.value;
@@ -221,10 +246,8 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
       return yield* fail("proposal-already-implemented");
     }
 
-    const projectOption = yield* snapshotQuery
-      .getProjectShellById(thread.projectId)
-      .pipe(Effect.mapError(() => fail("coordination-failed")));
-    if (Option.isNone(projectOption)) {
+    const projectOption = yield* orchestrationEngine.getProjectById(thread.projectId);
+    if (Option.isNone(projectOption) || projectOption.value.deletedAt !== null) {
       return yield* fail("project-not-found");
     }
 
@@ -234,21 +257,22 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
   /**
    * Did the link we failed to dispatch actually land?
    *
-   * Read once, and looking for the exact pair. A dispatch that reported failure
-   * may still have been persisted — the command queue and its receipt are not
-   * the same step as the answer coming back — so the honest question is whether
-   * the durable record now shows this proposal linked to this run, and nothing
-   * weaker. A link to a *different* run would mean something else entirely
-   * happened and must not be reported as this request's success.
+   * Read once, from the engine's committed state, and looking for the exact
+   * pair. A dispatch that reported failure may still have committed — the
+   * append transaction and the answer coming back are not the same step — so
+   * the honest question is whether the committed record now shows this proposal
+   * linked to this run, and nothing weaker. Asking the SQL projection instead
+   * would answer "not yet" for a link that is committed and merely not
+   * projected, turning a success into a spurious `link-not-confirmed`. A link
+   * to a *different* run would mean something else entirely happened and must
+   * not be reported as this request's success.
    */
   const confirmLink = Effect.fn("peerLoop.ExecutionCoordinator.confirmLink")(function* (input: {
     readonly threadId: PeerLoopExecuteProposalInput["threadId"];
     readonly proposedPlanId: PeerLoopExecuteProposalInput["proposedPlanId"];
     readonly runId: string;
   }) {
-    const threadOption = yield* snapshotQuery
-      .getThreadDetailById(input.threadId)
-      .pipe(Effect.orElseSucceed(() => Option.none<OrchestrationThread>()));
+    const threadOption = yield* orchestrationEngine.getThreadById(input.threadId);
     if (Option.isNone(threadOption)) return null;
     return (
       threadOption.value.peerLoopExecutions.find(
@@ -345,7 +369,7 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
   });
 
   const executeProposal: PeerLoopExecutionCoordinatorShape["executeProposal"] = (input) => {
-    const key = `${input.threadId} ${input.proposedPlanId}`;
+    const key = executionGateKey(input.threadId, input.proposedPlanId);
     return Effect.acquireUseRelease(
       acquireGate(key),
       (owned) => owned.gate.withPermits(1)(executeUnderGate(input)),
