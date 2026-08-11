@@ -2,19 +2,19 @@
  * Executing an agreed Navigator proposal, against fakes only.
  *
  * Every dependency here is injected: a recording Peer Loop, a dispatch that
- * records commands, and — the important part — TWO separate views of the same
- * thread:
+ * records commands, and a projected thread view.
  *
- *   - `committed`, updated synchronously by the fake `dispatch` before it
- *     resolves, standing in for the engine's own command read model;
- *   - `projected`, which lags and can be frozen outright, standing in for the
- *     SQL projection whose projectors catch up on their own schedule.
+ * THE FAKE DISPATCH MIRRORS THE REAL TRANSACTION. In
+ * `OrchestrationEngine.processEnvelope`, appending the event, applying every
+ * SQL projector and writing the accepted receipt all happen inside one
+ * `sql.withTransaction`, and `dispatch` resolves only after that transaction
+ * returns. So the fake updates the projected view *before* it answers. Doing it
+ * afterwards would model a system this repository does not have, and the
+ * at-most-once tests would then be asserting against fiction.
  *
- * Those two views are what makes the at-most-once tests mean anything. A
- * coordinator that revalidates against the projection reads "no link yet" the
- * instant after the first link commits and starts a second run; one that
- * revalidates against committed state does not. `projectionReads` counts every
- * look at the stale view, and the tests assert it stays at zero.
+ * That transactional visibility is what makes serialized revalidation against
+ * `ProjectionSnapshotQuery` sound, and it is proved separately against the real
+ * engine and real SQL in `peerLoopExecutionLink.projection.test.ts`.
  *
  * No bridge is spawned, no agent runs, and nothing is billed.
  */
@@ -35,12 +35,10 @@ import {
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -159,24 +157,16 @@ const EXECUTE: PeerLoopExecuteProposalInput = { threadId: THREAD_ID, proposedPla
 interface Recorder {
   readonly startCalls: Ref.Ref<ReadonlyArray<PeerLoopStartRunInput>>;
   readonly dispatched: Ref.Ref<ReadonlyArray<OrchestrationCommand>>;
-  /** The engine's committed command state. Advances before `dispatch` resolves. */
-  readonly committed: Ref.Ref<ReadonlyArray<OrchestrationThread>>;
-  /** The SQL projection. Lags, and in these tests never catches up. */
+  /**
+   * The projected thread view, written by a successful dispatch before it
+   * resolves — exactly as the real transaction does.
+   */
   readonly projected: Ref.Ref<ReadonlyArray<OrchestrationThread>>;
-  /** How many times anything read the stale projection. Must stay 0. */
-  readonly projectionReads: Ref.Ref<number>;
 }
 
 interface HarnessOptions {
   readonly threads?: ReadonlyArray<OrchestrationThread>;
   readonly project?: OrchestrationProjectShell | null;
-  /**
-   * Let the SQL projection catch up with each committed link.
-   *
-   * Off by default. The default is the interesting case: a projection that is
-   * behind is the normal state right after a dispatch, not an exotic fault.
-   */
-  readonly projectionKeepsUp?: boolean;
   /** Peer Loop's answer to the nth start call. Defaults to a fresh run id. */
   readonly startRun?: (
     input: PeerLoopStartRunInput,
@@ -190,14 +180,8 @@ interface HarnessOptions {
    * projector would.
    */
   readonly applyLink?: boolean;
-  /**
-   * The command id cannot be minted.
-   *
-   * The one remaining way to reach `coordination-failed`: reading the engine's
-   * committed state cannot fail, so the old "projection unavailable" path is
-   * gone with the projection dependency.
-   */
-  readonly commandIdFails?: boolean;
+  /** Projection reads fail. */
+  readonly readFails?: boolean;
   /**
    * Hold `startRun` open until this is completed.
    *
@@ -209,13 +193,12 @@ interface HarnessOptions {
 }
 
 const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions = {}) {
-  const initialThreads = options.threads ?? [navigatorThread()];
   const recorder: Recorder = {
     startCalls: yield* Ref.make<ReadonlyArray<PeerLoopStartRunInput>>([]),
     dispatched: yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]),
-    committed: yield* Ref.make<ReadonlyArray<OrchestrationThread>>(initialThreads),
-    projected: yield* Ref.make<ReadonlyArray<OrchestrationThread>>(initialThreads),
-    projectionReads: yield* Ref.make(0),
+    projected: yield* Ref.make<ReadonlyArray<OrchestrationThread>>(
+      options.threads ?? [navigatorThread()],
+    ),
   };
 
   const findThread = (threads: ReadonlyArray<OrchestrationThread>, threadId: string) => {
@@ -267,22 +250,16 @@ const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions 
     diagnostics: Effect.succeed([]),
   });
 
-  /*
-   * The stale view, still wired in. The coordinator no longer requires it, and
-   * the point of keeping it is the counter: if anything ever reads it again,
-   * `projectionReads` stops being zero and the at-most-once tests say so.
-   */
   const snapshotLayer = Layer.mock(ProjectionSnapshotQuery)({
     getThreadDetailById: (threadId) =>
-      Ref.update(recorder.projectionReads, (count) => count + 1).pipe(
-        Effect.andThen(Ref.get(recorder.projected)),
-        Effect.map((threads) => findThread(threads, threadId)),
-      ) as never,
+      options.readFails === true
+        ? Effect.fail(new Error("projection unavailable") as never)
+        : (Ref.get(recorder.projected).pipe(
+            Effect.map((threads) => findThread(threads, threadId)),
+          ) as never),
     getProjectShellById: () =>
-      Ref.update(recorder.projectionReads, (count) => count + 1).pipe(
-        Effect.as(
-          options.project === null ? Option.none() : Option.some(options.project ?? projectShell),
-        ),
+      Effect.succeed(
+        options.project === null ? Option.none() : Option.some(options.project ?? projectShell),
       ) as never,
     getCommandReadModel: () => Effect.die("unused"),
     getSnapshot: () => Effect.die("unused"),
@@ -301,10 +278,11 @@ const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions 
 
   const engineLayer = Layer.mock(OrchestrationEngineService)({
     /*
-     * The real engine advances its command read model inside the append
-     * transaction, before the dispatcher's deferred resolves. This mirrors
-     * that: `committed` is updated first, and only then does dispatch answer.
-     * The projection is updated only when a test asks for it.
+     * Event append and SQL projection are one transaction in the real engine,
+     * and `dispatch` resolves after it returns. So the projected view is
+     * updated BEFORE this answers. Moving that update after the answer would
+     * model a system this repository does not have — and would break the
+     * concurrency test, which is the point.
      */
     dispatch: (command: OrchestrationCommand) =>
       Effect.gen(function* () {
@@ -312,13 +290,10 @@ const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions 
         const isLink = command.type === "thread.peer-loop-execution.link";
         const dispatchFails = options.dispatchSucceeds === false;
 
-        // `applyLink` is the case where the command committed and only the
-        // answer was lost, so the commit happens either way when it is set.
+        // `applyLink` is the case where the transaction committed and only the
+        // answer was lost, so the projection is written either way when set.
         if (isLink && (!dispatchFails || options.applyLink === true)) {
-          yield* Ref.update(recorder.committed, (threads) => withLink(threads, command));
-          if (options.projectionKeepsUp === true) {
-            yield* Ref.update(recorder.projected, (threads) => withLink(threads, command));
-          }
+          yield* Ref.update(recorder.projected, (threads) => withLink(threads, command));
         }
 
         if (dispatchFails) {
@@ -329,51 +304,13 @@ const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions 
         }
         return { sequence: 1 };
       }) as never,
-    getThreadById: (threadId: string) =>
-      Ref.get(recorder.committed).pipe(Effect.map((threads) => findThread(threads, threadId))),
-    getProjectById: () =>
-      Effect.succeed(
-        options.project === null
-          ? Option.none()
-          : Option.some({
-              id: PROJECT_ID,
-              title: "Demo",
-              workspaceRoot: (options.project ?? projectShell).workspaceRoot,
-              defaultModelSelection: MODEL_SELECTION,
-              scripts: [],
-              createdAt: NOW,
-              updatedAt: NOW,
-              deletedAt: null,
-            }),
-      ) as never,
     readEvents: () => Stream.empty,
     streamDomainEvents: Stream.empty,
     latestSequence: Effect.succeed(0),
   } as never);
 
-  /*
-   * A crypto that refuses to mint. Everything else about `Crypto` is left
-   * alone, so only the command-id path is affected.
-   */
-  const cryptoLayer =
-    options.commandIdFails === true
-      ? Layer.succeed(Crypto.Crypto)({
-          ...(yield* Crypto.Crypto),
-          randomUUIDv4: Effect.fail(
-            new PlatformError.PlatformError(
-              new PlatformError.SystemError({
-                _tag: "Unknown",
-                module: "Crypto",
-                method: "randomUUIDv4",
-                description: "the entropy pool is unavailable",
-              }),
-            ),
-          ),
-        })
-      : Layer.empty;
-
   const coordinator = yield* make().pipe(
-    Effect.provide(Layer.mergeAll(peerLoopLayer, snapshotLayer, engineLayer, cryptoLayer)),
+    Effect.provide(Layer.mergeAll(peerLoopLayer, snapshotLayer, engineLayer)),
   );
 
   return { coordinator, recorder };
@@ -537,14 +474,12 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: refused before st
     expectNoStart({ project: null }, EXECUTE, "project-not-found"),
   );
 
-  it.effect("refuses, sanitized, when the link command id cannot be minted", () =>
+  it.effect("refuses, without detail, when the projection cannot be read", () =>
     Effect.gen(function* () {
-      // Minting happens before `startRun` on purpose: a real run with no way
-      // to record it is the one outcome worth a line of code to avoid.
-      const error = yield* expectNoStart({ commandIdFails: true }, EXECUTE, "coordination-failed");
+      const error = yield* expectNoStart({ readFails: true }, EXECUTE, "coordination-failed");
       if (isCoordinationError(error)) {
-        // Sanitized: nothing from the underlying failure, no path, no stack.
-        assert.strictEqual(error.detail.includes("entropy pool"), false);
+        // Sanitized: no SQL, no stack, no path.
+        assert.strictEqual(error.detail.includes("projection unavailable"), false);
         assert.strictEqual(error.detail.includes(WORKSPACE_ROOT), false);
       }
     }),
@@ -704,35 +639,33 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: concurrency", (it
       }
 
       /*
-       * The point of the whole exercise. The SQL projection never saw the link
-       * — it still shows a proposal with no execution — and the waiting request
-       * was refused anyway, because it revalidated against committed state.
-       * Had it asked the projection, it would have started a second run.
+       * And the projection the loser revalidated against already held the link
+       * the winner recorded, because the fake dispatch wrote it before
+       * answering — as the real transaction does. Delay that write until after
+       * dispatch resolves and this test starts seeing two runs.
        */
       const projectedThread = (yield* Ref.get(recorder.projected)).find(
         (thread) => thread.id === THREAD_ID,
       );
-      assert.deepStrictEqual(projectedThread?.peerLoopExecutions, []);
-      assert.strictEqual(yield* Ref.get(recorder.projectionReads), 0);
+      assert.deepStrictEqual(
+        projectedThread?.peerLoopExecutions.map((entry) => entry.runId),
+        ["run-1"],
+      );
 
       assert.strictEqual(yield* coordinator.pendingExecutionGateCount, 0);
     }),
   );
 
-  it.effect("refuses a second Execute issued right after the first, projection still stale", () =>
+  it.effect("refuses a second Execute issued immediately after the first resolves", () =>
     Effect.gen(function* () {
-      // No barrier here: the second request arrives after the first fully
-      // resolved, which is exactly when the projection is most likely to be
-      // behind — the projectors have had no chance to run at all.
+      // No barrier: the second request arrives the statement after the first
+      // returned. Nothing drained a worker and nothing awaited a projector, and
+      // it must still be refused — which is exactly the promise that dispatch
+      // being transactional with its projection makes.
       const { coordinator, recorder } = yield* makeHarness();
 
       const first = yield* coordinator.executeProposal(EXECUTE);
       assert.strictEqual(first.run.runId, "run-1");
-
-      const projectedThread = (yield* Ref.get(recorder.projected)).find(
-        (thread) => thread.id === THREAD_ID,
-      );
-      assert.deepStrictEqual(projectedThread?.peerLoopExecutions, []);
 
       const error = yield* Effect.flip(coordinator.executeProposal(EXECUTE));
       assert.ok(isCoordinationError(error));
@@ -745,23 +678,6 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: concurrency", (it
 
       assert.strictEqual((yield* Ref.get(recorder.startCalls)).length, 1);
       assert.strictEqual((yield* linkCommands(recorder)).length, 1);
-      assert.strictEqual(yield* Ref.get(recorder.projectionReads), 0);
-    }),
-  );
-
-  it.effect("behaves the same once the projection has caught up", () =>
-    Effect.gen(function* () {
-      // The stale case is the interesting one, but the caught-up case must not
-      // regress: same refusal, same single start.
-      const { coordinator, recorder } = yield* makeHarness({ projectionKeepsUp: true });
-
-      yield* coordinator.executeProposal(EXECUTE);
-      const error = yield* Effect.flip(coordinator.executeProposal(EXECUTE));
-      assert.strictEqual(
-        isCoordinationError(error) ? error.reason : null,
-        "proposal-already-executed",
-      );
-      assert.strictEqual((yield* Ref.get(recorder.startCalls)).length, 1);
     }),
   );
 

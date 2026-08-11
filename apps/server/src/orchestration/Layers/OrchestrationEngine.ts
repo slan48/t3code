@@ -212,6 +212,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             ),
           );
 
+        // Computed inside the transaction above and assigned here, after it
+        // returned and before this envelope's deferred resolves. The SQL
+        // projection was written in that same transaction, so once `dispatch`
+        // answers, the command read model and `ProjectionSnapshotQuery` both
+        // already reflect this command.
         commandReadModel = committedCommand.nextCommandReadModel;
         for (const [index, event] of committedCommand.committedEvents.entries()) {
           yield* PubSub.publish(eventPubSub, event);
@@ -309,33 +314,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive, limit) =>
     eventStore.readFromSequence(fromSequenceExclusive, limit);
 
-  /*
-   * Narrow reads over the committed command read model.
-   *
-   * `commandReadModel` is replaced by the worker fiber immediately after the
-   * append transaction commits and before the dispatcher's deferred resolves,
-   * so a caller that awaited `dispatch` sees the result of its own command
-   * here. The same is not true of the SQL projection, which the projectors
-   * catch up to separately.
-   *
-   * Reassignment is atomic on a single-threaded event loop, so a plain
-   * synchronous property read observes one whole committed model and never a
-   * half-updated one — the same reasoning `latestSequence` already relies on.
-   * Each accessor hands back one entity so no caller can hold, walk, or mutate
-   * the model itself.
-   */
-  const getThreadById: OrchestrationEngineShape["getThreadById"] = (threadId) =>
-    Effect.sync(() => {
-      const found = commandReadModel.threads.find((thread) => thread.id === threadId);
-      return found === undefined ? Option.none() : Option.some(found);
-    });
-
-  const getProjectById: OrchestrationEngineShape["getProjectById"] = (projectId) =>
-    Effect.sync(() => {
-      const found = commandReadModel.projects.find((project) => project.id === projectId);
-      return found === undefined ? Option.none() : Option.some(found);
-    });
-
   const dispatch: OrchestrationEngineShape["dispatch"] = (command) =>
     Effect.gen(function* () {
       const result = yield* Deferred.make<{ sequence: number }, OrchestrationDispatchError>();
@@ -350,8 +328,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   return {
     readEvents,
     dispatch,
-    getThreadById,
-    getProjectById,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.
@@ -359,9 +335,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return Stream.fromPubSub(eventPubSub);
     },
     // The command read model's snapshotSequence tracks the latest committed
-    // event sequence (updated on the worker fiber). A plain property read is a
-    // consistent, committed value — reassignment of `commandReadModel` is
-    // atomic on the single-threaded event loop.
+    // event sequence (assigned on the worker fiber once the append/projection
+    // transaction has returned, before the dispatch resolves). A plain property
+    // read is a consistent, committed value — reassignment of
+    // `commandReadModel` is atomic on the single-threaded event loop.
     latestSequence: Effect.sync(() => commandReadModel.snapshotSequence),
   } satisfies OrchestrationEngineShape;
 });

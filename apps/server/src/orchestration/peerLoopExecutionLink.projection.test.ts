@@ -136,6 +136,52 @@ const link = (runId: string, proposedPlanId: string, createdAt: string) =>
     });
   });
 
+it.layer(makeLayer("t3-peer-loop-link-visibility-"))(
+  "peer loop execution link is visible the moment dispatch resolves",
+  (it) => {
+    /*
+     * The fact the Navigator at-most-once guarantee is built on.
+     *
+     * `OrchestrationEngine.processEnvelope` appends the event, calls
+     * `projectionPipeline.projectEvent` and writes the accepted receipt inside
+     * ONE `sql.withTransaction`, and `dispatch` resolves only after that
+     * transaction returns. So the SQL projection is not eventually behind a
+     * dispatch the caller awaited — it is already current.
+     *
+     * Asserted with no polling, no sleeping, no worker drain and no projector
+     * wait: the read is the statement after `dispatch`. If projection
+     * application ever moved out of that transaction — onto a background
+     * fiber, a queue, a separate commit — this test fails, and the execution
+     * coordinator's serialized revalidation would be unsound.
+     */
+    it.effect("puts the exact link in getThreadDetailById with no wait of any kind", () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        yield* seedNavigatorThread;
+
+        const before = yield* snapshotQuery.getThreadDetailById(THREAD_ID);
+        assert.deepStrictEqual(
+          Option.isSome(before) ? [...before.value.peerLoopExecutions] : null,
+          [],
+        );
+
+        yield* link("run-1", "plan-1", LINKED_AT);
+
+        const after = yield* snapshotQuery.getThreadDetailById(THREAD_ID);
+        assert.deepStrictEqual(Option.isSome(after) ? [...after.value.peerLoopExecutions] : null, [
+          { runId: "run-1", proposedPlanId: "plan-1", createdAt: LINKED_AT },
+        ]);
+
+        // The same is true of the raw projection row the query reads from.
+        assert.deepStrictEqual(
+          (yield* readLinkRows).map((row) => row.runId),
+          ["run-1"],
+        );
+      }),
+    );
+  },
+);
+
 it.layer(makeLayer("t3-peer-loop-link-roundtrip-"))("peer loop execution link", (it) => {
   it.effect("round-trips from the event to the SQL row and both snapshots", () =>
     Effect.gen(function* () {

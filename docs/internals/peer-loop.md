@@ -588,8 +588,8 @@ and the Peer Loop bridge — and owns no lifecycle of its own.
 
 The sequence, in order, and each step matters:
 
-1. **Validate against the engine's committed command state.** The thread is
-   active and its purpose is `navigator`; the proposal exists on _that_ thread; it has no
+1. **Validate against the projection.** The thread is active and its purpose is
+   `navigator`; the proposal exists on _that_ thread; it has no
    `peerLoopExecutions` link already; it is not already implemented the ordinary
    way (`implementedAt` / `implementationThreadId`); the project is active and
    supplies the canonical `workspaceRoot`. Every refusal happens here, before
@@ -615,36 +615,36 @@ spawn; its map is reference-counted so it stays bounded; and its key is
 length-prefixed rather than separator-joined, because any separator is a byte
 that could appear inside an id and the resulting collision would be silent.
 
-**Serialization alone is not enough — the re-read has to be against the right
-source.** It reads `OrchestrationEngineService.getThreadById` /
-`getProjectById`, the engine's own committed command state, and **not**
-`ProjectionSnapshotQuery`. The SQL projection is eventually consistent with
-respect to `dispatch`: its projectors catch up separately, so a request that
-took the gate immediately after the first one's link command committed can read
-a projected thread that still shows no link, conclude the proposal was never
-executed, and start a second run. The engine's read model is seeded from replay
-at startup and advanced inside the same transaction that appends the event,
-before `dispatch` resolves — so a request that waited behind the gate is
-guaranteed to see the link the previous one recorded.
+**Serialization only works because dispatch is transactional with its
+projection.** `OrchestrationEngine.processEnvelope` appends the event, calls
+`projectionPipeline.projectEvent` — which runs every SQL projector — and writes
+the accepted receipt inside **one** `sql.withTransaction`. `dispatch` resolves
+only after that transaction has returned. So the SQL projection is _not_
+eventually consistent with respect to a dispatch the caller awaited: by the time
+the first request's link dispatch answers, `ProjectionSnapshotQuery` already
+contains the link, and the next request through the gate sees it.
 
-The coordinator therefore has exactly **one** validation source, and
-`ProjectionSnapshotQuery` is not in its dependency graph at all. Keeping the
-projection as a second opinion would reintroduce the race the moment anything
-read it. The same reasoning applies to the post-dispatch re-read below: asking
-the projection there would report `link-not-confirmed` for a link that is
-committed and merely not yet projected.
+That is why validation and the post-dispatch confirmation both read
+`ProjectionSnapshotQuery`, and why the coordinator has exactly **one**
+validation source. There is no separate committed-state lookup and no second
+opinion to keep in step; the projection is the authoritative read here.
 
-Those engine accessors are narrow and server-internal — one entity by id, no
-wire contract, no client method — and they return whatever the read model
-holds, including soft-deleted entities. "Active" is the coordinator's rule, so
-the coordinator is where the `deletedAt` check lives.
+(The engine's in-memory command read model is computed inside that same
+transaction and assigned after it returns, still before `dispatch` resolves. It
+backs the decider and `latestSequence`; the execution coordinator does not read
+it.)
+
+`getThreadDetailById` and `getProjectShellById` return only active rows —
+`deleted_at IS NULL` — so deleted threads and projects are filtered by the
+query, as they always were.
 
 **Partial failure is explicit.** Peer Loop's own errors travel back untouched —
 a `PROJECT_HAS_UNFINISHED_RUN` refusal keeps its code, a timeout keeps
 `mayHaveApplied` — and a timed-out start is never retried, because Peer Loop may
 already have started the run and a second start would fork a session. If the
-link dispatch fails, the thread is re-read once from that same committed state:
-if that exact proposal/run pair is now committed the operation succeeded, and otherwise the caller gets a
+link dispatch fails, the thread is re-read once from the projection — which is
+written in the same transaction as the event, so it is the honest place to ask:
+if that exact proposal/run pair is there the operation succeeded, and otherwise the caller gets a
 typed `PeerLoopExecutionCoordinationError` with `reason: "link-not-confirmed"`,
 the structured `runId`, and `mayHaveStarted: true` — so recovery is a deliberate
 act on a run the owner can open, not a guess. Nothing auto-resumes, nothing

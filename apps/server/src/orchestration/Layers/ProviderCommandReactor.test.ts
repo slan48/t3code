@@ -378,8 +378,6 @@ describe("ProviderCommandReactor", () => {
             return engine.streamDomainEvents;
           },
           latestSequence: engine.latestSequence,
-          getThreadById: engine.getThreadById,
-          getProjectById: engine.getProjectById,
         } satisfies OrchestrationEngineService["Service"];
       }),
     ).pipe(Layer.provide(orchestrationLayer));
