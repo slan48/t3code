@@ -74,10 +74,11 @@ export function buildLocalDraftThread(
     id: threadId,
     environmentId: draftThread.environmentId,
     projectId: draftThread.projectId,
-    title: "New thread",
-    // A locally drafted thread is an ordinary coding thread. Navigator threads
-    // are created deliberately and are not drafted here.
-    purpose: "coding",
+    title: draftThread.purpose === "navigator" ? "Navigator" : "New thread",
+    // The draft decided this when it was created, and it is immutable from
+    // there: the local stand-in must agree with the thread the first send will
+    // actually create, or the chat surface renders the wrong identity.
+    purpose: draftThread.purpose,
     modelSelection: fallbackModelSelection,
     runtimeMode: draftThread.runtimeMode,
     interactionMode: draftThread.interactionMode,

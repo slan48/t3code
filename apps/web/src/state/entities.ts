@@ -1,4 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
+
+import { codingThreadsOnly } from "../navigatorThreads";
 import type {
   EnvironmentProject,
   EnvironmentThread,
@@ -118,6 +120,20 @@ export function useServerConfigs(): ReadonlyMap<EnvironmentId, ServerConfig> {
 
 export function useThreadShells(): ReadonlyArray<EnvironmentThreadShell> {
   return useAtomValue(environmentThreadShells.threadShellsAtom);
+}
+
+/**
+ * Thread shells for the ordinary coding surfaces.
+ *
+ * Navigator conversations are synchronized like any other thread and stay
+ * reachable from `/navigator` and their own chat URL — they are simply not
+ * *coding* threads, so they do not belong in the coding sidebar, in coding
+ * search, or in the fallback that decides which thread to open. Nothing is
+ * archived or transformed; this is a filter over the same live list.
+ */
+export function useCodingThreadShells(): ReadonlyArray<EnvironmentThreadShell> {
+  const threads = useThreadShells();
+  return useMemo(() => codingThreadsOnly(threads), [threads]);
 }
 
 export function useAllEnvironmentShellsBootstrapped(): boolean {

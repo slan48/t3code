@@ -659,8 +659,58 @@ underneath — it makes agents act and spends subscription capacity. Peer Loop
 observation methods stay read-scoped and the existing explicit controls are
 unchanged.
 
-There is **no UI** for this, and no natural-language confirmation: the operation
-is invoked explicitly and nothing infers agreement from prose.
+There is **no UI** for this yet, and no natural-language confirmation: the
+operation is invoked explicitly and nothing infers agreement from prose.
+
+### The Navigator conversation surface
+
+`/navigator` is where an owner talks to Navigator. A Navigator conversation is
+an ordinary durable orchestration thread with `purpose: "navigator"` — the same
+messages, the same proposed plans, the same synchronization. There is no second
+conversation store, message table, plan store or lifecycle.
+
+**Opening or using this surface calls no Peer Loop RPC.** The route and its
+sidebar entry are built only from orchestration project and thread shells, and
+neither module imports a Peer Loop atom or command, so mounting them cannot
+spawn the bridge. `/peer-loop` remains the advanced execution inspector,
+unchanged.
+
+**Purpose-aware drafts.** The existing composer draft gained an immutable
+`purpose`, defaulted on decode so every draft persisted before Navigator
+existed rehydrates as the coding draft it is. `useNewThreadHandler` takes a
+`purpose` option that defaults to `coding`, so every existing caller behaves
+exactly as before. A Navigator draft is pinned at creation to
+`approval-required`, `plan`, `branch: null` and `worktreePath: null`, inherits
+none of the coding composer's runtime/interaction/checkout state, and cannot be
+moved off that shape by a later context edit.
+
+**Two slots per project, and how they stay apart.**
+`logicalProjectDraftThreadKeyByLogicalProjectKey` holds at most one draft per
+logical project and evicts whatever it replaces. Navigator drafts are never
+written into it — they are found by scanning `draftThreadsByThreadKey` instead —
+so a project's Navigator draft and its coding draft cannot occupy the same slot,
+evict each other, or be resurrected in place of one another. The persisted map
+therefore keeps exactly the shape and meaning it had before Navigator existed.
+
+**Promotion** goes through the existing bootstrap create-thread path: the first
+send carries the draft's `purpose` (and, for Navigator, the pinned modes and
+null checkout) into the ordinary `thread.create`. There is no Navigator-specific
+create RPC, and coding promotion is unchanged.
+
+**Coding lists exclude Navigator threads.** `useCodingThreadShells` filters them
+out of the sidebar, command palette and the fallback that decides which thread
+to open — landing in a planning-only conversation because it was the newest
+thread would be an accident. Nothing is archived, retitled or transformed; the
+threads stay synchronized and reachable from `/navigator` and their own chat
+URL.
+
+**Still forthcoming, and deliberately not present yet:** the coding-control
+lockdown inside ChatView (hiding implementation, permission-mode, checkout,
+terminal/write, approval-accept and checkpoint-revert actions), the shared
+provider Navigator role frame, the Execute action and natural-language
+confirmation, child execution cards, structured run-result context, and the
+mobile Navigator UI. Until the ChatView lockdown lands, the server invariants
+described above remain the thing that refuses any escape attempt.
 
 Nothing else launches a run, and there is no Navigator UI. The link and its
 history are described above.

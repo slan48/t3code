@@ -15,11 +15,14 @@ import {
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
+  NAVIGATOR_INTERACTION_MODE,
+  NAVIGATOR_RUNTIME_MODE,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
   RuntimeMode,
   TerminalOpenInput,
+  type ThreadPurpose,
 } from "@t3tools/contracts";
 import {
   connectionStatusTitle,
@@ -1458,9 +1461,21 @@ function ChatViewContent(props: ChatViewProps) {
   const threadError = isServerThread
     ? (localServerError ?? activeServerThread?.session?.lastError ?? null)
     : localDraftError;
-  const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
-  const interactionMode =
-    composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
+  /*
+   * A Navigator conversation is planning-only, and the composer's remembered
+   * coding preferences must not leak into it. Reading the purpose from the
+   * thread (server or draft stand-in) and pinning the modes here means the
+   * first send carries the Navigator shape rather than whatever the coding
+   * composer last had — the server would refuse the alternative anyway.
+   */
+  const activeThreadPurpose: ThreadPurpose = activeThread?.purpose ?? "coding";
+  const isNavigatorThread = activeThreadPurpose === "navigator";
+  const runtimeMode = isNavigatorThread
+    ? NAVIGATOR_RUNTIME_MODE
+    : (composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE);
+  const interactionMode = isNavigatorThread
+    ? NAVIGATOR_INTERACTION_MODE
+    : (composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE);
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
@@ -4859,7 +4874,10 @@ function ChatViewContent(props: ChatViewProps) {
                     createThread: {
                       projectId: activeProject.id,
                       title,
-                      purpose: "coding" as const,
+                      // Carried from the draft, and with it the Navigator
+                      // shape below. The server refuses any other combination
+                      // for a navigator thread.
+                      purpose: activeThreadPurpose,
                       modelSelection: threadCreateModelSelection,
                       runtimeMode,
                       interactionMode,

@@ -4,7 +4,13 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_RUNTIME_MODE, type ScopedProjectRef } from "@t3tools/contracts";
+import {
+  DEFAULT_RUNTIME_MODE,
+  NAVIGATOR_INTERACTION_MODE,
+  NAVIGATOR_RUNTIME_MODE,
+  type ScopedProjectRef,
+  type ThreadPurpose,
+} from "@t3tools/contracts";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 import {
@@ -51,11 +57,17 @@ export function useNewThreadHandler() {
         envMode?: DraftThreadEnvMode;
         startFromOrigin?: boolean;
         replace?: boolean;
+        /**
+         * What the draft becomes when it is sent. Defaults to `coding`, so
+         * every existing caller keeps exactly the behaviour it had.
+         */
+        purpose?: ThreadPurpose;
       },
     ): Promise<void> => {
       const {
         getComposerDraft,
         getDraftSessionByLogicalProjectKey,
+        getNavigatorDraftSessionByLogicalProjectKey,
         getDraftSession,
         getDraftThread,
         applyStickyState,
@@ -112,7 +124,18 @@ export function useNewThreadHandler() {
       const hasWorktreePathOption = options?.worktreePath !== undefined;
       const hasEnvModeOption = options?.envMode !== undefined;
       const hasStartFromOriginOption = options?.startFromOrigin !== undefined;
-      const storedDraftThread = getDraftSessionByLogicalProjectKey(logicalProjectKey);
+      /*
+       * Navigator and coding drafts are separate slots for one project.
+       * Reusing the right one is the whole of it: a Navigator request never
+       * looks at — and so never resurrects, remaps or navigates to — the
+       * project's coding draft, and a coding request never sees the Navigator
+       * one, because the coding slot map has never held it.
+       */
+      const purpose: ThreadPurpose = options?.purpose ?? "coding";
+      const isNavigator = purpose === "navigator";
+      const storedDraftThread = isNavigator
+        ? getNavigatorDraftSessionByLogicalProjectKey(logicalProjectKey)
+        : getDraftSessionByLogicalProjectKey(logicalProjectKey);
       const storedDraftThreadRef = storedDraftThread
         ? scopeThreadRef(storedDraftThread.environmentId, storedDraftThread.threadId)
         : null;
@@ -165,7 +188,7 @@ export function useNewThreadHandler() {
                     newWorktreesStartFromOrigin: primaryServerSettings.newWorktreesStartFromOrigin,
                   }),
                 };
-          if (workspaceContext) {
+          if (workspaceContext && !isNavigator) {
             setDraftThreadContext(reusableStoredDraftThread.draftId, {
               ...workspaceContext,
               ...(carryRuntimeMode ? { runtimeMode: carryRuntimeMode } : {}),
@@ -188,12 +211,14 @@ export function useNewThreadHandler() {
             logicalProjectKey,
             projectRef,
             reusableStoredDraftThread.draftId,
-            {
-              threadId: reusableStoredDraftThread.threadId,
-              ...workspaceContext,
-              ...(carryRuntimeMode ? { runtimeMode: carryRuntimeMode } : {}),
-              ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
-            },
+            isNavigator
+              ? { threadId: reusableStoredDraftThread.threadId, purpose }
+              : {
+                  threadId: reusableStoredDraftThread.threadId,
+                  ...workspaceContext,
+                  ...(carryRuntimeMode ? { runtimeMode: carryRuntimeMode } : {}),
+                  ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
+                },
           );
           if (
             currentRouteTarget?.kind === "draft" &&
@@ -213,6 +238,9 @@ export function useNewThreadHandler() {
         latestActiveDraftThread &&
         currentRouteTarget?.kind === "draft" &&
         latestActiveDraftThread.logicalProjectKey === logicalProjectKey &&
+        // Same project is not enough: reusing the open draft across purposes
+        // is precisely the confusion the two slots exist to prevent.
+        latestActiveDraftThread.purpose === purpose &&
         latestActiveDraftThread.promotedTo == null
       ) {
         if (
@@ -246,21 +274,41 @@ export function useNewThreadHandler() {
       const createdAt = new Date().toISOString();
       const initialEnvMode = options?.envMode ?? primaryServerSettings.defaultThreadEnvMode;
       return (async () => {
-        setLogicalProjectDraftThreadId(logicalProjectKey, projectRef, draftId, {
-          threadId,
-          createdAt,
-          branch: options?.branch ?? null,
-          worktreePath: options?.worktreePath ?? null,
-          envMode: initialEnvMode,
-          startFromOrigin:
-            options?.startFromOrigin ??
-            resolveNewDraftStartFromOrigin({
-              envMode: initialEnvMode,
-              newWorktreesStartFromOrigin: primaryServerSettings.newWorktreesStartFromOrigin,
-            }),
-          runtimeMode: carryRuntimeMode ?? DEFAULT_RUNTIME_MODE,
-          ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
-        });
+        setLogicalProjectDraftThreadId(
+          logicalProjectKey,
+          projectRef,
+          draftId,
+          isNavigator
+            ? {
+                // Nothing carried. A Navigator draft is planning-only, owns no
+                // checkout, and inherits none of the coding composer's state.
+                threadId,
+                createdAt,
+                purpose,
+                runtimeMode: NAVIGATOR_RUNTIME_MODE,
+                interactionMode: NAVIGATOR_INTERACTION_MODE,
+                branch: null,
+                worktreePath: null,
+                envMode: "local",
+                startFromOrigin: false,
+              }
+            : {
+                threadId,
+                createdAt,
+                purpose,
+                branch: options?.branch ?? null,
+                worktreePath: options?.worktreePath ?? null,
+                envMode: initialEnvMode,
+                startFromOrigin:
+                  options?.startFromOrigin ??
+                  resolveNewDraftStartFromOrigin({
+                    envMode: initialEnvMode,
+                    newWorktreesStartFromOrigin: primaryServerSettings.newWorktreesStartFromOrigin,
+                  }),
+                runtimeMode: carryRuntimeMode ?? DEFAULT_RUNTIME_MODE,
+                ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
+              },
+        );
         applyStickyState(draftId);
         if (carryModelSelection) {
           // After sticky state so the viewed thread's exact selection

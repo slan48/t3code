@@ -11,8 +11,12 @@ import {
   ProviderOptionSelection,
   PreviewAnnotationPayloadSchema,
   type PreviewAnnotationPayload,
+  NAVIGATOR_INTERACTION_MODE,
+  NAVIGATOR_RUNTIME_MODE,
   RuntimeMode,
   type ServerProvider,
+  type ThreadPurpose,
+  ThreadPurposeWithDefault,
   type ScopedProjectRef,
   type ScopedThreadRef,
   ThreadId,
@@ -210,6 +214,9 @@ const PersistedDraftThreadState = Schema.Struct({
   projectId: ProjectId,
   logicalProjectKey: Schema.optionalKey(Schema.String),
   createdAt: Schema.String,
+  // Immutable, and defaulted so every draft persisted before Navigator
+  // existed rehydrates as the coding draft it has always been.
+  purpose: ThreadPurposeWithDefault,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   branch: Schema.NullOr(Schema.String),
@@ -237,6 +244,15 @@ const PersistedComposerDraftStoreState = Schema.Struct({
   stickyActiveProvider: Schema.optionalKey(Schema.NullOr(ProviderInstanceId)),
 });
 type PersistedComposerDraftStoreState = typeof PersistedComposerDraftStoreState.Type;
+
+/**
+ * The persisted shape, exposed for decode tests.
+ *
+ * Backward compatibility is a property of this schema — a draft written before
+ * `purpose` existed has to come back as a coding draft — and that is only
+ * checkable by decoding the old shape directly.
+ */
+export const PersistedComposerDraftStoreStateForTests = PersistedComposerDraftStoreState;
 
 const PersistedComposerDraftStoreStorage = Schema.Struct({
   version: Schema.Number,
@@ -289,6 +305,12 @@ export interface DraftSessionState {
   projectId: ProjectId;
   logicalProjectKey: string;
   createdAt: string;
+  /**
+   * What this draft becomes when it is promoted. Decided at creation and never
+   * changed afterwards — a coding draft cannot turn into a Navigator one, and
+   * the server would refuse the resulting thread anyway.
+   */
+  purpose: ThreadPurpose;
   runtimeMode: RuntimeMode;
   interactionMode: ProviderInteractionMode;
   branch: string | null;
@@ -335,6 +357,16 @@ interface ComposerDraftStoreState {
   /** Looks up the active draft session for a logical project identity. */
   getDraftThreadByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
   getDraftSessionByLogicalProjectKey: (logicalProjectKey: string) => ProjectDraftSession | null;
+  /**
+   * The Navigator draft for a logical project, if one is open.
+   *
+   * Scanned rather than looked up: Navigator drafts are kept out of the
+   * single-slot logical-project map precisely so they cannot displace, or be
+   * displaced by, that project's ordinary coding draft.
+   */
+  getNavigatorDraftSessionByLogicalProjectKey: (
+    logicalProjectKey: string,
+  ) => ProjectDraftSession | null;
   getDraftThreadByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   getDraftSessionByProjectRef: (projectRef: ScopedProjectRef) => ProjectDraftSession | null;
   /** Reads mutable draft-session metadata by `DraftId`. */
@@ -357,6 +389,8 @@ interface ComposerDraftStoreState {
       createdAt?: string;
       envMode?: DraftThreadEnvMode;
       startFromOrigin?: boolean;
+      /** Only honoured when the draft is being created. Immutable afterwards. */
+      purpose?: ThreadPurpose;
       runtimeMode?: RuntimeMode;
       interactionMode?: ProviderInteractionMode;
     },
@@ -1338,8 +1372,12 @@ function createDraftThreadState(
     startFromOrigin?: boolean;
     runtimeMode?: RuntimeMode;
     interactionMode?: ProviderInteractionMode;
+    purpose?: ThreadPurpose;
   },
 ): DraftThreadState {
+  // Immutable: an existing draft keeps the purpose it was created with. Only a
+  // brand-new draft can be told what it is, and only once.
+  const purpose: ThreadPurpose = existingThread?.purpose ?? options?.purpose ?? "coding";
   // A project change (including switching environments within a logical
   // project) invalidates machine-specific context: the branch may not exist
   // there and the worktree path certainly doesn't. The user's *intent* —
@@ -1364,12 +1402,34 @@ function createDraftThreadState(
     options?.startFromOrigin === undefined
       ? (existingThread?.startFromOrigin ?? false)
       : options.startFromOrigin;
+  if (purpose === "navigator") {
+    // Fixed, and not merely defaulted: a Navigator draft never inherits the
+    // coding composer's runtime mode, interaction mode or checkout, and no
+    // option can move it off them. The server refuses any other combination
+    // for a navigator thread, so producing one here would only fail later.
+    return {
+      threadId,
+      environmentId: projectRef.environmentId,
+      projectId: projectRef.projectId,
+      logicalProjectKey,
+      createdAt: options?.createdAt ?? existingThread?.createdAt ?? new Date().toISOString(),
+      purpose,
+      runtimeMode: NAVIGATOR_RUNTIME_MODE,
+      interactionMode: NAVIGATOR_INTERACTION_MODE,
+      branch: null,
+      worktreePath: null,
+      envMode: "local",
+      startFromOrigin: false,
+      promotedTo: null,
+    };
+  }
   return {
     threadId,
     environmentId: projectRef.environmentId,
     projectId: projectRef.projectId,
     logicalProjectKey,
     createdAt: options?.createdAt ?? existingThread?.createdAt ?? new Date().toISOString(),
+    purpose,
     runtimeMode: options?.runtimeMode ?? existingThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
     interactionMode:
       options?.interactionMode ?? existingThread?.interactionMode ?? DEFAULT_INTERACTION_MODE,
@@ -1400,6 +1460,7 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
   return (
     !!left &&
     left.threadId === right.threadId &&
+    left.purpose === right.purpose &&
     left.environmentId === right.environmentId &&
     left.projectId === right.projectId &&
     left.logicalProjectKey === right.logicalProjectKey &&
@@ -1554,6 +1615,8 @@ function normalizePersistedDraftThreads(
         envMode: normalizeDraftThreadEnvMode(candidateDraftThread.envMode, normalizedWorktreePath),
         startFromOrigin,
         promotedTo,
+        // Every draft that predates Navigator is a coding draft.
+        purpose: "coding",
       };
     }
   }
@@ -1593,6 +1656,7 @@ function normalizePersistedDraftThreads(
           projectId: projectRef.projectId,
           logicalProjectKey,
           createdAt: new Date().toISOString(),
+          purpose: "coding",
           runtimeMode: DEFAULT_RUNTIME_MODE,
           interactionMode: DEFAULT_INTERACTION_MODE,
           branch: null,
@@ -2155,6 +2219,7 @@ function toHydratedDraftThreadState(
     threadId: persistedDraftThread.threadId,
     environmentId: persistedDraftThread.environmentId as EnvironmentId,
     projectId: persistedDraftThread.projectId,
+    purpose: persistedDraftThread.purpose,
     logicalProjectKey:
       persistedDraftThread.logicalProjectKey ??
       projectDraftKey(
@@ -2208,14 +2273,35 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           if (!draftThread || isDraftThreadPromoting(draftThread)) {
             return null;
           }
+          // Belt and braces: the slot map is coding-only by construction, and
+          // this is the read that would matter if that ever stopped holding.
+          if (draftThread.purpose !== "coding") {
+            return null;
+          }
           return toProjectDraftSession(DraftId.make(draftId), draftThread);
+        },
+        getNavigatorDraftSessionByLogicalProjectKey: (logicalProjectKey) => {
+          const normalizedLogicalProjectKey = logicalProjectDraftKey(logicalProjectKey);
+          if (normalizedLogicalProjectKey.length === 0) {
+            return null;
+          }
+          for (const [draftId, draftThread] of Object.entries(get().draftThreadsByThreadKey)) {
+            if (
+              draftThread.purpose === "navigator" &&
+              draftThread.logicalProjectKey === normalizedLogicalProjectKey &&
+              !isDraftThreadPromoting(draftThread)
+            ) {
+              return toProjectDraftSession(DraftId.make(draftId), draftThread);
+            }
+          }
+          return null;
         },
         getDraftThreadByProjectRef: (projectRef) => {
           return get().getDraftSessionByProjectRef(projectRef);
         },
         getDraftSessionByProjectRef: (projectRef) => {
           for (const [draftId, draftThread] of Object.entries(get().draftThreadsByThreadKey)) {
-            if (isDraftThreadPromoting(draftThread)) {
+            if (isDraftThreadPromoting(draftThread) || draftThread.purpose !== "coding") {
               continue;
             }
             if (
@@ -2263,8 +2349,6 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           }
           set((state) => {
             const existingThread = state.draftThreadsByThreadKey[draftId];
-            const previousThreadKeyForLogicalProject =
-              state.logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
             const nextDraftThread = createDraftThreadState(
               projectRef,
               options?.threadId ?? existingThread?.threadId ?? ThreadId.make(draftId),
@@ -2272,6 +2356,34 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               existingThread,
               options,
             );
+            /*
+             * THE SLOT MAP IS CODING-ONLY, AND THAT IS THE SEPARATION.
+             *
+             * `logicalProjectDraftThreadKeyByLogicalProjectKey` holds at most
+             * one draft per logical project and evicts whatever it replaces.
+             * Navigator drafts are deliberately never written into it, so a
+             * project's Navigator draft and its coding draft cannot occupy the
+             * same slot, evict one another, or be resurrected in place of one
+             * another. Navigator drafts are found by scanning instead — there
+             * is at most one per project, and scanning is what
+             * `getDraftSessionByProjectRef` already does.
+             *
+             * It also leaves the persisted map with exactly the shape and
+             * meaning it had before Navigator existed.
+             */
+            if (nextDraftThread.purpose === "navigator") {
+              if (draftThreadsEqual(existingThread, nextDraftThread)) {
+                return state;
+              }
+              return {
+                draftThreadsByThreadKey: {
+                  ...state.draftThreadsByThreadKey,
+                  [draftId]: nextDraftThread,
+                },
+              };
+            }
+            const previousThreadKeyForLogicalProject =
+              state.logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
             const hasSameLogicalMapping = previousThreadKeyForLogicalProject === draftId;
             if (hasSameLogicalMapping && draftThreadsEqual(existingThread, nextDraftThread)) {
               return state;
@@ -2362,22 +2474,35 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               options.startFromOrigin === undefined
                 ? existing.startFromOrigin
                 : options.startFromOrigin;
+            const isNavigator = existing.purpose === "navigator";
             const nextDraftThread: DraftThreadState = {
               threadId: existing.threadId,
               environmentId: nextProjectRef.environmentId,
               projectId: nextProjectRef.projectId,
               logicalProjectKey: existing.logicalProjectKey,
+              // Immutable. `setDraftThreadContext` edits context, never identity.
+              purpose: existing.purpose,
               createdAt:
                 options.createdAt === undefined
                   ? existing.createdAt
                   : options.createdAt || existing.createdAt,
-              runtimeMode: options.runtimeMode ?? existing.runtimeMode,
-              interactionMode: options.interactionMode ?? existing.interactionMode,
-              branch: nextBranch,
-              worktreePath: nextWorktreePath,
-              envMode:
-                options.envMode ?? (nextWorktreePath ? "worktree" : (existing.envMode ?? "local")),
-              startFromOrigin: nextStartFromOrigin,
+              // A Navigator draft is pinned. Context edits reach it through the
+              // same shared paths a coding draft uses — project remaps, carried
+              // composer state — and none of them may hand it a writable
+              // runtime mode, an implementation mode, or a checkout.
+              runtimeMode: isNavigator
+                ? NAVIGATOR_RUNTIME_MODE
+                : (options.runtimeMode ?? existing.runtimeMode),
+              interactionMode: isNavigator
+                ? NAVIGATOR_INTERACTION_MODE
+                : (options.interactionMode ?? existing.interactionMode),
+              branch: isNavigator ? null : nextBranch,
+              worktreePath: isNavigator ? null : nextWorktreePath,
+              envMode: isNavigator
+                ? "local"
+                : (options.envMode ??
+                  (nextWorktreePath ? "worktree" : (existing.envMode ?? "local"))),
+              startFromOrigin: isNavigator ? false : nextStartFromOrigin,
               promotedTo: existing.promotedTo ?? null,
             };
             const isUnchanged =

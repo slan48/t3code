@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as PeerLoopRouteImport } from './routes/peer-loop'
 import { Route as PairRouteImport } from './routes/pair'
+import { Route as NavigatorRouteImport } from './routes/navigator'
 import { Route as ConnectRouteImport } from './routes/connect'
 import { Route as AgentRunsRouteImport } from './routes/agent-runs'
 import { Route as ChatRouteImport } from './routes/_chat'
@@ -46,6 +47,11 @@ const PeerLoopRoute = PeerLoopRouteImport.update({
 const PairRoute = PairRouteImport.update({
   id: '/pair',
   path: '/pair',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const NavigatorRoute = NavigatorRouteImport.update({
+  id: '/navigator',
+  path: '/navigator',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ConnectRoute = ConnectRouteImport.update({
@@ -153,6 +159,7 @@ export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
   '/agent-runs': typeof AgentRunsRouteWithChildren
   '/connect': typeof ConnectRoute
+  '/navigator': typeof NavigatorRoute
   '/pair': typeof PairRoute
   '/peer-loop': typeof PeerLoopRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
@@ -175,6 +182,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
+  '/navigator': typeof NavigatorRoute
   '/pair': typeof PairRoute
   '/settings': typeof SettingsRouteWithChildren
   '/agent-runs/$runId': typeof AgentRunsRunIdRoute
@@ -200,6 +208,7 @@ export interface FileRoutesById {
   '/_chat': typeof ChatRouteWithChildren
   '/agent-runs': typeof AgentRunsRouteWithChildren
   '/connect': typeof ConnectRoute
+  '/navigator': typeof NavigatorRoute
   '/pair': typeof PairRoute
   '/peer-loop': typeof PeerLoopRouteWithChildren
   '/settings': typeof SettingsRouteWithChildren
@@ -227,6 +236,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agent-runs'
     | '/connect'
+    | '/navigator'
     | '/pair'
     | '/peer-loop'
     | '/settings'
@@ -249,6 +259,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
+    | '/navigator'
     | '/pair'
     | '/settings'
     | '/agent-runs/$runId'
@@ -273,6 +284,7 @@ export interface FileRouteTypes {
     | '/_chat'
     | '/agent-runs'
     | '/connect'
+    | '/navigator'
     | '/pair'
     | '/peer-loop'
     | '/settings'
@@ -299,6 +311,7 @@ export interface RootRouteChildren {
   ChatRoute: typeof ChatRouteWithChildren
   AgentRunsRoute: typeof AgentRunsRouteWithChildren
   ConnectRoute: typeof ConnectRoute
+  NavigatorRoute: typeof NavigatorRoute
   PairRoute: typeof PairRoute
   PeerLoopRoute: typeof PeerLoopRouteWithChildren
   SettingsRoute: typeof SettingsRouteWithChildren
@@ -326,6 +339,13 @@ declare module '@tanstack/react-router' {
       path: '/pair'
       fullPath: '/pair'
       preLoaderRoute: typeof PairRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/navigator': {
+      id: '/navigator'
+      path: '/navigator'
+      fullPath: '/navigator'
+      preLoaderRoute: typeof NavigatorRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/connect': {
@@ -545,6 +565,7 @@ const rootRouteChildren: RootRouteChildren = {
   ChatRoute: ChatRouteWithChildren,
   AgentRunsRoute: AgentRunsRouteWithChildren,
   ConnectRoute: ConnectRoute,
+  NavigatorRoute: NavigatorRoute,
   PairRoute: PairRoute,
   PeerLoopRoute: PeerLoopRouteWithChildren,
   SettingsRoute: SettingsRouteWithChildren,
