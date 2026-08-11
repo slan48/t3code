@@ -706,12 +706,26 @@ URL.
 
 **Planning lockdown in the chat surface.** `apps/web/src/navigatorCapabilities.ts`
 derives one capability record from the thread's purpose — runtime mode,
-interaction mode, checkout, plan implementation, terminals, checkpoint revert,
-repository-mutating diff actions, approval accept — rather than scattering
-`purpose === "navigator"` comparisons through the components. Controls read it
-to decide whether to render, and the callbacks read it again as an early guard,
-because hiding a button does not unbind a keyboard shortcut, a slash command,
-or a stale reference in a component that has not re-rendered. Declining and
+interaction mode, checkout, plan implementation, terminals, project scripts,
+checkpoint revert, repository-mutating actions, approval accept — rather than
+scattering `purpose === "navigator"` comparisons through the components.
+`ChatView` derives it once and **passes it down**: `ChatHeader` (project
+scripts, and the conversation identity badge), `MessagesTimeline` and
+`ProposedPlanCard` (proposal wording and the workspace write), `PlanSidebar`
+(the same wording and the same write), `ComposerPrimaryActions` (refine instead
+of implement) and `ComposerPendingApprovalActions` (no accept, decline and
+cancel kept). Children consume the record rather than re-deriving purpose, so a
+new control cannot quietly skip the question.
+
+The callbacks read it again as an early guard, because hiding a button does not
+unbind a keyboard shortcut, a slash command, or a stale reference in a component
+that has not re-rendered: `onRespondToApproval` (which inspects the _decision_ —
+`accept` and `acceptForSession` are blocked, `decline` and `cancel` are not),
+`onImplementPlanInNewThread`, `runProjectScript`, `setTerminalOpen`,
+`toggleTerminalVisibility`, `splitTerminal`, `splitPanelTerminal`,
+`onRevertToTurnCount`, `handleRuntimeModeChange` and
+`handleInteractionModeChange` (which is also the standalone slash-command path,
+so `/default` is inert rather than refused). Declining and
 cancelling a pending approval stay available: the server explicitly permits
 clearing a request, and blocking it would strand a conversation with an
 unanswerable question. Reading, navigating, conversing, refining the proposal
@@ -724,9 +738,12 @@ the thread's `null` branch — dispatching a `thread.meta.update` the server
 refuses, on every message the owner types. It returns early for Navigator
 threads instead.
 
-The same module supplies the proposal wording, so the timeline card and the
-Plan sidebar agree: a Navigator plan is an **Execution Proposal**, and a coding
-thread's plan keeps the `Plan` / `Proposed plan` wording it has always had.
+The same module supplies the proposal wording and the conversation identity, so
+the timeline card and the Plan sidebar agree: a Navigator plan is an **Execution
+Proposal**, and a coding thread's plan keeps the `Plan` / `Proposed plan`
+wording it has always had. The identity is a badge rather than a title
+convention, because the generated title stops saying "Navigator" the moment the
+model names the conversation after its subject.
 
 **The provider role frame.** `apps/server/src/orchestration/navigatorProviderFrame.ts`
 holds one bounded, constant preamble. `ProviderCommandReactor` wraps it around

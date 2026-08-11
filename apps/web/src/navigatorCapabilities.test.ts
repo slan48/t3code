@@ -24,6 +24,7 @@ describe("navigator capabilities", () => {
       canChooseCheckout: false,
       canImplementPlan: false,
       canUseTerminals: false,
+      canRunProjectScripts: false,
       canRevertCheckpoint: false,
       canStartRepositoryMutation: false,
       // Clearing a pending request is explicitly allowed by the server, and

@@ -20,6 +20,13 @@ interface ComposerPrimaryActionsProps {
   pendingAction: PendingActionState | null;
   isRunning: boolean;
   showPlanFollowUpPrompt: boolean;
+  /**
+   * Whether this conversation can turn a plan into work.
+   *
+   * False for a planning conversation, which keeps the refine action — that is
+   * the whole point of it — and offers neither implementation path.
+   */
+  canImplementPlan?: boolean;
   promptHasText: boolean;
   isSendBusy: boolean;
   sendDisabledReason: string | null;
@@ -60,6 +67,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   pendingAction,
   isRunning,
   showPlanFollowUpPrompt,
+  canImplementPlan = true,
   promptHasText,
   isSendBusy,
   sendDisabledReason,
@@ -149,7 +157,11 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   }
 
   if (showPlanFollowUpPrompt) {
-    if (promptHasText) {
+    // A planning conversation refines its proposal and never implements it, so
+    // it takes the refine button whether or not there is text waiting. The
+    // Implement pair below is never rendered for it — and `onImplementPlanInNewThread`
+    // is guarded in `ChatView` as well, for the paths that do not go through here.
+    if (promptHasText || !canImplementPlan) {
       return (
         <Button
           type="submit"

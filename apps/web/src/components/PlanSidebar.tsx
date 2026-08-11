@@ -59,6 +59,14 @@ interface PlanSidebarProps {
   activePlan: ActivePlanState | null;
   activeProposedPlan: LatestProposedPlanState | null;
   label?: string;
+  /**
+   * Whether "Save to workspace" is offered.
+   *
+   * It writes a file into the repository, which a planning conversation does
+   * not do. Copy and download stay: they move text to the owner's own machine
+   * and touch nothing in the project.
+   */
+  canSaveToWorkspace?: boolean;
   environmentId: EnvironmentId;
   threadRef?: ScopedThreadRef | undefined;
   markdownCwd: string | undefined;
@@ -71,6 +79,7 @@ const PlanSidebar = memo(function PlanSidebar({
   activePlan,
   activeProposedPlan,
   label = "Plan",
+  canSaveToWorkspace = true,
   environmentId,
   threadRef,
   markdownCwd,
@@ -180,12 +189,14 @@ const PlanSidebar = memo(function PlanSidebar({
                   {isCopied ? "Copied!" : "Copy to clipboard"}
                 </MenuItem>
                 <MenuItem onClick={handleDownload}>Download as markdown</MenuItem>
-                <MenuItem
-                  onClick={handleSaveToWorkspace}
-                  disabled={!workspaceRoot || isSavingToWorkspace}
-                >
-                  Save to workspace
-                </MenuItem>
+                {canSaveToWorkspace ? (
+                  <MenuItem
+                    onClick={handleSaveToWorkspace}
+                    disabled={!workspaceRoot || isSavingToWorkspace}
+                  >
+                    Save to workspace
+                  </MenuItem>
+                ) : null}
               </MenuPopup>
             </Menu>
           ) : null}

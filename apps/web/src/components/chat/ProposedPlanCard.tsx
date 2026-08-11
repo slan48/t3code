@@ -41,6 +41,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   cwd,
   workspaceRoot,
   wording = CODING_PROPOSAL_WORDING,
+  canSaveToWorkspace = true,
 }: {
   planMarkdown: string;
   environmentId: EnvironmentId;
@@ -52,6 +53,11 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
    * every existing caller renders exactly what it renders today.
    */
   wording?: ProposalWording;
+  /**
+   * Whether "Save to workspace" is offered. It writes a file into the
+   * repository; copy and download do not and always stay.
+   */
+  canSaveToWorkspace?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
@@ -170,9 +176,11 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               {isCopied ? "Copied!" : "Copy to clipboard"}
             </MenuItem>
             <MenuItem onClick={handleDownload}>Download as markdown</MenuItem>
-            <MenuItem onClick={openSaveDialog} disabled={!workspaceRoot || isSavingToWorkspace}>
-              Save to workspace
-            </MenuItem>
+            {canSaveToWorkspace ? (
+              <MenuItem onClick={openSaveDialog} disabled={!workspaceRoot || isSavingToWorkspace}>
+                Save to workspace
+              </MenuItem>
+            ) : null}
           </MenuPopup>
         </Menu>
       </div>

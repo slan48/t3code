@@ -157,7 +157,7 @@ import {
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
-import { proposalWording, threadCapabilities } from "~/navigatorCapabilities";
+import { conversationIdentity, proposalWording, threadCapabilities } from "~/navigatorCapabilities";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -1479,6 +1479,7 @@ function ChatViewContent(props: ChatViewProps) {
    */
   const capabilities = threadCapabilities(activeThreadPurpose);
   const proposalLabels = proposalWording(activeThreadPurpose);
+  const threadIdentity = conversationIdentity(activeThreadPurpose);
   const runtimeMode = isNavigatorThread
     ? NAVIGATOR_RUNTIME_MODE
     : (composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE);
@@ -2144,7 +2145,12 @@ function ChatViewContent(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
-  const planSidebarLabel = sidebarProposedPlan || interactionMode === "plan" ? "Plan" : "Tasks";
+  const planSidebarLabel =
+    sidebarProposedPlan || interactionMode === "plan"
+      ? // Same wording record the timeline card uses, so the two never disagree
+        // about what this conversation calls its plan.
+        proposalLabels.badge
+      : "Tasks";
   const showPlanFollowUpPrompt =
     pendingUserInputs.length === 0 &&
     interactionMode === "plan" &&
@@ -2659,12 +2665,17 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const setTerminalOpen = useCallback(
     (open: boolean) => {
+      // Terminals run commands in a checkout. A Navigator conversation owns
+      // none, so this is guarded at the callback and not only where the button
+      // is drawn — a keybinding reaches this function directly.
+      if (!capabilities.canUseTerminals) return;
       if (!activeThreadRef) return;
       storeSetTerminalOpen(activeThreadRef, open);
     },
-    [activeThreadRef, storeSetTerminalOpen],
+    [activeThreadRef, capabilities.canUseTerminals, storeSetTerminalOpen],
   );
   const toggleTerminalVisibility = useCallback(() => {
+    if (!capabilities.canUseTerminals) return;
     if (!activeThreadRef) return;
     const nextOpen = !terminalUiState.terminalOpen;
     if (nextOpen && terminalUiState.terminalIds.length === 0) {
@@ -2709,6 +2720,7 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
   const splitTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
+      if (!capabilities.canUseTerminals) return;
       if (!activeThreadRef || hasReachedSplitLimit || !activeThreadId || !activeProject) {
         return;
       }
@@ -2830,6 +2842,7 @@ function ChatViewContent(props: ChatViewProps) {
         rememberAsLastInvoked?: boolean;
       },
     ) => {
+      if (!capabilities.canRunProjectScripts) return;
       if (!activeThreadId || !activeProject || !activeThread) return;
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
@@ -3227,6 +3240,7 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
+      if (!capabilities.canUseTerminals) return;
       if (
         !activeThreadRef ||
         !activeThreadId ||
@@ -5035,6 +5049,19 @@ function ChatViewContent(props: ChatViewProps) {
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       if (!activeThreadId) return;
+      /*
+       * The decision decides, not the thread. Accepting is the one answer that
+       * would let a read-only conversation act, and the server refuses it for a
+       * navigator thread. Declining and cancelling only clear a pending
+       * request and stay available — a Navigator conversation stuck on an
+       * unanswerable question would be worse than the risk this closes.
+       *
+       * Guarded at the single funnel every approval control routes through, so
+       * a render site that has not been updated still cannot get one out.
+       */
+      const isAcceptance = decision === "accept" || decision === "acceptForSession";
+      if (isAcceptance && !capabilities.canAcceptApprovals) return;
+      if (!isAcceptance && !capabilities.canDeclineApprovals) return;
 
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -5057,7 +5084,14 @@ function ChatViewContent(props: ChatViewProps) {
       setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, environmentId, respondToThreadApproval, setThreadError],
+    [
+      activeThreadId,
+      capabilities.canAcceptApprovals,
+      capabilities.canDeclineApprovals,
+      environmentId,
+      respondToThreadApproval,
+      setThreadError,
+    ],
   );
 
   const onRespondToUserInput = useCallback(
@@ -5367,6 +5401,10 @@ function ChatViewContent(props: ChatViewProps) {
   );
 
   const onImplementPlanInNewThread = useCallback(async () => {
+    // Implementing a proposal is the coding path. A Navigator conversation
+    // hands its Execution Proposal to Peer Loop instead — a later increment —
+    // and must never create an implementing thread itself.
+    if (!capabilities.canImplementPlan) return;
     if (
       !activeThread ||
       !activeProject ||
@@ -5768,6 +5806,7 @@ function ChatViewContent(props: ChatViewProps) {
         threadRef={activeThreadRef}
         markdownCwd={gitCwd ?? undefined}
         workspaceRoot={activeWorkspaceRoot}
+        canSaveToWorkspace={capabilities.canStartRepositoryMutation}
         timestampFormat={timestampFormat}
         mode="embedded"
       />
@@ -5824,6 +5863,8 @@ function ChatViewContent(props: ChatViewProps) {
         >
           {!rightPanelOpen ? panelLayoutControls : null}
           <ChatHeader
+            capabilities={capabilities}
+            conversationIdentity={threadIdentity}
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
             {...(routeKind === "draft" && draftId ? { draftId } : {})}
@@ -5868,6 +5909,7 @@ function ChatViewContent(props: ChatViewProps) {
               <MessagesTimeline
                 key={activeThread.id}
                 proposalWording={proposalLabels}
+                canSavePlanToWorkspace={capabilities.canStartRepositoryMutation}
                 isWorking={isWorking}
                 activeTurnInProgress={isWorking || !latestTurnSettled}
                 activeTurnStartedAt={activeWorkStartedAt}
@@ -5953,6 +5995,7 @@ function ChatViewContent(props: ChatViewProps) {
                         <DraftHeroHeadline
                           activeProjectRef={activeProjectRef}
                           activeProjectTitle={activeProject?.title ?? null}
+                          conversationIdentity={threadIdentity}
                         />
                       </div>
                       <ComposerBannerStack className="relative z-0" items={composerBannerItems} />

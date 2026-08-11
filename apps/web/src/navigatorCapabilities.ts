@@ -29,6 +29,8 @@ export interface ThreadCapabilities {
   readonly canImplementPlan: boolean;
   /** Open or create a terminal from the chat surface. */
   readonly canUseTerminals: boolean;
+  /** Run, add, edit or delete a project script from the chat header. */
+  readonly canRunProjectScripts: boolean;
   /** Rewind the thread's worktree to an earlier checkpoint. */
   readonly canRevertCheckpoint: boolean;
   /** Diff/review actions that start a repository mutation. */
@@ -47,12 +49,13 @@ export interface ThreadCapabilities {
   readonly canConverse: boolean;
 }
 
-const CODING_CAPABILITIES: ThreadCapabilities = {
+export const CODING_CAPABILITIES: ThreadCapabilities = {
   canChangeRuntimeMode: true,
   canChangeInteractionMode: true,
   canChooseCheckout: true,
   canImplementPlan: true,
   canUseTerminals: true,
+  canRunProjectScripts: true,
   canRevertCheckpoint: true,
   canStartRepositoryMutation: true,
   canAcceptApprovals: true,
@@ -74,6 +77,7 @@ const NAVIGATOR_CAPABILITIES: ThreadCapabilities = {
   canChooseCheckout: false,
   canImplementPlan: false,
   canUseTerminals: false,
+  canRunProjectScripts: false,
   canRevertCheckpoint: false,
   canStartRepositoryMutation: false,
   canAcceptApprovals: false,
@@ -85,6 +89,33 @@ export function threadCapabilities(purpose: ThreadPurpose | undefined): ThreadCa
   // Unknown means coding: an older shell without `purpose` is an ordinary
   // thread, and stripping its controls would be a regression, not caution.
   return purpose === "navigator" ? NAVIGATOR_CAPABILITIES : CODING_CAPABILITIES;
+}
+
+/* ------------------------------------------------------------ identity */
+
+/**
+ * A compact badge naming a non-coding conversation.
+ *
+ * Null for a coding thread: its header is unchanged, and labelling every
+ * ordinary thread "Coding" would be noise. Navigator needs one because its
+ * generated title stops saying "Navigator" the moment the model names the
+ * conversation after its subject, and "what am I talking to" has to stay
+ * answerable at a glance.
+ */
+export interface ConversationIdentity {
+  readonly label: string;
+  readonly ariaLabel: string;
+}
+
+export const NAVIGATOR_IDENTITY: ConversationIdentity = {
+  label: "Navigator",
+  ariaLabel: "Navigator planning conversation",
+};
+
+export function conversationIdentity(
+  purpose: ThreadPurpose | undefined,
+): ConversationIdentity | null {
+  return purpose === "navigator" ? NAVIGATOR_IDENTITY : null;
 }
 
 /* ------------------------------------------------------------- wording */

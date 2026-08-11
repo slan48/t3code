@@ -23,15 +23,26 @@ import {
   MenuSeparator,
   MenuTrigger,
 } from "../ui/menu";
+import { Badge } from "../ui/badge";
+import type { ConversationIdentity } from "~/navigatorCapabilities";
 
 interface DraftHeroHeadlineProps {
   readonly activeProjectRef: ScopedProjectRef | null;
   readonly activeProjectTitle: string | null;
+  /**
+   * The conversation's identity, when it is not an ordinary coding thread.
+   *
+   * An empty Navigator draft looks exactly like an empty coding draft
+   * otherwise, and "what should we build" is the wrong invitation for a
+   * conversation that does not build anything.
+   */
+  readonly conversationIdentity?: ConversationIdentity | null;
 }
 
 export function DraftHeroHeadline({
   activeProjectRef,
   activeProjectTitle,
+  conversationIdentity = null,
 }: DraftHeroHeadlineProps) {
   const projects = useProjects();
   const threads = useCodingThreadShells();
@@ -143,6 +154,25 @@ export function DraftHeroHeadline({
       {activeProjectTitle ?? "Add a project"}
     </button>
   );
+
+  if (conversationIdentity) {
+    return (
+      <div className="mx-auto flex w-full max-w-5xl flex-col items-center gap-2">
+        <Badge variant="secondary" aria-label={conversationIdentity.ariaLabel}>
+          {conversationIdentity.label}
+        </Badge>
+        <h1 className="text-center font-normal text-2xl text-foreground tracking-tight sm:text-3xl">
+          {hasResolvedProject ? (
+            <>What should we plan in {projectSelector}?</>
+          ) : canChooseProject ? (
+            <>{projectSelector} to start</>
+          ) : (
+            <>Add a project to start</>
+          )}
+        </h1>
+      </div>
+    );
+  }
 
   return (
     <h1 className="mx-auto w-full max-w-5xl text-center font-normal text-2xl text-foreground tracking-tight sm:text-3xl">

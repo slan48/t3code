@@ -126,6 +126,8 @@ import {
 interface TimelineRowSharedState {
   /** What this thread calls its proposed plan. See `navigatorCapabilities`. */
   proposalWording: ProposalWording;
+  /** Writing the plan into the repository. Off for planning conversations. */
+  canSavePlanToWorkspace: boolean;
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
@@ -188,6 +190,7 @@ interface MessagesTimelineProps {
    * so the timeline card and the Plan sidebar agree.
    */
   proposalWording?: ProposalWording;
+  canSavePlanToWorkspace?: boolean;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
@@ -225,6 +228,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   timestampFormat,
   workspaceRoot,
   proposalWording = CODING_PROPOSAL_WORDING,
+  canSavePlanToWorkspace = true,
   skills = EMPTY_TIMELINE_SKILLS,
   anchorMessageId,
   onAnchorReady,
@@ -435,6 +439,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       proposalWording,
+      canSavePlanToWorkspace,
       timestampFormat,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
@@ -1110,6 +1115,7 @@ function ProposedPlanTimelineRow({
         cwd={ctx.markdownCwd}
         workspaceRoot={ctx.workspaceRoot}
         wording={ctx.proposalWording}
+        canSaveToWorkspace={ctx.canSavePlanToWorkspace}
       />
     </div>
   );

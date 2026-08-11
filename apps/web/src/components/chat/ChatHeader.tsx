@@ -18,6 +18,12 @@ import { OpenInPicker } from "./OpenInPicker";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useT3ProjectFileScripts } from "~/hooks/useT3ProjectFileScripts";
 import { ProjectFavicon } from "../ProjectFavicon";
+import {
+  CODING_CAPABILITIES,
+  type ConversationIdentity,
+  type ThreadCapabilities,
+} from "~/navigatorCapabilities";
+import { Badge } from "../ui/badge";
 import { cn } from "~/lib/utils";
 
 interface ChatHeaderProps {
@@ -42,6 +48,22 @@ interface ChatHeaderProps {
     input: NewProjectScriptInput,
   ) => Promise<ProjectScriptActionResult>;
   onDeleteProjectScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+  /**
+   * What kind of conversation this is.
+   *
+   * Derived once in `ChatView` and passed down, rather than each child asking
+   * the thread again — the point of a single capability record is that a new
+   * control cannot quietly skip the question.
+   */
+  capabilities?: ThreadCapabilities;
+  /**
+   * A compact identity for a non-coding conversation, or null for a coding one.
+   *
+   * The generated title stops saying "Navigator" as soon as the model names the
+   * conversation after its subject, so the badge is what keeps the answer to
+   * "what am I talking to" on screen.
+   */
+  conversationIdentity?: ConversationIdentity | null;
 }
 
 export function shouldShowOpenInPicker(input: {
@@ -57,6 +79,8 @@ export function shouldShowOpenInPicker(input: {
 }
 
 export const ChatHeader = memo(function ChatHeader({
+  capabilities = CODING_CAPABILITIES,
+  conversationIdentity = null,
   activeThreadEnvironmentId,
   activeThreadId,
   draftId,
@@ -132,6 +156,15 @@ export const ChatHeader = memo(function ChatHeader({
           />
           <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
         </Tooltip>
+        {conversationIdentity ? (
+          <Badge
+            variant="secondary"
+            className="shrink-0"
+            aria-label={conversationIdentity.ariaLabel}
+          >
+            {conversationIdentity.label}
+          </Badge>
+        ) : null}
       </div>
       <div
         data-chat-header-actions
@@ -140,7 +173,7 @@ export const ChatHeader = memo(function ChatHeader({
           rightPanelOpen ? "pr-0" : "pr-16",
         )}
       >
-        {activeProjectScripts && (
+        {activeProjectScripts && capabilities.canRunProjectScripts && (
           <ProjectScriptsControl
             scripts={activeProjectScripts}
             fileScripts={fileScripts}
