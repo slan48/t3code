@@ -62,6 +62,10 @@ import {
 import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { CODING_PROPOSAL_WORDING, type ProposalWording } from "~/navigatorCapabilities";
+import {
+  NavigatorProposalExecution,
+  type NavigatorExecutionContext,
+} from "../navigator/NavigatorProposalExecution";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
 import { shouldAutoExpandChangedFiles } from "./changedFilesPresentation";
@@ -128,6 +132,13 @@ interface TimelineRowSharedState {
   proposalWording: ProposalWording;
   /** Writing the plan into the repository. Off for planning conversations. */
   canSavePlanToWorkspace: boolean;
+  /**
+   * Execution of this conversation's proposals, when it is a Navigator one.
+   *
+   * Null for every coding thread, which is what keeps the ordinary plan card
+   * exactly as it is today.
+   */
+  navigatorExecution: NavigatorExecutionContext | null;
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
@@ -191,6 +202,7 @@ interface MessagesTimelineProps {
    */
   proposalWording?: ProposalWording;
   canSavePlanToWorkspace?: boolean;
+  navigatorExecution?: NavigatorExecutionContext | null;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
@@ -229,6 +241,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   workspaceRoot,
   proposalWording = CODING_PROPOSAL_WORDING,
   canSavePlanToWorkspace = true,
+  navigatorExecution = null,
   skills = EMPTY_TIMELINE_SKILLS,
   anchorMessageId,
   onAnchorReady,
@@ -440,6 +453,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     () => ({
       proposalWording,
       canSavePlanToWorkspace,
+      navigatorExecution,
       timestampFormat,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
@@ -455,6 +469,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
     }),
     [
+      proposalWording,
+      canSavePlanToWorkspace,
+      navigatorExecution,
       timestampFormat,
       routeThreadKey,
       markdownCwd,
@@ -1116,6 +1133,14 @@ function ProposedPlanTimelineRow({
         workspaceRoot={ctx.workspaceRoot}
         wording={ctx.proposalWording}
         canSaveToWorkspace={ctx.canSavePlanToWorkspace}
+        executionArea={
+          ctx.navigatorExecution === null ? null : (
+            <NavigatorProposalExecution
+              context={ctx.navigatorExecution}
+              proposal={row.proposedPlan}
+            />
+          )
+        }
       />
     </div>
   );

@@ -67,6 +67,12 @@ interface PlanSidebarProps {
    * and touch nothing in the project.
    */
   canSaveToWorkspace?: boolean;
+  /**
+   * Execution of the shown proposal, when the conversation has any. Same slot,
+   * same component and same per-proposal gate as the timeline card, so the two
+   * Execute buttons are one control.
+   */
+  executionArea?: React.ReactNode;
   environmentId: EnvironmentId;
   threadRef?: ScopedThreadRef | undefined;
   markdownCwd: string | undefined;
@@ -80,6 +86,7 @@ const PlanSidebar = memo(function PlanSidebar({
   activeProposedPlan,
   label = "Plan",
   canSaveToWorkspace = true,
+  executionArea = null,
   environmentId,
   threadRef,
   markdownCwd,
@@ -275,6 +282,8 @@ const PlanSidebar = memo(function PlanSidebar({
               ) : null}
             </div>
           ) : null}
+
+          {executionArea}
 
           {/* Empty state */}
           {!activePlan && !planMarkdown ? (

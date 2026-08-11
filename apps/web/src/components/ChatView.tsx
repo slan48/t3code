@@ -17,6 +17,7 @@ import {
   type KeybindingCommand,
   NAVIGATOR_INTERACTION_MODE,
   NAVIGATOR_RUNTIME_MODE,
+  type OrchestrationPeerLoopExecution,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -165,6 +166,12 @@ import {
   threadCapabilities,
   visibleRightPanelSurfaces,
 } from "~/navigatorCapabilities";
+import { groupExecutionsByProposal } from "~/navigatorExecution";
+import { useNavigatorExecutionLinks } from "~/state/navigatorExecutionCommand";
+import {
+  NavigatorProposalExecution,
+  type NavigatorExecutionContext,
+} from "./navigator/NavigatorProposalExecution";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -326,6 +333,8 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
+/** Stable identity for the common case: a thread with no Peer Loop executions. */
+const NO_PEER_LOOP_EXECUTIONS: ReadonlyArray<OrchestrationPeerLoopExecution> = [];
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
   const composerAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -2198,6 +2207,63 @@ function ChatViewContent(props: ChatViewProps) {
     interactionMode === "plan" &&
     latestTurnSettled &&
     hasActionableProposedPlan(activeProposedPlan);
+  /*
+   * Handing an Execution Proposal to Peer Loop.
+   *
+   * Derived once here so the timeline card and the Plan sidebar cannot disagree
+   * about which proposals are executable or which runs belong to them. What is
+   * NOT here is anything Peer Loop reports: this object travels through the
+   * timeline's row context, and a five-second poll in it would re-render every
+   * row in the conversation. Run summaries are read inside the card, and only
+   * once a link exists to read them for.
+   */
+  const navigatorProposedPlanIds = useMemo(
+    () => (activeThread?.proposedPlans ?? []).map((plan) => plan.id),
+    [activeThread?.proposedPlans],
+  );
+  const durableThreadIdForExecution = isServerThread ? (activeThread?.id ?? null) : null;
+  const executionLinks = useNavigatorExecutionLinks({
+    threadId: durableThreadIdForExecution,
+    durable: activeThread?.peerLoopExecutions ?? NO_PEER_LOOP_EXECUTIONS,
+    proposedPlanIds: navigatorProposedPlanIds,
+  });
+  const executionsByProposal = useMemo(
+    () => groupExecutionsByProposal(executionLinks),
+    [executionLinks],
+  );
+  const navigatorExecution = useMemo<NavigatorExecutionContext | null>(
+    () =>
+      isNavigatorThread
+        ? {
+            environmentId,
+            threadId: durableThreadIdForExecution,
+            purpose: activeThreadPurpose,
+            latestTurnSettled,
+            executionsByProposal,
+          }
+        : null,
+    [
+      activeThreadPurpose,
+      durableThreadIdForExecution,
+      environmentId,
+      executionsByProposal,
+      isNavigatorThread,
+      latestTurnSettled,
+    ],
+  );
+  /*
+   * The sidebar shows whichever proposal the turn is about, and that can be a
+   * plan carried over from another thread. Only this conversation's own
+   * proposals may be executed from here — a link recorded against a plan that
+   * lives elsewhere would attach a run to the wrong conversation.
+   */
+  const sidebarExecutionProposal = useMemo(() => {
+    if (sidebarProposedPlan === null || navigatorExecution === null) return null;
+    const owned = (activeThread?.proposedPlans ?? []).some(
+      (plan) => plan.id === sidebarProposedPlan.id,
+    );
+    return owned ? sidebarProposedPlan : null;
+  }, [activeThread?.proposedPlans, navigatorExecution, sidebarProposedPlan]);
   const activePendingApproval = pendingApprovals[0] ?? null;
   const {
     beginLocalDispatch,
@@ -5891,6 +5957,14 @@ function ChatViewContent(props: ChatViewProps) {
         markdownCwd={gitCwd ?? undefined}
         workspaceRoot={activeWorkspaceRoot}
         canSaveToWorkspace={capabilities.canStartRepositoryMutation}
+        executionArea={
+          navigatorExecution === null || sidebarExecutionProposal === null ? null : (
+            <NavigatorProposalExecution
+              context={navigatorExecution}
+              proposal={sidebarExecutionProposal}
+            />
+          )
+        }
         timestampFormat={timestampFormat}
         mode="embedded"
       />
@@ -5994,6 +6068,7 @@ function ChatViewContent(props: ChatViewProps) {
                 key={activeThread.id}
                 proposalWording={proposalLabels}
                 canSavePlanToWorkspace={capabilities.canStartRepositoryMutation}
+                navigatorExecution={navigatorExecution}
                 isWorking={isWorking}
                 activeTurnInProgress={isWorking || !latestTurnSettled}
                 activeTurnStartedAt={activeWorkStartedAt}

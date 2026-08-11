@@ -42,6 +42,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   workspaceRoot,
   wording = CODING_PROPOSAL_WORDING,
   canSaveToWorkspace = true,
+  executionArea = null,
 }: {
   planMarkdown: string;
   environmentId: EnvironmentId;
@@ -58,6 +59,14 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
    * repository; copy and download do not and always stay.
    */
   canSaveToWorkspace?: boolean;
+  /**
+   * Execution of this proposal, when the conversation has any.
+   *
+   * A slot rather than props: the Execute action and its child run cards are a
+   * Navigator concern, and a coding thread's plan card must not grow a Peer
+   * Loop dependency to render nothing.
+   */
+  executionArea?: React.ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
@@ -218,6 +227,8 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
           </div>
         ) : null}
       </div>
+
+      {executionArea}
 
       <Dialog
         open={isSaveDialogOpen}

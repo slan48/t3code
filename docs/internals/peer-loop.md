@@ -659,8 +659,9 @@ underneath — it makes agents act and spends subscription capacity. Peer Loop
 observation methods stay read-scoped and the existing explicit controls are
 unchanged.
 
-There is **no UI** for this yet, and no natural-language confirmation: the
-operation is invoked explicitly and nothing infers agreement from prose.
+The web surface for this is described under **Executing a proposal** below. It
+is an explicit button and nothing else: no natural-language confirmation, and
+nothing infers agreement from prose.
 
 ### The Navigator conversation surface
 
@@ -793,14 +794,85 @@ and `plan`, owns no worktree, and the orchestration invariants refuse every
 command that would change that. The frame shapes behaviour so the conversation
 is useful; the server is what makes it safe.
 
-**Still forthcoming, and deliberately not present yet:** the Execute action and
-natural-language confirmation, child execution cards, structured run-result
-context and the DONE return flow, the `OWNER_REQUIRED` explanation UI, and the
-mobile Navigator UI.
+### Executing a proposal
 
-Nothing else launches a run. The conversation surface described above is
-planning-only: it has no Execute action, and the link and its history are
-described above.
+**The action is explicit, and the press is the confirmation.** An Execution
+Proposal on a durable Navigator thread carries an `Execute with Peer Loop`
+button with adjacent wording saying that it starts Peer Loop's Reviewer →
+Builder workflow in this project using the proposal shown above. Nothing reads
+agreement out of the conversation.
+
+It is offered only for a proposal that is settled, unlinked, and not already
+implemented by a coding thread. `apps/web/src/navigatorExecution.ts` answers
+that as one enumerated decision — `not-a-navigator-thread`,
+`draft-conversation`, `no-proposal`, `proposal-not-settled`, `already-executed`,
+`already-implemented`, `executing` — so a coding thread's plan card renders
+exactly the markup it renders today and a draft conversation renders nothing
+about execution at all.
+
+**Two visible controls, one gate.** The action appears in both the timeline
+proposal card and the Plan sidebar, from the same component. The gate lives in
+a module-level store keyed by conversation and proposal
+(`apps/web/src/state/navigatorExecutionCommand.ts`), so the two controls are the
+same control: a synchronous second press — from either place — is refused before
+an RPC exists. A hook-local flag would have given one proposal two gates.
+
+**The request is two ids.** `buildExecuteProposalRequest` produces the
+environment wrapper and `{ threadId, proposedPlanId }`. No objective, no project
+path, no run id, no `newRun`, no owner policy and no permission mode — the
+server derives the project and the objective from its own record. Peer Loop's
+optional `safetyLimit` is not sent either: this surface does not offer the owner
+a way to choose one, and inventing a bound would be T3 Code making a Peer Loop
+decision.
+
+**Nothing is ever retried**, including timeouts, connection failures and
+defects. Both error families survive with their structure: a Peer Loop refusal
+keeps its code and the run a duplicate-run refusal names, a timeout keeps
+`mayHaveApplied`, and a `PeerLoopExecutionCoordinationError` gets bounded
+per-reason owner wording plus its structured `runId` and `mayHaveStarted`.
+`link-not-confirmed` says a run exists that T3 Code could not record, says not
+to press Execute again, links straight to `/peer-loop/$runId` — and **removes
+the Execute button**, because offering it beside that warning would invite a
+second run.
+
+**Immediate result, then the durable link.** The reply carries the association
+T3 Code persisted, and it is retained locally until the identical link — same
+proposal id, same run id — appears in the synchronized thread. That closes the
+window where the card would otherwise be blank or offer Execute a second time.
+The durable link wins the moment it is visible and the retained copy is dropped,
+so nothing is stored twice and no run state is duplicated in orchestration or in
+local storage.
+
+**Child execution cards.** Every durable `thread.peerLoopExecutions` association
+renders as a child of its own proposal, in association order. Everything mutable
+on the card comes from Peer Loop's structured run-list result through the
+existing `describeRunAttention` and the existing pills: OWNER_REQUIRED,
+driverless-interrupted, paused, failed and done all read in Peer Loop's terms
+and none of it is parsed out of prompts, Builder reports, activity text or run
+directories. A link with no summary reads `Status unavailable`; a run Peer Loop
+names as unreadable says so. Neither invents a lifecycle state. The card has no
+pause, resume, recovery, owner-approval or owner-message control — those need
+the run's live control snapshot and stay in the advanced inspector, which the
+card links to.
+
+**Observation is conditional.** `selectNavigatorRunListAtom` returns a
+query-nothing atom unless the conversation has at least one link, durable or
+just returned. Opening `/navigator`, its sidebar entry, a Navigator draft or a
+Navigator conversation that has never executed anything therefore issues no Peer
+Loop RPC and cannot spawn the bridge. When a link does exist, the read is the
+existing five-second run-summary poll, keyed to the **thread's own environment**
+— run ids are per-machine, and another environment's list would match a link
+against a stranger's run. No run is attached or subscribed to from here, and a
+new link triggers one re-read rather than waiting out the poll.
+
+**Still forthcoming, and deliberately not present yet:** natural-language
+confirmation of an agreed proposal, richer structured run context and the DONE
+return summary inside the conversation, Navigator's own explanation of
+`OWNER_REQUIRED`, and the mobile Navigator UI.
+
+Nothing else launches a run. The explicit Execute action described above is the
+only way a Navigator conversation starts one, and the link it records is the
+only thing T3 Code keeps about it.
 
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live
