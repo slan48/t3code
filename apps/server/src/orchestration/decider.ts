@@ -17,6 +17,7 @@ import {
   requireNavigatorCheckoutUnchanged,
   requireNavigatorModeUnchanged,
   requireNotNavigatorThread,
+  requirePeerLoopExecutionLinkable,
   requireProject,
   requireProjectAbsent,
   requireThread,
@@ -1145,6 +1146,38 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           proposedPlan: command.proposedPlan,
+        },
+      };
+    }
+
+    case "thread.peer-loop-execution.link": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // Everything about the association is settled here: it is immutable and
+      // there is no command that could correct it afterwards.
+      yield* requirePeerLoopExecutionLinkable({
+        readModel,
+        commandType: command.type,
+        thread,
+        proposedPlanId: command.proposedPlanId,
+        runId: command.runId,
+      });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.peer-loop-execution-linked",
+        payload: {
+          threadId: command.threadId,
+          proposedPlanId: command.proposedPlanId,
+          runId: command.runId,
+          createdAt: command.createdAt,
         },
       };
     }

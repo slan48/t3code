@@ -20,6 +20,7 @@ import {
   ThreadDeletedPayload,
   ThreadInteractionModeSetPayload,
   ThreadMetaUpdatedPayload,
+  ThreadPeerLoopExecutionLinkedPayload,
   ThreadProposedPlanUpsertedPayload,
   ThreadRuntimeModeSetPayload,
   ThreadSettledPayload,
@@ -592,6 +593,46 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             proposedPlans,
+            updatedAt: event.occurredAt,
+          }),
+        };
+      });
+
+    case "thread.peer-loop-execution-linked":
+      return Effect.gen(function* () {
+        const payload = yield* decodeForEvent(
+          ThreadPeerLoopExecutionLinkedPayload,
+          event.payload,
+          event.type,
+          "payload",
+        );
+        const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+        if (!thread) {
+          return nextBase;
+        }
+
+        // The decider already refused duplicates, so filtering here is purely
+        // defensive: a replay must not be able to produce two child cards for
+        // one run, or two runs for one proposal.
+        const peerLoopExecutions = [
+          ...thread.peerLoopExecutions.filter(
+            (entry) =>
+              entry.runId !== payload.runId && entry.proposedPlanId !== payload.proposedPlanId,
+          ),
+          {
+            runId: payload.runId,
+            proposedPlanId: payload.proposedPlanId,
+            createdAt: payload.createdAt,
+          },
+        ].toSorted(
+          (left, right) =>
+            left.createdAt.localeCompare(right.createdAt) || left.runId.localeCompare(right.runId),
+        );
+
+        return {
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            peerLoopExecutions,
             updatedAt: event.occurredAt,
           }),
         };

@@ -41,6 +41,7 @@ const baseThread: OrchestrationThread = {
   deletedAt: null,
   messages: [],
   proposedPlans: [],
+  peerLoopExecutions: [],
   activities: [],
   checkpoints: [],
   session: null,
@@ -139,6 +140,90 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.runtimeMode).toBe("approval-required");
         expect(result.thread.interactionMode).toBe("plan");
       }
+    });
+  });
+
+  describe("thread.peer-loop-execution-linked", () => {
+    const link = (input: {
+      readonly runId: string;
+      readonly proposedPlanId: string;
+      readonly createdAt: string;
+    }) =>
+      ({
+        ...baseEventFields,
+        sequence: 1,
+        occurredAt: input.createdAt,
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.peer-loop-execution-linked",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          proposedPlanId: input.proposedPlanId,
+          runId: input.runId,
+          createdAt: input.createdAt,
+        },
+      }) as const;
+
+    const apply = (
+      thread: OrchestrationThread,
+      events: ReadonlyArray<ReturnType<typeof link>>,
+    ): OrchestrationThread =>
+      events.reduce((current, event) => {
+        const result = applyThreadDetailEvent(current, event);
+        return result.kind === "updated" ? result.thread : current;
+      }, thread);
+
+    it("records the association and nothing about the run", () => {
+      const next = apply(baseThread, [
+        link({ runId: "run-1", proposedPlanId: "plan-1", createdAt: "2026-04-01T01:00:00.000Z" }),
+      ]);
+      expect(next.peerLoopExecutions).toEqual([
+        { runId: "run-1", proposedPlanId: "plan-1", createdAt: "2026-04-01T01:00:00.000Z" },
+      ]);
+    });
+
+    it("orders by createdAt, then by run id", () => {
+      const next = apply(baseThread, [
+        link({ runId: "run-b", proposedPlanId: "plan-2", createdAt: "2026-04-01T02:00:00.000Z" }),
+        link({ runId: "run-a", proposedPlanId: "plan-1", createdAt: "2026-04-01T01:00:00.000Z" }),
+        link({ runId: "run-a2", proposedPlanId: "plan-3", createdAt: "2026-04-01T02:00:00.000Z" }),
+      ]);
+      expect(next.peerLoopExecutions.map((entry) => entry.runId)).toEqual([
+        "run-a",
+        "run-a2",
+        "run-b",
+      ]);
+    });
+
+    it("de-duplicates a replayed link so no child card appears twice", () => {
+      const replayed = link({
+        runId: "run-1",
+        proposedPlanId: "plan-1",
+        createdAt: "2026-04-01T01:00:00.000Z",
+      });
+      const next = apply(baseThread, [replayed, replayed, replayed]);
+      expect(next.peerLoopExecutions).toHaveLength(1);
+    });
+
+    it("leaves proposed plans and their implementation metadata untouched", () => {
+      const withPlan: OrchestrationThread = {
+        ...baseThread,
+        proposedPlans: [
+          {
+            id: "plan-1",
+            turnId: null,
+            planMarkdown: "# Ship it",
+            implementedAt: "2026-04-01T00:30:00.000Z",
+            implementationThreadId: ThreadId.make("thread-implementation"),
+            createdAt: "2026-04-01T00:00:00.000Z",
+            updatedAt: "2026-04-01T00:30:00.000Z",
+          },
+        ],
+      };
+      const next = apply(withPlan, [
+        link({ runId: "run-1", proposedPlanId: "plan-1", createdAt: "2026-04-01T01:00:00.000Z" }),
+      ]);
+      expect(next.proposedPlans).toEqual(withPlan.proposedPlans);
     });
   });
 

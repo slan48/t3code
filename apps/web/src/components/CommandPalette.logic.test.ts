@@ -124,6 +124,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     session: null,
     messages: [],
     proposedPlans: [],
+    peerLoopExecutions: [],
     createdAt: "2026-03-01T00:00:00.000Z",
     archivedAt: null,
     settledOverride: null,

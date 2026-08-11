@@ -53,6 +53,7 @@ function makeReadModel(input: {
         deletedAt: null,
         messages: input.messages ?? [],
         proposedPlans: [],
+        peerLoopExecutions: [],
         activities: input.activities ?? [],
         checkpoints: [],
         session: null,

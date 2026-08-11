@@ -47,6 +47,7 @@ function makeThread(
     deletedAt: null,
     messages: [],
     proposedPlans: [],
+    peerLoopExecutions: [],
     activities: [],
     checkpoints: [],
     session: null,

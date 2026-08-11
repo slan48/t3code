@@ -297,6 +297,29 @@ const SourceProposedPlanReference = Schema.Struct({
   planId: OrchestrationProposedPlanId,
 });
 
+/**
+ * One Peer Loop run launched from one Navigator Execution Proposal.
+ *
+ * An association, and deliberately nothing else. It records that a proposal on
+ * a Navigator thread produced a run and when the link was made, so a client can
+ * ask Peer Loop about that run and show it under the conversation it came from.
+ *
+ * There is no state, outcome, halt reason, summary, iteration, live writer or
+ * control on this type, and there never should be. Peer Loop owns every one of
+ * those and reports them live over its own protocol; a copy here would be a
+ * second answer to the same question, stale the moment it was written.
+ *
+ * `runId` is Peer Loop's own id, carried as an opaque string. T3 Code does not
+ * mint it, parse it or infer anything from it.
+ */
+export const OrchestrationPeerLoopExecution = Schema.Struct({
+  runId: TrimmedNonEmptyString,
+  proposedPlanId: OrchestrationProposedPlanId,
+  /** When the link was recorded — not when the run started. Peer Loop owns that. */
+  createdAt: IsoDateTime,
+});
+export type OrchestrationPeerLoopExecution = typeof OrchestrationPeerLoopExecution.Type;
+
 export const OrchestrationSessionStatus = Schema.Literals([
   "idle",
   "starting",
@@ -418,6 +441,11 @@ export const OrchestrationThread = Schema.Struct({
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+  // Association only: which Peer Loop runs came from this thread's proposals.
+  // Defaulted so every thread snapshot written before this existed decodes.
+  peerLoopExecutions: Schema.Array(OrchestrationPeerLoopExecution).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
   activities: Schema.Array(OrchestrationThreadActivity),
@@ -927,6 +955,26 @@ const ThreadTitleRegenerationCompleteCommand = Schema.Struct({
   title: Schema.optional(TrimmedNonEmptyString),
 });
 
+/**
+ * Records that a Navigator proposal was executed as a Peer Loop run.
+ *
+ * Internal on purpose: it is not in `ClientOrchestrationCommand`, so no client
+ * can assert a link. The later server-side coordination service is the only
+ * thing that will send it, once it has actually started a run and knows the id
+ * Peer Loop gave it. Recording a link a client merely claimed would put a run
+ * id in the read model that may name nothing at all.
+ *
+ * There is no matching update or delete command. A link is a historical fact.
+ */
+const ThreadPeerLoopExecutionLinkCommand = Schema.Struct({
+  type: Schema.Literal("thread.peer-loop-execution.link"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  proposedPlanId: OrchestrationProposedPlanId,
+  runId: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+});
+
 const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
@@ -936,6 +984,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
   ThreadTitleRegenerationCompleteCommand,
+  ThreadPeerLoopExecutionLinkCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -972,6 +1021,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
+  "thread.peer-loop-execution-linked",
 ]);
 export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
@@ -1183,6 +1233,13 @@ export const ThreadActivityAppendedPayload = Schema.Struct({
   activity: OrchestrationThreadActivity,
 });
 
+export const ThreadPeerLoopExecutionLinkedPayload = Schema.Struct({
+  threadId: ThreadId,
+  proposedPlanId: OrchestrationProposedPlanId,
+  runId: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+});
+
 export const OrchestrationEventMetadata = Schema.Struct({
   providerTurnId: Schema.optional(TrimmedNonEmptyString),
   providerItemId: Schema.optional(ProviderItemId),
@@ -1334,6 +1391,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.activity-appended"),
     payload: ThreadActivityAppendedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.peer-loop-execution-linked"),
+    payload: ThreadPeerLoopExecutionLinkedPayload,
   }),
 ]);
 export type OrchestrationEvent = typeof OrchestrationEvent.Type;

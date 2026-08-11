@@ -359,6 +359,83 @@ export function requireNotNavigatorThread(input: {
   );
 }
 
+/**
+ * The one moment a proposal/run association can be established.
+ *
+ * The link is immutable and there is no command that edits or removes one, so
+ * every rule about it has to hold here. Four things are checked, and each one
+ * failing means something different:
+ *
+ *   - the thread is a Navigator thread. A coding thread has no Execution
+ *     Proposals to run and must not collect run ids;
+ *   - the proposal exists on *that* thread. A plan id from another conversation
+ *     would attach a run to work it did not come from;
+ *   - the proposal has not already been executed. One proposal, one run — a
+ *     second link would make "which run did this plan produce" ambiguous;
+ *   - the run id is unlinked anywhere in the read model. Peer Loop run ids are
+ *     unique, so the same id arriving twice is a bug or a replay, not two runs.
+ *
+ * Refusals name the conflicting thread and plan because an operator has to be
+ * able to find them; nothing else about either is disclosed.
+ */
+export function requirePeerLoopExecutionLinkable(input: {
+  readonly readModel: OrchestrationReadModel;
+  readonly commandType: OrchestrationCommand["type"];
+  readonly thread: OrchestrationThread;
+  readonly proposedPlanId: string;
+  readonly runId: string;
+}): Effect.Effect<void, OrchestrationCommandInvariantError> {
+  if (input.thread.purpose !== "navigator") {
+    return Effect.fail(
+      invariantError(
+        input.commandType,
+        `Thread '${input.thread.id}' is a coding thread. Only a navigator thread's execution proposals launch Peer Loop runs.`,
+      ),
+    );
+  }
+
+  const plan = input.thread.proposedPlans.find((entry) => entry.id === input.proposedPlanId);
+  if (plan === undefined) {
+    return Effect.fail(
+      invariantError(
+        input.commandType,
+        `Proposed plan '${input.proposedPlanId}' does not exist on thread '${input.thread.id}'.`,
+      ),
+    );
+  }
+
+  const existingForPlan = input.thread.peerLoopExecutions.find(
+    (execution) => execution.proposedPlanId === input.proposedPlanId,
+  );
+  if (existingForPlan !== undefined) {
+    // Idempotent re-link is still refused: the caller is the coordination
+    // service, which knows whether it already recorded this, and silently
+    // accepting would hide a double-launch.
+    return Effect.fail(
+      invariantError(
+        input.commandType,
+        `Proposed plan '${input.proposedPlanId}' on thread '${input.thread.id}' is already linked to Peer Loop run '${existingForPlan.runId}'.`,
+      ),
+    );
+  }
+
+  for (const thread of input.readModel.threads) {
+    const existingForRun = thread.peerLoopExecutions.find(
+      (execution) => execution.runId === input.runId,
+    );
+    if (existingForRun !== undefined) {
+      return Effect.fail(
+        invariantError(
+          input.commandType,
+          `Peer Loop run '${input.runId}' is already linked to proposed plan '${existingForRun.proposedPlanId}' on thread '${thread.id}'.`,
+        ),
+      );
+    }
+  }
+
+  return Effect.void;
+}
+
 export function requireNonNegativeInteger(input: {
   readonly commandType: OrchestrationCommand["type"];
   readonly field: string;

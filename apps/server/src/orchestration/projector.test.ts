@@ -99,6 +99,9 @@ describe("orchestration projector", () => {
         deletedAt: null,
         messages: [],
         proposedPlans: [],
+        // The legacy event has no collection at all; the contract default is
+        // what makes it materialize as empty rather than undefined.
+        peerLoopExecutions: [],
         activities: [],
         checkpoints: [],
         session: null,

@@ -38,6 +38,7 @@ const readModel: OrchestrationReadModel = {
       deletedAt: null,
       messages: [],
       proposedPlans: [],
+      peerLoopExecutions: [],
       activities: [],
       checkpoints: [],
       session: null,

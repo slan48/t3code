@@ -548,6 +548,40 @@ so a client that sends the command anyway is refused with a typed
 
 `coding` threads are untouched by all of it.
 
+### Executions as children of a Navigator conversation
+
+A Navigator Execution Proposal can be run as a Peer Loop run. When it is, T3
+Code records exactly one thing: an **immutable association** — Navigator thread
+id, proposed plan id, Peer Loop run id, and the time the link was made. It lives
+on the thread read model as `peerLoopExecutions` and in its own projection
+table, `projection_thread_peer_loop_executions` (migration 037; `run_id`
+primary key, unique on `(thread_id, proposed_plan_id)`).
+
+That association is the whole of it. There is **no** run state, outcome, halt
+reason, summary, iteration, activity, live writer or control anywhere in T3
+Code's persistence, and there must never be. Peer Loop owns every one of those
+and answers for them live over the protocol described above; a copy here would
+be a second answer to the same question, wrong the moment the run moved. What
+the link buys is the ability to show a run as a child of the conversation it
+came from, and to still find it a week later — the durable half of a
+relationship whose mutable half is read live.
+
+The rules, enforced in the decider because the link is immutable and there is no
+command that edits or removes one: the thread must be a `navigator` thread, the
+proposal must exist on that thread, a proposal links to at most one run, and a
+run id links at most once across the whole read model. The linking command is
+internal — not part of `ClientOrchestrationCommand` — because only the
+server-side coordination service that actually started a run knows a run id
+worth recording.
+
+`implementedAt` / `implementationThreadId` on a proposed plan are a different
+fact ("a coding thread picked this plan up") and are left alone. Deleting a
+projected thread drops its association rows so the read model keeps no orphans;
+it does not delete a Peer Loop run or anything Peer Loop wrote.
+
+Nothing launches a run yet, and there is no Navigator UI. This increment is the
+association and its history.
+
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live
 writer. Peer Loop owns every one of those for its own runs, over its own

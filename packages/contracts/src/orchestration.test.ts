@@ -7,11 +7,13 @@ import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_THREAD_PURPOSE,
   ModelSelection,
+  ClientOrchestrationCommand,
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
+  OrchestrationPeerLoopExecution,
   ProjectCreatedPayload,
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
@@ -52,6 +54,10 @@ function getOptionValue(
 }
 const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPayload);
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
+const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodeOrchestrationPeerLoopExecution = Schema.decodeUnknownEffect(
+  OrchestrationPeerLoopExecution,
+);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 
@@ -1079,5 +1085,133 @@ it.effect("refuses a purpose it does not know", () =>
       }),
     );
     assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+/* ------------------------------------------------- peer loop executions */
+
+/*
+ * The proposal/run association. Every thread snapshot written before this
+ * existed has no collection at all, and all of them have to keep decoding.
+ */
+
+it.effect("defaults peerLoopExecutions to empty for a thread snapshot that predates it", () =>
+  Effect.gen(function* () {
+    const thread = yield* decodeOrchestrationThread({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Historical thread",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+      session: null,
+      deletedAt: null,
+      messages: [],
+      activities: [],
+      checkpoints: [],
+    });
+
+    assert.deepStrictEqual(thread.peerLoopExecutions, []);
+    // The default must not disturb what a legacy snapshot did carry.
+    assert.deepStrictEqual(thread.proposedPlans, []);
+  }),
+);
+
+it.effect("carries peer loop executions on a thread snapshot, oldest first", () =>
+  Effect.gen(function* () {
+    const thread = yield* decodeOrchestrationThread({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Navigator",
+      purpose: "navigator",
+      modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+      runtimeMode: "approval-required",
+      interactionMode: "plan",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      archivedAt: null,
+      session: null,
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      peerLoopExecutions: [
+        {
+          runId: "run-1",
+          proposedPlanId: "plan-1",
+          createdAt: "2026-01-01T00:01:00.000Z",
+        },
+      ],
+      activities: [],
+      checkpoints: [],
+    });
+
+    assert.deepStrictEqual(thread.peerLoopExecutions, [
+      { runId: "run-1", proposedPlanId: "plan-1", createdAt: "2026-01-01T00:01:00.000Z" },
+    ]);
+  }),
+);
+
+it.effect("keeps a peer loop execution to an association and nothing more", () =>
+  Effect.gen(function* () {
+    const execution = yield* decodeOrchestrationPeerLoopExecution({
+      runId: "run-1",
+      proposedPlanId: "plan-1",
+      createdAt: "2026-01-01T00:01:00.000Z",
+      // Peer Loop's own facts. They belong to Peer Loop, are read live from it,
+      // and must not survive into T3 Code's read model.
+      state: "builder_working",
+      outcome: { kind: "done" },
+      haltReason: null,
+    });
+
+    assert.deepStrictEqual(execution, {
+      runId: "run-1",
+      proposedPlanId: "plan-1",
+      createdAt: "2026-01-01T00:01:00.000Z",
+    });
+  }),
+);
+
+it.effect("refuses an execution with no run id", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeOrchestrationPeerLoopExecution({
+        runId: "   ",
+        proposedPlanId: "plan-1",
+        createdAt: "2026-01-01T00:01:00.000Z",
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+it.effect("keeps the link command off the client command surface", () =>
+  Effect.gen(function* () {
+    const link = {
+      type: "thread.peer-loop-execution.link",
+      commandId: "cmd-1",
+      threadId: "thread-1",
+      proposedPlanId: "plan-1",
+      runId: "run-1",
+      createdAt: "2026-01-01T00:01:00.000Z",
+    };
+
+    // The server accepts it internally...
+    const internal = yield* decodeOrchestrationCommand(link);
+    assert.strictEqual(internal.type, "thread.peer-loop-execution.link");
+
+    // ...and no client can send it. Only the coordination service, which has
+    // actually started a run, knows a run id worth recording.
+    const fromClient = yield* Effect.exit(decodeClientOrchestrationCommand(link));
+    assert.strictEqual(fromClient._tag, "Failure");
   }),
 );

@@ -24,6 +24,7 @@ import {
   type ProjectionThreadMessage,
   ProjectionThreadMessageRepository,
 } from "../../persistence/Services/ProjectionThreadMessages.ts";
+import { ProjectionThreadPeerLoopExecutionRepository } from "../../persistence/Services/ProjectionThreadPeerLoopExecutions.ts";
 import {
   type ProjectionThreadProposedPlan,
   ProjectionThreadProposedPlanRepository,
@@ -39,6 +40,7 @@ import { ProjectionProjectRepositoryLive } from "../../persistence/Layers/Projec
 import { ProjectionStateRepositoryLive } from "../../persistence/Layers/ProjectionState.ts";
 import { ProjectionThreadActivityRepositoryLive } from "../../persistence/Layers/ProjectionThreadActivities.ts";
 import { ProjectionThreadMessageRepositoryLive } from "../../persistence/Layers/ProjectionThreadMessages.ts";
+import { ProjectionThreadPeerLoopExecutionRepositoryLive } from "../../persistence/Layers/ProjectionThreadPeerLoopExecutions.ts";
 import { ProjectionThreadProposedPlanRepositoryLive } from "../../persistence/Layers/ProjectionThreadProposedPlans.ts";
 import { ProjectionThreadSessionRepositoryLive } from "../../persistence/Layers/ProjectionThreadSessions.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
@@ -60,6 +62,7 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   threads: "projection.threads",
   threadMessages: "projection.thread-messages",
   threadProposedPlans: "projection.thread-proposed-plans",
+  threadPeerLoopExecutions: "projection.thread-peer-loop-executions",
   threadActivities: "projection.thread-activities",
   threadSessions: "projection.thread-sessions",
   threadTurns: "projection.thread-turns",
@@ -476,6 +479,8 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
     const projectionThreadRepository = yield* ProjectionThreadRepository;
     const projectionThreadMessageRepository = yield* ProjectionThreadMessageRepository;
     const projectionThreadProposedPlanRepository = yield* ProjectionThreadProposedPlanRepository;
+    const projectionThreadPeerLoopExecutionRepository =
+      yield* ProjectionThreadPeerLoopExecutionRepository;
     const projectionThreadActivityRepository = yield* ProjectionThreadActivityRepository;
     const projectionThreadSessionRepository = yield* ProjectionThreadSessionRepository;
     const projectionTurnRepository = yield* ProjectionTurnRepository;
@@ -1010,6 +1015,39 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           }).pipe(Effect.asVoid);
           return;
         }
+
+        default:
+          return;
+      }
+    });
+
+    /**
+     * The proposal/run association table.
+     *
+     * Its own projector, because it is its own table and its own concern: the
+     * link outlives any particular turn and is never rewritten. Insert is
+     * conflict-tolerant so a rebuild replays cleanly, and a deleted thread's
+     * rows go with it so the read model keeps no orphans. Peer Loop's own runs
+     * are untouched — deleting a T3 Code row is not deleting a run.
+     */
+    const applyThreadPeerLoopExecutionsProjection: ProjectorDefinition["apply"] = Effect.fn(
+      "applyThreadPeerLoopExecutionsProjection",
+    )(function* (event, _attachmentSideEffects) {
+      switch (event.type) {
+        case "thread.peer-loop-execution-linked":
+          yield* projectionThreadPeerLoopExecutionRepository.insert({
+            runId: event.payload.runId,
+            threadId: event.payload.threadId,
+            proposedPlanId: event.payload.proposedPlanId,
+            createdAt: event.payload.createdAt,
+          });
+          return;
+
+        case "thread.deleted":
+          yield* projectionThreadPeerLoopExecutionRepository.deleteByThreadId({
+            threadId: event.payload.threadId,
+          });
+          return;
 
         default:
           return;
@@ -1561,6 +1599,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         apply: applyThreadProposedPlansProjection,
       },
       {
+        name: ORCHESTRATION_PROJECTOR_NAMES.threadPeerLoopExecutions,
+        apply: applyThreadPeerLoopExecutionsProjection,
+      },
+      {
         name: ORCHESTRATION_PROJECTOR_NAMES.threadActivities,
         apply: applyThreadActivitiesProjection,
       },
@@ -1682,6 +1724,7 @@ export const OrchestrationProjectionPipelineLive = Layer.effect(
   Layer.provideMerge(ProjectionThreadRepositoryLive),
   Layer.provideMerge(ProjectionThreadMessageRepositoryLive),
   Layer.provideMerge(ProjectionThreadProposedPlanRepositoryLive),
+  Layer.provideMerge(ProjectionThreadPeerLoopExecutionRepositoryLive),
   Layer.provideMerge(ProjectionThreadActivityRepositoryLive),
   Layer.provideMerge(ProjectionThreadSessionRepositoryLive),
   Layer.provideMerge(ProjectionTurnRepositoryLive),

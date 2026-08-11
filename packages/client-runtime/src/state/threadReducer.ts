@@ -23,6 +23,12 @@ const proposedPlanOrder = O.combine<OrchestrationThread["proposedPlans"][number]
   O.mapInput(O.String, (p) => p.id),
 );
 
+/** createdAt first, then the run id as a stable tie-breaker. */
+const peerLoopExecutionOrder = O.combine<OrchestrationThread["peerLoopExecutions"][number]>(
+  O.mapInput(O.String, (execution) => execution.createdAt),
+  O.mapInput(O.String, (execution) => execution.runId),
+);
+
 const checkpointOrder = O.mapInput(
   O.Number,
   (cp: OrchestrationThread["checkpoints"][number]) =>
@@ -98,6 +104,7 @@ export function applyThreadDetailEvent(
           deletedAt: null,
           messages: [],
           proposedPlans: [],
+          peerLoopExecutions: [],
           activities: [],
           checkpoints: [],
           session: null,
@@ -424,6 +431,31 @@ export function applyThreadDetailEvent(
       return {
         kind: "updated",
         thread: { ...thread, proposedPlans, updatedAt: event.occurredAt },
+      };
+    }
+
+    case "thread.peer-loop-execution-linked": {
+      const execution = {
+        runId: event.payload.runId,
+        proposedPlanId: event.payload.proposedPlanId,
+        createdAt: event.payload.createdAt,
+      };
+
+      // De-duplicated on both keys, not just the run id: a replayed stream must
+      // not be able to show one proposal twice or one run twice.
+      const peerLoopExecutions = pipe(
+        thread.peerLoopExecutions,
+        Arr.filter(
+          (entry) =>
+            entry.runId !== execution.runId && entry.proposedPlanId !== execution.proposedPlanId,
+        ),
+        Arr.append(execution),
+        Arr.sort(peerLoopExecutionOrder),
+      );
+
+      return {
+        kind: "updated",
+        thread: { ...thread, peerLoopExecutions, updatedAt: event.occurredAt },
       };
     }
 

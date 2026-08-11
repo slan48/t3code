@@ -17,6 +17,7 @@ import {
   type OrchestrationLatestTurn,
   type OrchestrationMessage,
   type OrchestrationProjectShell,
+  type OrchestrationPeerLoopExecution,
   type OrchestrationProposedPlan,
   type OrchestrationProject,
   type OrchestrationSession,
@@ -47,6 +48,7 @@ import { ProjectionProject } from "../../persistence/Services/ProjectionProjects
 import { ProjectionState } from "../../persistence/Services/ProjectionState.ts";
 import { ProjectionThreadActivity } from "../../persistence/Services/ProjectionThreadActivities.ts";
 import { ProjectionThreadMessage } from "../../persistence/Services/ProjectionThreadMessages.ts";
+import { ProjectionThreadPeerLoopExecution } from "../../persistence/Services/ProjectionThreadPeerLoopExecutions.ts";
 import { ProjectionThreadProposedPlan } from "../../persistence/Services/ProjectionThreadProposedPlans.ts";
 import { ProjectionThreadSession } from "../../persistence/Services/ProjectionThreadSessions.ts";
 import { ProjectionThread } from "../../persistence/Services/ProjectionThreads.ts";
@@ -157,6 +159,10 @@ const REQUIRED_SNAPSHOT_PROJECTORS = [
   ORCHESTRATION_PROJECTOR_NAMES.threads,
   ORCHESTRATION_PROJECTOR_NAMES.threadMessages,
   ORCHESTRATION_PROJECTOR_NAMES.threadProposedPlans,
+  // The links are part of a full thread, so a snapshot cannot claim a sequence
+  // this projector has not reached — a client would otherwise resume past the
+  // link event and never see the execution it already had a row for.
+  ORCHESTRATION_PROJECTOR_NAMES.threadPeerLoopExecutions,
   ORCHESTRATION_PROJECTOR_NAMES.threadActivities,
   ORCHESTRATION_PROJECTOR_NAMES.threadSessions,
   ORCHESTRATION_PROJECTOR_NAMES.checkpoints,
@@ -507,6 +513,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           updated_at AS "updatedAt"
         FROM projection_thread_proposed_plans
         ORDER BY thread_id ASC, created_at ASC, plan_id ASC
+      `,
+  });
+
+  const listThreadPeerLoopExecutionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionThreadPeerLoopExecution,
+    execute: () =>
+      sql`
+        SELECT
+          run_id AS "runId",
+          thread_id AS "threadId",
+          proposed_plan_id AS "proposedPlanId",
+          created_at AS "createdAt"
+        FROM projection_thread_peer_loop_executions
+        ORDER BY thread_id ASC, created_at ASC, run_id ASC
       `,
   });
 
@@ -950,6 +971,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  const listThreadPeerLoopExecutionRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionThreadPeerLoopExecution,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          run_id AS "runId",
+          thread_id AS "threadId",
+          proposed_plan_id AS "proposedPlanId",
+          created_at AS "createdAt"
+        FROM projection_thread_peer_loop_executions
+        WHERE thread_id = ${threadId}
+        ORDER BY created_at ASC, run_id ASC
+      `,
+  });
+
   const listThreadActivityRowsByThread = SqlSchema.findAll({
     Request: ThreadIdLookupInput,
     Result: ProjectionThreadActivityDbRowSchema,
@@ -1109,6 +1146,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listThreadPeerLoopExecutionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getSnapshot:listThreadPeerLoopExecutions:query",
+                "ProjectionSnapshotQuery.getSnapshot:listThreadPeerLoopExecutions:decodeRows",
+              ),
+            ),
+          ),
           listThreadActivityRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1158,6 +1203,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             threadRows,
             messageRows,
             proposedPlanRows,
+            peerLoopExecutionRows,
             activityRows,
             sessionRows,
             checkpointRows,
@@ -1167,6 +1213,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             Effect.gen(function* () {
               const messagesByThread = new Map<string, Array<OrchestrationMessage>>();
               const proposedPlansByThread = new Map<string, Array<OrchestrationProposedPlan>>();
+              const peerLoopExecutionsByThread = new Map<
+                string,
+                Array<OrchestrationPeerLoopExecution>
+              >();
               const activitiesByThread = new Map<string, Array<OrchestrationThreadActivity>>();
               const checkpointsByThread = new Map<string, Array<OrchestrationCheckpointSummary>>();
               const sessionsByThread = new Map<string, OrchestrationSession>();
@@ -1213,6 +1263,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   updatedAt: row.updatedAt,
                 });
                 proposedPlansByThread.set(row.threadId, threadProposedPlans);
+              }
+
+              for (const row of peerLoopExecutionRows) {
+                // The link's own timestamp still moves the snapshot clock: a
+                // client that only re-reads on a newer updatedAt must see it.
+                updatedAt = maxIso(updatedAt, row.createdAt);
+                const threadExecutions = peerLoopExecutionsByThread.get(row.threadId) ?? [];
+                threadExecutions.push({
+                  runId: row.runId,
+                  proposedPlanId: row.proposedPlanId,
+                  createdAt: row.createdAt,
+                });
+                peerLoopExecutionsByThread.set(row.threadId, threadExecutions);
               }
 
               for (const row of activityRows) {
@@ -1337,6 +1400,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 deletedAt: row.deletedAt,
                 messages: messagesByThread.get(row.threadId) ?? [],
                 proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
+                peerLoopExecutions: peerLoopExecutionsByThread.get(row.threadId) ?? [],
                 activities: activitiesByThread.get(row.threadId) ?? [],
                 checkpoints: checkpointsByThread.get(row.threadId) ?? [],
                 session: sessionsByThread.get(row.threadId) ?? null,
@@ -1392,6 +1456,16 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          // The decider needs these: linking refuses a duplicate run id across
+          // the whole read model, which it cannot see if they are not loaded.
+          listThreadPeerLoopExecutionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listThreadPeerLoopExecutions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listThreadPeerLoopExecutions:decodeRows",
+              ),
+            ),
+          ),
           listThreadSessionRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1420,7 +1494,15 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       )
       .pipe(
         Effect.flatMap(
-          ([projectRows, threadRows, proposedPlanRows, sessionRows, latestTurnRows, stateRows]) =>
+          ([
+            projectRows,
+            threadRows,
+            proposedPlanRows,
+            peerLoopExecutionRows,
+            sessionRows,
+            latestTurnRows,
+            stateRows,
+          ]) =>
             Effect.sync(() => {
               let updatedAt: string | null = null;
               const projects: OrchestrationProject[] = [];
@@ -1494,6 +1576,20 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 latestTurnByThread.set(row.threadId, mapLatestTurn(row));
               }
               const proposedPlansByThread = new Map<string, Array<OrchestrationProposedPlan>>();
+              const peerLoopExecutionsByThread = new Map<
+                string,
+                Array<OrchestrationPeerLoopExecution>
+              >();
+              for (const row of peerLoopExecutionRows) {
+                updatedAt = maxIso(updatedAt, row.createdAt);
+                const threadExecutions = peerLoopExecutionsByThread.get(row.threadId) ?? [];
+                threadExecutions.push({
+                  runId: row.runId,
+                  proposedPlanId: row.proposedPlanId,
+                  createdAt: row.createdAt,
+                });
+                peerLoopExecutionsByThread.set(row.threadId, threadExecutions);
+              }
               const sessionByThread = new Map<string, OrchestrationSession>();
 
               for (let index = 0; index < sessionRows.length; index += 1) {
@@ -1541,6 +1637,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   deletedAt: row.deletedAt,
                   messages: [],
                   proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
+                  peerLoopExecutions: peerLoopExecutionsByThread.get(row.threadId) ?? [],
                   activities: [],
                   checkpoints: [],
                   session: sessionByThread.get(row.threadId) ?? null,
@@ -2099,6 +2196,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         threadRow,
         messageRows,
         proposedPlanRows,
+        peerLoopExecutionRows,
         activityRows,
         checkpointRows,
         latestTurnRow,
@@ -2125,6 +2223,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listPlans:query",
               "ProjectionSnapshotQuery.getThreadDetailById:listPlans:decodeRows",
+            ),
+          ),
+        ),
+        listThreadPeerLoopExecutionRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadDetailById:listPeerLoopExecutions:query",
+              "ProjectionSnapshotQuery.getThreadDetailById:listPeerLoopExecutions:decodeRows",
             ),
           ),
         ),
@@ -2202,6 +2308,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           return message;
         }),
         proposedPlans: proposedPlanRows.map(mapProposedPlanRow),
+        peerLoopExecutions: peerLoopExecutionRows.map((row) => ({
+          runId: row.runId,
+          proposedPlanId: row.proposedPlanId,
+          createdAt: row.createdAt,
+        })),
         activities: activityRows.map((row) => {
           const activity = {
             id: row.activityId,
