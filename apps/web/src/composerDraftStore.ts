@@ -424,7 +424,10 @@ interface ComposerDraftStoreState {
       interactionMode?: ProviderInteractionMode;
     },
   ) => void;
+  /** Removes this project's *coding* draft. Never its Navigator sibling. */
   clearProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
+  /** Removes this project's *Navigator* draft. Never its coding sibling. */
+  clearNavigatorProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
   clearProjectDraftThreadById: (
     projectRef: ScopedProjectRef,
     threadRef: ComposerThreadTarget,
@@ -1475,6 +1478,29 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
   );
 }
 
+/**
+ * Remove one project draft of a given purpose.
+ *
+ * Shared by the coding and Navigator cleanups so the two can never drift into
+ * disagreeing about which draft "the project's draft" means.
+ */
+function removeFirstProjectDraft(
+  state: ComposerDraftStoreState,
+  projectRef: ScopedProjectRef,
+  purpose: ThreadPurpose,
+): Partial<ComposerDraftStoreState> {
+  const match = Object.entries(state.draftThreadsByThreadKey).find(
+    ([, draftThread]) =>
+      draftThread.purpose === purpose &&
+      draftThread.projectId === projectRef.projectId &&
+      draftThread.environmentId === projectRef.environmentId,
+  );
+  if (!match) {
+    return state;
+  }
+  return removeDraftThreadReferences(state, match[0]);
+}
+
 function removeDraftThreadReferences(
   state: Pick<
     ComposerDraftStoreState,
@@ -2212,6 +2238,18 @@ function toHydratedThreadDraft(
   };
 }
 
+/**
+ * The rehydration mapping, exposed for tests.
+ *
+ * The Navigator clamp lives here, so proving it holds means calling this with
+ * a persisted body whose modes disagree with its purpose.
+ */
+export function hydrateDraftThreadForTests(
+  persistedDraftThread: PersistedDraftThreadState,
+): DraftThreadState {
+  return toHydratedDraftThreadState(persistedDraftThread);
+}
+
 function toHydratedDraftThreadState(
   persistedDraftThread: PersistedDraftThreadState,
 ): DraftThreadState {
@@ -2241,6 +2279,22 @@ function toHydratedDraftThreadState(
           persistedDraftThread.promotedTo.threadId as ThreadId,
         )
       : null,
+    // LAST, so it wins. Clamped on the way in rather than only on the way out:
+    // persisted mode fields can disagree with the purpose — an older build, a
+    // hand-edited store, a draft written before the pinning existed — and a
+    // rehydrated Navigator draft carrying a writable runtime mode would send a
+    // turn the server then refuses. The purpose is the authority here; the
+    // stored modes are not.
+    ...(persistedDraftThread.purpose === "navigator"
+      ? {
+          runtimeMode: NAVIGATOR_RUNTIME_MODE,
+          interactionMode: NAVIGATOR_INTERACTION_MODE,
+          branch: null,
+          worktreePath: null,
+          envMode: "local" as const,
+          startFromOrigin: false,
+        }
+      : {}),
   };
 }
 
@@ -2529,17 +2583,20 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           });
         },
         clearProjectDraftThreadId: (projectRef) => {
-          set((state) => {
-            const matchingThreadEntry = Object.entries(state.draftThreadsByThreadKey).find(
-              ([, draftThread]) =>
-                draftThread.projectId === projectRef.projectId &&
-                draftThread.environmentId === projectRef.environmentId,
-            );
-            if (!matchingThreadEntry) {
-              return state;
-            }
-            return removeDraftThreadReferences(state, matchingThreadEntry[0]);
-          });
+          /*
+           * CODING-ONLY, AND EXPLICITLY SO.
+           *
+           * This scans for "the draft of this project" and removes the first
+           * match. Once a project can have a coding draft *and* a Navigator
+           * draft, "the first match" depends on insertion order — so a coding
+           * cleanup could delete the Navigator conversation instead, silently
+           * and non-deterministically. The purpose filter makes the scan mean
+           * what its callers have always assumed it meant.
+           */
+          set((state) => removeFirstProjectDraft(state, projectRef, "coding"));
+        },
+        clearNavigatorProjectDraftThreadId: (projectRef) => {
+          set((state) => removeFirstProjectDraft(state, projectRef, "navigator"));
         },
         clearProjectDraftThreadById: (projectRef, threadRef) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";

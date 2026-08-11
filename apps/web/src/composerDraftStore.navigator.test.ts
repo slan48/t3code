@@ -20,6 +20,7 @@ import * as Schema from "effect/Schema";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  hydrateDraftThreadForTests,
   PersistedComposerDraftStoreStateForTests,
   useComposerDraftStore,
   type DraftId,
@@ -244,5 +245,130 @@ describe("coding and navigator drafts for one project", () => {
     expect(state.getDraftSession(CODING_DRAFT)).toBe(null);
     // And the Navigator draft survived the eviction entirely.
     expect(state.getDraftSession(NAVIGATOR_DRAFT)?.purpose).toBe("navigator");
+  });
+});
+
+describe("cleanup cannot remove the wrong purpose sibling", () => {
+  /*
+   * Insertion order is the whole point of these two. The project-wide cleanup
+   * used to take the first draft it found for the project, so which one it
+   * deleted depended on which was inserted first — a coding cleanup could take
+   * the Navigator conversation with it, silently and only sometimes. Both
+   * orders are asserted so the bug cannot come back in one of them.
+   */
+  const seed = (first: "coding" | "navigator") => {
+    const store = useComposerDraftStore.getState();
+    const writeCoding = () =>
+      store.setLogicalProjectDraftThreadId(LOGICAL_PROJECT_KEY, PROJECT_REF, CODING_DRAFT, {
+        threadId: ThreadId.make("thread-coding"),
+      });
+    const writeNavigator = () =>
+      store.setLogicalProjectDraftThreadId(LOGICAL_PROJECT_KEY, PROJECT_REF, NAVIGATOR_DRAFT, {
+        threadId: ThreadId.make("thread-navigator"),
+        purpose: "navigator",
+      });
+    if (first === "coding") {
+      writeCoding();
+      writeNavigator();
+    } else {
+      writeNavigator();
+      writeCoding();
+    }
+  };
+
+  for (const first of ["coding", "navigator"] as const) {
+    it(`clears only the coding draft with ${first} inserted first`, () => {
+      seed(first);
+      useComposerDraftStore.getState().clearProjectDraftThreadId(PROJECT_REF);
+      const state = useComposerDraftStore.getState();
+      expect(state.getDraftSession(CODING_DRAFT)).toBe(null);
+      expect(state.getDraftSession(NAVIGATOR_DRAFT)?.purpose).toBe("navigator");
+    });
+
+    it(`clears only the Navigator draft with ${first} inserted first`, () => {
+      seed(first);
+      useComposerDraftStore.getState().clearNavigatorProjectDraftThreadId(PROJECT_REF);
+      const state = useComposerDraftStore.getState();
+      expect(state.getDraftSession(NAVIGATOR_DRAFT)).toBe(null);
+      expect(state.getDraftSession(CODING_DRAFT)?.purpose).toBe("coding");
+    });
+
+    it(`clears only the named draft with ${first} inserted first`, () => {
+      seed(first);
+      useComposerDraftStore.getState().clearDraftThread(NAVIGATOR_DRAFT);
+      const state = useComposerDraftStore.getState();
+      expect(state.getDraftSession(NAVIGATOR_DRAFT)).toBe(null);
+      expect(state.getDraftSession(CODING_DRAFT)?.purpose).toBe("coding");
+    });
+
+    it(`finalizes only the promoted draft with ${first} inserted first`, () => {
+      seed(first);
+      const store = useComposerDraftStore.getState();
+      store.markDraftThreadPromoting(CODING_DRAFT);
+      store.finalizePromotedDraftThread(CODING_DRAFT);
+      const state = useComposerDraftStore.getState();
+      expect(state.getDraftSession(CODING_DRAFT)).toBe(null);
+      // The sibling was not promoting, and must be untouched by the sweep.
+      expect(state.getDraftSession(NAVIGATOR_DRAFT)?.purpose).toBe("navigator");
+    });
+  }
+});
+
+describe("rehydrating a persisted Navigator draft", () => {
+  it("clamps stale mode fields that disagree with the purpose", () => {
+    // A store written by an older build, or edited by hand: navigator purpose
+    // with a full-access, worktree-bearing body. The purpose is the authority.
+    useComposerDraftStore.setState({
+      draftsByThreadKey: {},
+      draftThreadsByThreadKey: {},
+      logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      stickyModelSelectionByProvider: {},
+      stickyActiveProvider: null,
+    });
+    const hydrated = hydrateDraftThreadForTests({
+      threadId: ThreadId.make("thread-navigator"),
+      environmentId: ENVIRONMENT_ID,
+      projectId: PROJECT_ID,
+      logicalProjectKey: LOGICAL_PROJECT_KEY,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      purpose: "navigator",
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "feature/x",
+      worktreePath: "/repos/demo-wt",
+      envMode: "worktree",
+      startFromOrigin: true,
+    });
+
+    expect(hydrated.purpose).toBe("navigator");
+    expect(hydrated.runtimeMode).toBe("approval-required");
+    expect(hydrated.interactionMode).toBe("plan");
+    expect(hydrated.branch).toBe(null);
+    expect(hydrated.worktreePath).toBe(null);
+    expect(hydrated.envMode).toBe("local");
+    expect(hydrated.startFromOrigin).toBe(false);
+  });
+
+  it("leaves a coding draft's stored context exactly as written", () => {
+    const hydrated = hydrateDraftThreadForTests({
+      threadId: ThreadId.make("thread-coding"),
+      environmentId: ENVIRONMENT_ID,
+      projectId: PROJECT_ID,
+      logicalProjectKey: LOGICAL_PROJECT_KEY,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      purpose: "coding",
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: "feature/x",
+      worktreePath: "/repos/demo-wt",
+      envMode: "worktree",
+      startFromOrigin: true,
+    });
+
+    expect(hydrated.runtimeMode).toBe("full-access");
+    expect(hydrated.branch).toBe("feature/x");
+    expect(hydrated.worktreePath).toBe("/repos/demo-wt");
+    expect(hydrated.envMode).toBe("worktree");
+    expect(hydrated.startFromOrigin).toBe(true);
   });
 });

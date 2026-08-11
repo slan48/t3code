@@ -59,6 +59,7 @@ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts"
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { NAVIGATOR_PROVIDER_FRAME } from "../navigatorProviderFrame.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
 
@@ -148,6 +149,8 @@ describe("ProviderCommandReactor", () => {
     readonly requiresNewThreadForModelChange?: boolean;
     readonly titleRegenerationCompletionDispatchFailures?: number;
     readonly titleRegenerationBeforeStart?: "one" | "two";
+    /** Create the thread as a Navigator conversation instead of a coding one. */
+    readonly threadPurpose?: "coding" | "navigator";
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -435,10 +438,19 @@ describe("ProviderCommandReactor", () => {
         threadId: ThreadId.make("thread-1"),
         projectId: asProjectId("project-1"),
         title: "Thread",
-        purpose: "coding",
+        ...(input?.threadPurpose === "navigator"
+          ? // The only combination the server accepts for a navigator thread.
+            ({
+              purpose: "navigator",
+              interactionMode: "plan",
+              runtimeMode: "approval-required",
+            } as const)
+          : ({
+              purpose: "coding",
+              interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+              runtimeMode: "approval-required",
+            } as const)),
         modelSelection: modelSelection,
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
         branch: null,
         worktreePath: null,
         createdAt: now,
@@ -2812,5 +2824,82 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex_work"));
     expect(thread?.session?.activeTurnId).toBeNull();
+  });
+
+  describe("navigator provider role frame", () => {
+    /*
+     * The frame is applied at the shared turn-start boundary, so it reaches every
+     * adapter without any of them knowing Navigator exists. These assertions are
+     * about the seam that guarantees that: what `sendTurn` receives versus what
+     * the orchestration read model stored.
+     */
+    const OWNER_TEXT = "Compare the two migration approaches for me.";
+
+    it("frames the provider message while persisting the owner's text unchanged", async () => {
+      const harness = await createHarness({ threadPurpose: "navigator" });
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-navigator-turn"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("navigator-message-1"),
+            role: "user",
+            text: OWNER_TEXT,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      expect(sent?.input).toContain(NAVIGATOR_PROVIDER_FRAME);
+      expect(sent?.input).toContain(OWNER_TEXT);
+      expect(sent?.input?.startsWith(NAVIGATOR_PROVIDER_FRAME)).toBe(true);
+
+      // And the durable record holds what the owner typed — not the wrapper.
+      // Persisting the frame would put words in their mouth in their own
+      // transcript, and replay would compound it every turn.
+      const readModel = await harness.readModel();
+      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      const stored = thread?.messages.find(
+        (entry) => entry.id === asMessageId("navigator-message-1"),
+      );
+      expect(stored?.text).toBe(OWNER_TEXT);
+      expect(stored?.text).not.toContain("You are Navigator");
+    });
+
+    it("leaves a coding turn's provider message byte for byte as it was", async () => {
+      const harness = await createHarness();
+      const now = "2026-01-01T00:00:00.000Z";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-coding-turn-unframed"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("coding-message-1"),
+            role: "user",
+            text: OWNER_TEXT,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      // Identical, not merely equivalent: an ordinary turn is untouched by this.
+      expect(sent?.input).toBe(OWNER_TEXT);
+      expect(sent?.input).not.toContain("You are Navigator");
+    });
   });
 });

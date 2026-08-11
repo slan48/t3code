@@ -43,6 +43,7 @@ import {
   resolveSourceControlWriterModelSelection,
   ServerSettingsService,
 } from "../../serverSettings.ts";
+import { providerMessageTextForThread } from "../navigatorProviderFrame.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
@@ -1098,7 +1099,15 @@ const make = Effect.gen(function* () {
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
-      messageText: message.text,
+      /*
+       * The one place the provider-visible text may differ from the persisted
+       * one. A Navigator turn is wrapped in the role frame here, at the shared
+       * boundary, so every adapter receives the same semantics and none of them
+       * has to know Navigator exists. `message.text` — the owner's own words —
+       * is what was stored, what the timeline shows, and what the title
+       * generation above already used.
+       */
+      messageText: providerMessageTextForThread(thread.purpose, message.text),
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined
         ? { modelSelection: event.payload.modelSelection }

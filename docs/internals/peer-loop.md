@@ -704,13 +704,56 @@ thread would be an accident. Nothing is archived, retitled or transformed; the
 threads stay synchronized and reachable from `/navigator` and their own chat
 URL.
 
-**Still forthcoming, and deliberately not present yet:** the coding-control
-lockdown inside ChatView (hiding implementation, permission-mode, checkout,
-terminal/write, approval-accept and checkpoint-revert actions), the shared
-provider Navigator role frame, the Execute action and natural-language
-confirmation, child execution cards, structured run-result context, and the
-mobile Navigator UI. Until the ChatView lockdown lands, the server invariants
-described above remain the thing that refuses any escape attempt.
+**Planning lockdown in the chat surface.** `apps/web/src/navigatorCapabilities.ts`
+derives one capability record from the thread's purpose — runtime mode,
+interaction mode, checkout, plan implementation, terminals, checkpoint revert,
+repository-mutating diff actions, approval accept — rather than scattering
+`purpose === "navigator"` comparisons through the components. Controls read it
+to decide whether to render, and the callbacks read it again as an early guard,
+because hiding a button does not unbind a keyboard shortcut, a slash command,
+or a stale reference in a component that has not re-rendered. Declining and
+cancelling a pending approval stay available: the server explicitly permits
+clearing a request, and blocking it would strand a conversation with an
+unanswerable question. Reading, navigating, conversing, refining the proposal
+and copying stay available too — none of it mutates.
+
+One guard is worth naming. `persistThreadSettingsForNextTurn` reconciles the
+thread with the composer before every send, and on a Navigator thread its
+branch reconciliation would fire on any turn whose local checkout differs from
+the thread's `null` branch — dispatching a `thread.meta.update` the server
+refuses, on every message the owner types. It returns early for Navigator
+threads instead.
+
+The same module supplies the proposal wording, so the timeline card and the
+Plan sidebar agree: a Navigator plan is an **Execution Proposal**, and a coding
+thread's plan keeps the `Plan` / `Proposed plan` wording it has always had.
+
+**The provider role frame.** `apps/server/src/orchestration/navigatorProviderFrame.ts`
+holds one bounded, constant preamble. `ProviderCommandReactor` wraps it around
+the owner's message at the shared turn-start boundary, so Codex, Claude, Cursor,
+Grok and OpenCode all receive the same Navigator role without a single adapter
+knowing Navigator exists. It says what Navigator is for — discussing approaches,
+asking clarifying questions, maintaining one Execution Proposal through the
+provider's own plan mechanism — and what it does not do: implement, edit files,
+run implementation commands, claim work happened, act as Reviewer, or approve
+Peer Loop owner decisions. It also says plainly that discussing an approach is
+not authorization to execute it.
+
+Two things about that frame. **The persisted message is the owner's text,
+unchanged** — stored, replayed, shown in the timeline, and used for title
+generation exactly as typed; only the provider-visible string for that turn is
+wrapped. Persisting the wrapper would put words in the owner's mouth in their
+own transcript. And **the frame is not the enforcement.** A model can be asked
+not to edit files; it cannot be prevented by a sentence. The real boundary is
+the one described above: a navigator thread is pinned to `approval-required`
+and `plan`, owns no worktree, and the orchestration invariants refuse every
+command that would change that. The frame shapes behaviour so the conversation
+is useful; the server is what makes it safe.
+
+**Still forthcoming, and deliberately not present yet:** the Execute action and
+natural-language confirmation, child execution cards, structured run-result
+context and the DONE return flow, the `OWNER_REQUIRED` explanation UI, and the
+mobile Navigator UI.
 
 Nothing else launches a run, and there is no Navigator UI. The link and its
 history are described above.

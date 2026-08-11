@@ -157,6 +157,7 @@ import {
   WifiOffIcon,
 } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
+import { proposalWording, threadCapabilities } from "~/navigatorCapabilities";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -1470,6 +1471,14 @@ function ChatViewContent(props: ChatViewProps) {
    */
   const activeThreadPurpose: ThreadPurpose = activeThread?.purpose ?? "coding";
   const isNavigatorThread = activeThreadPurpose === "navigator";
+  /*
+   * One derivation for the whole surface. Controls read it to decide whether
+   * to render, and the callbacks below read it again as an early guard —
+   * because hiding a button does not unbind a keyboard shortcut, a slash
+   * command, or a stale reference held by a component that has not re-rendered.
+   */
+  const capabilities = threadCapabilities(activeThreadPurpose);
+  const proposalLabels = proposalWording(activeThreadPurpose);
   const runtimeMode = isNavigatorThread
     ? NAVIGATOR_RUNTIME_MODE
     : (composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE);
@@ -3073,6 +3082,9 @@ function ChatViewContent(props: ChatViewProps) {
 
   const handleRuntimeModeChange = useCallback(
     (mode: RuntimeMode) => {
+      // Guarded here, not only where the control is rendered: a keyboard
+      // shortcut or a stale reference reaches this function directly.
+      if (!capabilities.canChangeRuntimeMode) return;
       if (mode === runtimeMode) return;
       setComposerDraftRuntimeMode(composerDraftTarget, mode);
       if (isLocalDraftThread) {
@@ -3081,6 +3093,7 @@ function ChatViewContent(props: ChatViewProps) {
       scheduleComposerFocus();
     },
     [
+      capabilities.canChangeRuntimeMode,
       isLocalDraftThread,
       runtimeMode,
       scheduleComposerFocus,
@@ -3092,6 +3105,10 @@ function ChatViewContent(props: ChatViewProps) {
 
   const handleInteractionModeChange = useCallback(
     (mode: ProviderInteractionMode) => {
+      // A Navigator conversation stays in plan mode. The `/default` style
+      // slash command routes through here too, so ignoring it here is what
+      // makes that shortcut a no-op rather than a refused command.
+      if (!capabilities.canChangeInteractionMode) return;
       if (mode === interactionMode) return;
       setComposerDraftInteractionMode(composerDraftTarget, mode);
       if (isLocalDraftThread) {
@@ -3100,6 +3117,7 @@ function ChatViewContent(props: ChatViewProps) {
       scheduleComposerFocus();
     },
     [
+      capabilities.canChangeInteractionMode,
       interactionMode,
       isLocalDraftThread,
       scheduleComposerFocus,
@@ -3456,6 +3474,23 @@ function ChatViewContent(props: ChatViewProps) {
       interactionMode: ProviderInteractionMode;
     }): Promise<AtomCommandResult<void, unknown>> => {
       if (!serverThread) {
+        return AsyncResult.success(undefined);
+      }
+
+      /*
+       * A Navigator thread's settings are not the composer's to persist.
+       *
+       * This runs before every send and reconciles the thread with whatever the
+       * composer currently holds — branch, runtime mode, interaction mode. For
+       * a Navigator conversation all three are fixed, and every one of these
+       * commands would be refused by the server's invariants. In particular the
+       * branch reconciliation would fire on any follow-up turn whose local
+       * checkout differs from the thread's `null` branch, dispatching a
+       * `thread.meta.update` that cannot succeed on every message the owner
+       * sends. Guarding here rather than at the call sites means a new caller
+       * inherits the guard instead of rediscovering the bug.
+       */
+      if (serverThread.purpose === "navigator") {
         return AsyncResult.success(undefined);
       }
 
@@ -4524,6 +4559,9 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onRevertToTurnCount = useCallback(
     async (turnCount: number) => {
+      // Reverting rewinds a worktree. A Navigator conversation has none, and
+      // the server refuses the command outright — so it must never be sent.
+      if (!capabilities.canRevertCheckpoint) return;
       const localApi = readLocalApi();
       if (!localApi || !activeThread || isRevertingCheckpoint) return;
 
@@ -5829,6 +5867,7 @@ function ChatViewContent(props: ChatViewProps) {
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
                 key={activeThread.id}
+                proposalWording={proposalLabels}
                 isWorking={isWorking}
                 activeTurnInProgress={isWorking || !latestTurnSettled}
                 activeTurnStartedAt={activeWorkStartedAt}
