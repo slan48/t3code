@@ -11,12 +11,9 @@ import type {
   OrchestrationPeerLoopExecution,
   OrchestrationProposedPlanId,
   PeerLoopAttachRunInput,
-  PeerLoopEvent,
   PeerLoopListRunsInput,
   PeerLoopRunStateFile,
   PeerLoopRunSummary,
-  PeerLoopSubscribeEventsInput,
-  PeerLoopSubscriptionEvent,
 } from "@t3tools/contracts";
 import { PeerLoopUnavailableError, ProjectId, ThreadId } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
@@ -35,7 +32,6 @@ import {
   type NavigatorExecutionContextThread,
 } from "./NavigatorExecutionContext.ts";
 import {
-  NAVIGATOR_ACTIVITY_MAX_EVENTS,
   NAVIGATOR_CONTEXT_MAX_ATTACHMENTS,
   NAVIGATOR_CONTEXT_MAX_LINKS,
 } from "./navigatorExecutionContextFormat.ts";
@@ -108,59 +104,6 @@ const stateFile = (overrides: Partial<PeerLoopRunStateFile> = {}): PeerLoopRunSt
     ...overrides,
   }) as PeerLoopRunStateFile;
 
-/** One replayed `run-event`, as the bridge would deliver it. */
-const runEvent = (input: {
-  readonly seq: number;
-  readonly payload?: PeerLoopEvent["payload"];
-}): PeerLoopSubscriptionEvent => ({
-  kind: "run-event",
-  runId: "run-77",
-  replay: true,
-  event: {
-    runId: "run-77",
-    seq: input.seq,
-    ts: `2026-03-01T10:0${String(input.seq % 10)}:00.000Z`,
-    type: "run_event",
-    actor: "builder",
-    iteration: 1,
-    payload: input.payload ?? { kind: "builder_report", report: `report ${String(input.seq)}` },
-  } as PeerLoopEvent,
-});
-
-const runSynced = (afterSeq: number): PeerLoopSubscriptionEvent => ({
-  kind: "run-synced",
-  runId: "run-77",
-  afterSeq,
-  eventHighWaterMark: afterSeq,
-});
-
-const runResync = (): PeerLoopSubscriptionEvent => ({
-  kind: "run-resync",
-  runId: "run-77",
-  afterSeq: 0,
-  reason: "gap",
-});
-
-/** A message the deeper-detail gate accepts. */
-const DEEP_MESSAGE = "show me the execution activity";
-const deepTurn = (thread: NavigatorExecutionContextThread) => ({
-  thread,
-  ownerMessageText: DEEP_MESSAGE,
-});
-
-/**
- * An ordinary turn: a thread, and a message that asks for nothing in detail.
- *
- * Every existing assertion is about the compact structured path, so the default
- * message has to be one the deeper-detail gate refuses — otherwise "no
- * subscription" would be proving the wrong thing.
- */
-const ORDINARY_MESSAGE = "How is it going?";
-const ordinaryTurn = (thread: NavigatorExecutionContextThread) => ({
-  thread,
-  ownerMessageText: ORDINARY_MESSAGE,
-});
-
 /** The service, provided from a per-test layer. */
 const context = (layer: Layer.Layer<NavigatorExecutionContext>) =>
   Effect.service(NavigatorExecutionContext).pipe(Effect.provide(layer));
@@ -178,9 +121,6 @@ interface Calls {
   readonly list: Array<PeerLoopListRunsInput>;
   readonly attach: Array<string>;
   readonly projectLookups: Array<ProjectId>;
-  readonly subscribe: Array<PeerLoopSubscribeEventsInput>;
-  /** Bumped by the replay stream's finalizer. Proves the stream is released. */
-  readonly replayFinalizers: Array<string>;
 }
 
 const harness = (options?: {
@@ -188,21 +128,8 @@ const harness = (options?: {
   readonly unreadable?: ReadonlyArray<string>;
   readonly snapshots?: Readonly<Record<string, PeerLoopRunStateFile | "fail" | "interrupt">>;
   readonly project?: "missing" | "fails";
-  /**
-   * What one `subscribeEvents` replay does.
-   *
-   * Absent means the subscription still dies on contact, which is what keeps
-   * every "ordinary turn opens no subscription" assertion honest.
-   */
-  readonly replay?: ReadonlyArray<PeerLoopSubscriptionEvent> | "fail" | "hang" | "interrupt";
 }) => {
-  const calls: Calls = {
-    list: [],
-    attach: [],
-    projectLookups: [],
-    subscribe: [],
-    replayFinalizers: [],
-  };
+  const calls: Calls = { list: [], attach: [], projectLookups: [] };
 
   const peerLoopLayer = Layer.mock(PeerLoopService)({
     listRuns: (input: PeerLoopListRunsInput) => {
@@ -248,36 +175,7 @@ const harness = (options?: {
     sendOwnerMessage: () => Effect.die("sendOwnerMessage is not part of building context"),
     pauseRun: () => Effect.die("pauseRun is not part of building context"),
     recoverRun: () => Effect.die("recoverRun is not part of building context"),
-    subscribeEvents: (input: PeerLoopSubscribeEventsInput) => {
-      calls.subscribe.push(input);
-      if (options?.replay === undefined) {
-        // Still fatal by default: an ordinary turn must never get here.
-        return Stream.die("subscribeEvents is not part of an ordinary context build");
-      }
-      const finalized = Stream.ensuring(
-        Effect.sync(() => {
-          calls.replayFinalizers.push(input.runId);
-        }),
-      );
-      if (options.replay === "fail") {
-        return Stream.fail(new PeerLoopUnavailableError({ reason: "replay refused" })).pipe(
-          finalized,
-        );
-      }
-      if (options.replay === "interrupt")
-        return Stream.fromEffect(Effect.interrupt).pipe(finalized);
-      if (options.replay === "hang") {
-        /*
-         * Emits, then never reaches the boundary. The only way out is the read
-         * timeout — which is exactly the case a provider turn must survive.
-         */
-        return Stream.concat(
-          Stream.fromIterable([runEvent({ seq: 1 })]),
-          Stream.fromEffect(Effect.never),
-        ).pipe(finalized);
-      }
-      return Stream.fromIterable(options.replay).pipe(finalized);
-    },
+    subscribeEvents: () => Stream.die("subscribeEvents is not part of building context"),
     diagnostics: Effect.succeed([]),
   });
 
@@ -321,14 +219,12 @@ describe("conversations that never touch Peer Loop", () => {
     const { calls, layer } = harness({ runs: [summary()] });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result = yield* context.forThread(
-        ordinaryTurn({
-          id: THREAD_ID,
-          purpose: "coding",
-          projectId: PROJECT_ID,
-          peerLoopExecutions: [link({ runId: "run-77" })],
-        }),
-      );
+      const result = yield* context.forThread({
+        id: THREAD_ID,
+        purpose: "coding",
+        projectId: PROJECT_ID,
+        peerLoopExecutions: [link({ runId: "run-77" })],
+      });
       // Null, so the provider text is the owner's byte for byte.
       expect(result).toBeNull();
       // AND nothing was asked. Not "asked and ignored".
@@ -342,7 +238,7 @@ describe("conversations that never touch Peer Loop", () => {
     const { calls, layer } = harness({ runs: [summary()] });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      expect(yield* context.forThread(ordinaryTurn(navigatorThread([])))).toBeNull();
+      expect(yield* context.forThread(navigatorThread([]))).toBeNull();
       // THE BOUNDARY THAT KEEPS AN UNUSED INSTALL FROM SPAWNING THE BRIDGE.
       // The first Peer Loop call is what starts `peer-loop`; a conversation
       // that has executed nothing must never make one.
@@ -360,7 +256,7 @@ describe("reading the project's runs", () => {
     const { calls, layer } = harness({ runs: [summary()] });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      yield* context.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })])));
+      yield* context.forThread(navigatorThread([link({ runId: "run-77" })]));
       expect(calls.list).toEqual([{ projectPath: WORKSPACE_ROOT }]);
       expect(calls.projectLookups).toEqual([PROJECT_ID]);
     }).pipe(Effect.provide(layer));
@@ -371,14 +267,12 @@ describe("reading the project's runs", () => {
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
       yield* context.forThread(
-        ordinaryTurn(
-          navigatorThread(
-            Array.from({ length: 12 }, (_, index) =>
-              link({
-                runId: `run-${String(index)}`,
-                createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
-              }),
-            ),
+        navigatorThread(
+          Array.from({ length: 12 }, (_, index) =>
+            link({
+              runId: `run-${String(index)}`,
+              createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
+            }),
           ),
         ),
       );
@@ -395,9 +289,7 @@ describe("reading the project's runs", () => {
     });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result = yield* context.forThread(
-        ordinaryTurn(navigatorThread([link({ runId: "run-mine" })])),
-      );
+      const result = yield* context.forThread(navigatorThread([link({ runId: "run-mine" })]));
       expect(result).toContain("run-mine");
       // The join is strictly by linked run id. Another run in the same project
       // is not this conversation's business.
@@ -412,14 +304,12 @@ describe("reading the project's runs", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread(
-              Array.from({ length: NAVIGATOR_CONTEXT_MAX_LINKS + 4 }, (_, index) =>
-                link({
-                  runId: `run-${String(index).padStart(2, "0")}`,
-                  createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
-                }),
-              ),
+          navigatorThread(
+            Array.from({ length: NAVIGATOR_CONTEXT_MAX_LINKS + 4 }, (_, index) =>
+              link({
+                runId: `run-${String(index).padStart(2, "0")}`,
+                createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
+              }),
             ),
           ),
         )) ?? "";
@@ -435,12 +325,10 @@ describe("reading the project's runs", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-gone", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-broken", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-gone", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-broken", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
       expect(result).toContain("not currently listing this run");
       expect(result).toContain("could not read this run's record");
@@ -459,13 +347,11 @@ describe("reading the project's runs", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-a", createdAt: "2026-03-03T10:00:00.000Z" }),
-              link({ runId: "run-b", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-c", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-a", createdAt: "2026-03-03T10:00:00.000Z" }),
+            link({ runId: "run-b", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-c", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
       expect(result).toContain("state: builder_working");
       expect(result).toContain("state: paused");
@@ -518,13 +404,11 @@ describe("the second, structured read", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-done", createdAt: "2026-03-03T10:00:00.000Z" }),
-              link({ runId: "run-active", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-owner", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-done", createdAt: "2026-03-03T10:00:00.000Z" }),
+            link({ runId: "run-active", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-owner", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
 
       expect(calls.attach.toSorted()).toEqual(["run-done", "run-owner"]);
@@ -546,14 +430,12 @@ describe("the second, structured read", () => {
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
       yield* context.forThread(
-        ordinaryTurn(
-          navigatorThread(
-            runIds.map((runId, index) =>
-              link({
-                runId,
-                createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
-              }),
-            ),
+        navigatorThread(
+          runIds.map((runId, index) =>
+            link({
+              runId,
+              createdAt: `2026-03-${String(index + 1).padStart(2, "0")}T10:00:00.000Z`,
+            }),
           ),
         ),
       );
@@ -580,12 +462,10 @@ describe("the second, structured read", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-bad", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-ok", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-bad", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-ok", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
       // One card degrades; the other still carries its structured answer, and
       // the turn is not failed by either.
@@ -603,9 +483,7 @@ describe("when Peer Loop cannot be read", () => {
     const { calls, layer } = harness({ runs: "fail" });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result =
-        (yield* context.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })])))) ??
-        "";
+      const result = (yield* context.forThread(navigatorThread([link({ runId: "run-77" })]))) ?? "";
       expect(result).toContain("Structured execution status is unavailable");
       // Nothing from the error reaches the provider. A bridge failure is
       // exactly the kind of text that carries paths and diagnostics.
@@ -627,12 +505,10 @@ describe("when Peer Loop cannot be read", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-77", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-78", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-77", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-78", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
       expect(result).not.toContain("not currently listing this run");
       expect(result).not.toContain("could not read this run's record");
@@ -652,12 +528,10 @@ describe("when Peer Loop cannot be read", () => {
       const context = yield* NavigatorExecutionContext;
       const result =
         (yield* context.forThread(
-          ordinaryTurn(
-            navigatorThread([
-              link({ runId: "run-gone", createdAt: "2026-03-02T10:00:00.000Z" }),
-              link({ runId: "run-broken", createdAt: "2026-03-01T10:00:00.000Z" }),
-            ]),
-          ),
+          navigatorThread([
+            link({ runId: "run-gone", createdAt: "2026-03-02T10:00:00.000Z" }),
+            link({ runId: "run-broken", createdAt: "2026-03-01T10:00:00.000Z" }),
+          ]),
         )) ?? "";
       expect(result).toContain("run run-gone");
       expect(result).toContain("not currently listing this run");
@@ -670,9 +544,7 @@ describe("when Peer Loop cannot be read", () => {
     const { calls, layer } = harness({ project: "missing" });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result =
-        (yield* context.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })])))) ??
-        "";
+      const result = (yield* context.forThread(navigatorThread([link({ runId: "run-77" })]))) ?? "";
       expect(result).toContain("Execution records are unavailable");
       // No canonical workspace root means no scoped list to ask for, and an
       // unscoped one would return other projects' runs.
@@ -684,9 +556,7 @@ describe("when Peer Loop cannot be read", () => {
     const { calls, layer } = harness({ project: "fails" });
     return Effect.gen(function* () {
       const context = yield* NavigatorExecutionContext;
-      const result =
-        (yield* context.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })])))) ??
-        "";
+      const result = (yield* context.forThread(navigatorThread([link({ runId: "run-77" })]))) ?? "";
       expect(result).toContain("Execution records are unavailable");
       expect(result).not.toContain("projection unavailable");
       expect(calls.list).toEqual([]);
@@ -711,7 +581,7 @@ describe("which failures degrade and which travel", () => {
       const exit = yield* context(layer)
         .pipe(
           Effect.flatMap((service) =>
-            service.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })]))),
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
           ),
         )
         .pipe(Effect.exit);
@@ -730,7 +600,7 @@ describe("which failures degrade and which travel", () => {
       const exit = yield* context(layer)
         .pipe(
           Effect.flatMap((service) =>
-            service.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })]))),
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
           ),
         )
         .pipe(Effect.exit);
@@ -758,12 +628,10 @@ describe("which failures degrade and which travel", () => {
       const result = yield* context(layer).pipe(
         Effect.flatMap((service) =>
           service.forThread(
-            ordinaryTurn(
-              navigatorThread([
-                link({ runId: "run-bad", createdAt: "2026-03-02T10:00:00.000Z" }),
-                link({ runId: "run-ok", createdAt: "2026-03-01T10:00:00.000Z" }),
-              ]),
-            ),
+            navigatorThread([
+              link({ runId: "run-bad", createdAt: "2026-03-02T10:00:00.000Z" }),
+              link({ runId: "run-ok", createdAt: "2026-03-01T10:00:00.000Z" }),
+            ]),
           ),
         ),
       );
@@ -782,7 +650,7 @@ describe("which failures degrade and which travel", () => {
       const exit = yield* context(layer)
         .pipe(
           Effect.flatMap((service) =>
-            service.forThread(ordinaryTurn(navigatorThread([link({ runId: "run-77" })]))),
+            service.forThread(navigatorThread([link({ runId: "run-77" })])),
           ),
         )
         .pipe(Effect.exit);
@@ -790,198 +658,4 @@ describe("which failures degrade and which travel", () => {
       expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
     }),
   );
-});
-
-/* ------------------------------------------------- the deeper question */
-
-describe("reading a run in detail, only when asked", () => {
-  const linkedThread = navigatorThread([link({ runId: "run-77" })]);
-
-  it.effect("opens no subscription for an ordinary linked turn", () => {
-    /*
-     * THE GATE. The same conversation, the same links, the same live run — and
-     * a question the structured facts already answer. No replay, no bridge
-     * subscription, nothing extra in front of the model.
-     */
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: [runEvent({ seq: 1 }), runSynced(1)],
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(ordinaryTurn(linkedThread))) ?? "";
-      expect(result).toContain("state: builder_working");
-      expect(result).not.toContain("Detailed linked-run activity");
-      expect(calls.subscribe).toEqual([]);
-      expect(calls.list).toHaveLength(1);
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("opens exactly one, for the selected run, when the Owner asks", () => {
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: [runEvent({ seq: 1 }), runEvent({ seq: 2 }), runSynced(2)],
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(calls.subscribe).toEqual([{ runId: "run-77", afterSeq: 0 }]);
-      // The compact facts are still first and still there.
-      expect(result).toContain("state: builder_working");
-      expect(result).toContain("Detailed linked-run activity");
-      expect(result).toContain("report 1");
-      expect(result).toContain("report 2");
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("stops at the sync boundary and never sees a later event", () => {
-    /*
-     * A LIVE TAIL IS THE FAILURE MODE. `run-synced` is the transport fact that
-     * says the backlog is behind this subscriber; anything the fake emits after
-     * it is a live event, and a provider turn must not be holding the stream
-     * open to receive one.
-     */
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: [
-        runEvent({ seq: 1 }),
-        runSynced(1),
-        runEvent({ seq: 2, payload: { kind: "builder_report", report: "LIVE AFTER SYNC" } }),
-      ],
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(result).toContain("report 1");
-      expect(result).not.toContain("LIVE AFTER SYNC");
-      // And the stream was released rather than left attached.
-      expect(calls.replayFinalizers).toEqual(["run-77"]);
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("keeps only the newest records, in sequence order", () => {
-    const { layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: [
-        ...Array.from({ length: NAVIGATOR_ACTIVITY_MAX_EVENTS + 5 }, (_, index) =>
-          runEvent({ seq: index + 1 }),
-        ),
-        runSynced(NAVIGATOR_ACTIVITY_MAX_EVENTS + 5),
-      ],
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(result).toContain("Only the most recent");
-      // The first five fell out of the window; the last one is present.
-      expect(result).not.toContain("#1 ");
-      expect(result).toContain(`#${String(NAVIGATOR_ACTIVITY_MAX_EVENTS + 5)} `);
-      const shown = [...result.matchAll(/^ {2}#(\d+) /gmu)].map((match) => Number(match[1]));
-      expect(shown).toHaveLength(NAVIGATOR_ACTIVITY_MAX_EVENTS);
-      expect(shown).toEqual([...shown].toSorted((left, right) => left - right));
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("degrades on a resync without losing the compact status", () => {
-    // A resync means the stream could not be kept gapless, so whatever arrived
-    // is an unknown subset. Presenting a subset as "what happened" is worse
-    // than saying nothing.
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: [runEvent({ seq: 1 }), runResync()],
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(result).toContain("state: builder_working");
-      expect(result).toContain("Detailed activity for that run is unavailable");
-      expect(result).not.toContain("report 1");
-      // Once. Re-subscribing is what a live viewer does, not a provider turn.
-      expect(calls.subscribe).toHaveLength(1);
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("degrades on a typed replay failure, and says nothing about why", () => {
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: "fail",
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(result).toContain("state: builder_working");
-      expect(result).toContain("Detailed activity for that run is unavailable");
-      expect(result).not.toContain("replay refused");
-      expect(calls.subscribe).toHaveLength(1);
-      expect(calls.replayFinalizers).toEqual(["run-77"]);
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.live("degrades when the replay never reaches its boundary", () => {
-    /*
-     * A provider turn is blocked while this runs, so the timeout is the point.
-     * `it.live` because the read timeout is real elapsed time, and the fake
-     * hangs deliberately — there is nothing to poll and nothing to sleep on in
-     * the test itself.
-     */
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: "hang",
-    });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = (yield* context.forThread(deepTurn(linkedThread))) ?? "";
-      expect(result).toContain("state: builder_working");
-      expect(result).toContain("Detailed activity for that run is unavailable");
-      expect(calls.subscribe).toHaveLength(1);
-      // Interrupted by the timeout, so the stream's finalizer still ran.
-      expect(calls.replayFinalizers).toEqual(["run-77"]);
-    }).pipe(Effect.provide(layer), Effect.timeout("30 seconds"), Effect.orDie);
-  });
-
-  it.effect("lets an interrupted replay stay interrupted, and still finalizes", () => {
-    const { calls, layer } = harness({
-      runs: [summary({ runId: "run-77" })],
-      replay: "interrupt",
-    });
-    return Effect.gen(function* () {
-      const exit = yield* context(layer)
-        .pipe(Effect.flatMap((service) => service.forThread(deepTurn(linkedThread))))
-        .pipe(Effect.exit);
-      expect(Exit.isFailure(exit)).toBe(true);
-      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
-      expect(calls.replayFinalizers).toEqual(["run-77"]);
-    });
-  });
-
-  it.effect("reads nothing in detail when the conversation has no links", () => {
-    const { calls, layer } = harness({ replay: [runSynced(0)] });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      expect(yield* context.forThread(deepTurn(navigatorThread([])))).toBeNull();
-      // The zero-query boundary wins over the deeper question, always.
-      expect(calls.subscribe).toEqual([]);
-      expect(calls.list).toEqual([]);
-      expect(calls.projectLookups).toEqual([]);
-    }).pipe(Effect.provide(layer));
-  });
-
-  it.effect("reads nothing in detail on a coding thread", () => {
-    const { calls, layer } = harness({ replay: [runSynced(0)] });
-    return Effect.gen(function* () {
-      const context = yield* NavigatorExecutionContext;
-      const result = yield* context.forThread({
-        thread: {
-          id: THREAD_ID,
-          purpose: "coding",
-          projectId: PROJECT_ID,
-          peerLoopExecutions: [link({ runId: "run-77" })],
-        },
-        ownerMessageText: DEEP_MESSAGE,
-      });
-      expect(result).toBeNull();
-      expect(calls.subscribe).toEqual([]);
-      expect(calls.list).toEqual([]);
-    }).pipe(Effect.provide(layer));
-  });
 });

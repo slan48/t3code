@@ -34,20 +34,15 @@ import {
   ThreadId,
   defaultInstanceIdForDriver,
   type OrchestrationProposedPlanId,
-  type PeerLoopEvent,
   type PeerLoopRunStateFile,
   type PeerLoopRunSummary,
-  type PeerLoopSubscriptionEvent,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 
 import { NAVIGATOR_PROVIDER_FRAME } from "../src/orchestration/navigatorProviderFrame.ts";
-import {
-  NAVIGATOR_ACTIVITY_HEADING,
-  NAVIGATOR_CONTEXT_HEADING,
-} from "../src/peerLoop/navigatorExecutionContextFormat.ts";
+import { NAVIGATOR_CONTEXT_HEADING } from "../src/peerLoop/navigatorExecutionContextFormat.ts";
 import {
   makeOrchestrationIntegrationHarness,
   type OrchestrationIntegrationHarness,
@@ -194,32 +189,6 @@ const runStateFile = (
     ...overrides,
   }) as PeerLoopRunStateFile;
 
-/** One replayed `run-event`, as the bridge would deliver it. */
-const replayEvent = (input: {
-  readonly seq: number;
-  readonly payload: PeerLoopEvent["payload"];
-}): PeerLoopSubscriptionEvent => ({
-  kind: "run-event",
-  runId: RUN_ID,
-  replay: true,
-  event: {
-    runId: RUN_ID,
-    seq: input.seq,
-    ts: `2026-05-01T00:1${String(input.seq)}:00.000Z`,
-    type: "run_event",
-    actor: "builder",
-    iteration: 1,
-    payload: input.payload,
-  } as PeerLoopEvent,
-});
-
-const replaySynced = (afterSeq: number): PeerLoopSubscriptionEvent => ({
-  kind: "run-synced",
-  runId: RUN_ID,
-  afterSeq,
-  eventHighWaterMark: afterSeq,
-});
-
 function withHarness<A, E>(use: (harness: OrchestrationIntegrationHarness) => Effect.Effect<A, E>) {
   return Effect.acquireUseRelease(
     makeOrchestrationIntegrationHarness({ provider: PROVIDER, peerLoop: true }),
@@ -282,19 +251,13 @@ const ownerTurn = (input: {
 const sentInputs = (harness: OrchestrationIntegrationHarness, threadId: ThreadId) =>
   harness.adapterHarness!.getSentTurnInputs(threadId);
 
-/**
- * Nothing that changes a run, ever.
- *
- * Deliberately not about `subscribeEvents`: reading a replay is a read, and an
- * explicit deeper question is allowed exactly one. Where a turn must open none,
- * that is asserted at the turn.
- */
 const assertNoPeerLoopMutations = (harness: OrchestrationIntegrationHarness) => {
   const calls = harness.peerLoop.calls;
   assert.deepEqual(calls.resumeRun, [], "resumeRun must never be reached");
   assert.deepEqual(calls.pauseRun, [], "pauseRun must never be reached");
   assert.deepEqual(calls.recoverRun, [], "recoverRun must never be reached");
   assert.deepEqual(calls.sendOwnerMessage, [], "sendOwnerMessage must never be reached");
+  assert.deepEqual(calls.subscribeEvents, [], "subscribeEvents must never be reached");
 };
 
 it.live("carries one proposal from conversation through execution to a finished run", () =>
@@ -412,8 +375,6 @@ it.live("carries one proposal from conversation through execution to a finished 
       assert.isTrue(duringInput.endsWith(duringText));
       // One list read for the turn, and still exactly one start for the loop.
       assert.equal(harness.peerLoop.calls.listRuns.length, 1);
-      // "How is it going?" is a status question. No replay, no subscription.
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assert.deepEqual(harness.peerLoop.calls.listRuns[0], {
         projectPath: harness.workspaceDir,
       });
@@ -484,9 +445,6 @@ it.live("carries one proposal from conversation through execution to a finished 
       assert.isFalse(afterInput.includes("BUILDER REPORT PROSE"));
       // DONE is worth exactly one snapshot read, and no mutation at all.
       assert.deepEqual(harness.peerLoop.calls.attachRun, [RUN_ID]);
-      // "What changed?" is answered by the structured DONE decision. Still no
-      // subscription: the deeper gate has not been asked to open.
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assert.equal(harness.peerLoop.calls.startRun.length, 1);
       assertNoPeerLoopMutations(harness);
 
@@ -522,85 +480,7 @@ it.live("carries one proposal from conversation through execution to a finished 
       assert.equal(finalThread.peerLoopExecutions.length, 1);
       assert.equal(finalThread.archivedAt, null);
       assert.equal(harness.peerLoop.calls.startRun.length, 1);
-      // Four ordinary turns, and not one of them opened a replay.
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assertNoPeerLoopMutations(harness);
-
-      /* 7. Ask for the detail explicitly. ------------------------------------- */
-
-      harness.peerLoop.setReplay(RUN_ID, [
-        replayEvent({ seq: 1, payload: { kind: "run_started" } }),
-        replayEvent({
-          seq: 2,
-          payload: { kind: "builder_task", task: "Add the column with a default." },
-        }),
-        replayEvent({
-          seq: 3,
-          payload: {
-            kind: "builder_report",
-            report: "Column added; backfilled 1200 rows.",
-            // Not an allowlisted field on this kind, so it must not travel.
-            cwd: "/private/tmp/should-not-travel",
-          },
-        }),
-        replaySynced(3),
-        // Anything after the boundary is a live event. Reaching it would mean
-        // the turn was still attached, which is the failure this guards.
-        replayEvent({
-          seq: 4,
-          payload: { kind: "notice", message: "LIVE AFTER SYNC" },
-        }),
-      ]);
-
-      yield* harness.adapterHarness!.queueTurnResponse(
-        NAVIGATOR_THREAD,
-        conversationTurn("turn-detail", "Here is what happened, step by step."),
-      );
-      const detailText = "What happened step by step?";
-      yield* ownerTurn({
-        harness,
-        threadId: NAVIGATOR_THREAD,
-        id: "detail",
-        text: detailText,
-        interactionMode: "plan",
-      });
-      yield* harness.waitForThread(
-        NAVIGATOR_THREAD,
-        () => sentInputs(harness, NAVIGATOR_THREAD).length === 6,
-      );
-
-      const detailInput = sentInputs(harness, NAVIGATOR_THREAD)[5]!;
-      // Exactly one subscription, for the one linked run, once.
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, [RUN_ID]);
-      // The compact facts still come first; the activity is an addition.
-      assert.isTrue(detailInput.startsWith(NAVIGATOR_PROVIDER_FRAME));
-      assert.isTrue(detailInput.includes(NAVIGATOR_CONTEXT_HEADING));
-      assert.isTrue(detailInput.includes(NAVIGATOR_ACTIVITY_HEADING));
-      assert.equal(detailInput.split(NAVIGATOR_ACTIVITY_HEADING).length, 2);
-      assert.isTrue(
-        detailInput.indexOf(NAVIGATOR_CONTEXT_HEADING) <
-          detailInput.indexOf(NAVIGATOR_ACTIVITY_HEADING),
-      );
-      assert.isTrue(detailInput.includes("task: Add the column with a default."));
-      assert.isTrue(detailInput.includes("report: Column added; backfilled 1200 rows."));
-      // Stopped at the boundary; the live event was never observed.
-      assert.isFalse(detailInput.includes("LIVE AFTER SYNC"));
-      // A field outside the allowlist for that kind never travels.
-      assert.isFalse(detailInput.includes("/private/tmp/should-not-travel"));
-      // The Owner's words are still last, and still exactly theirs.
-      assert.isTrue(detailInput.endsWith(detailText));
-      assert.isTrue(detailInput.length <= 12_000 + NAVIGATOR_PROVIDER_FRAME.length + 256);
-      // Reading is not acting.
-      assert.equal(harness.peerLoop.calls.startRun.length, 1);
-      assertNoPeerLoopMutations(harness);
-
-      const detailThread = yield* harness.waitForThread(NAVIGATOR_THREAD, (thread) =>
-        thread.messages.some((message) => message.id === MessageId.make("msg-detail")),
-      );
-      assert.equal(
-        detailThread.messages.find((message) => message.id === MessageId.make("msg-detail"))?.text,
-        detailText,
-      );
     }),
   ),
 );
@@ -688,9 +568,6 @@ it.live("explains an OWNER_REQUIRED run without offering to answer it", () =>
       // Read-only: one list, one snapshot, and nothing that could answer.
       assert.equal(harness.peerLoop.calls.listRuns.length, 1);
       assert.deepEqual(harness.peerLoop.calls.attachRun, [RUN_ID]);
-      // "Is it stuck?" is a status question: the structured question answers
-      // it, so no replay is opened.
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assertNoPeerLoopMutations(harness);
 
       /*
@@ -715,7 +592,6 @@ it.live("explains an OWNER_REQUIRED run without offering to answer it", () =>
       );
       assert.equal(thread.peerLoopExecutions.length, 1);
       assert.equal(harness.peerLoop.calls.startRun.length, 1);
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assertNoPeerLoopMutations(harness);
     }),
   ),
@@ -777,7 +653,6 @@ it.live("leaves a coding thread's provider text byte for byte, and asks Peer Loo
       assert.deepEqual(harness.peerLoop.calls.listRuns, []);
       assert.deepEqual(harness.peerLoop.calls.attachRun, []);
       assert.deepEqual(harness.peerLoop.calls.startRun, []);
-      assert.deepEqual(harness.peerLoop.calls.subscribeEvents, []);
       assertNoPeerLoopMutations(harness);
     }),
   ),

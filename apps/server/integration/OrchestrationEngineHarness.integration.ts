@@ -12,7 +12,6 @@ import {
   type PeerLoopRunStateFile,
   type PeerLoopRunSummary,
   type PeerLoopStartRunInput,
-  type PeerLoopSubscriptionEvent,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -260,14 +259,6 @@ export interface PeerLoopFake {
   readonly setSnapshot: (runId: string, state: PeerLoopRunStateFile) => void;
   /** The run id the next `startRun` returns. */
   readonly setNextRunId: (runId: string) => void;
-  /**
-   * A finite replay for one run, ending at its own `run-synced`.
-   *
-   * Unset by default, and the subscription stays fatal until it is: an
-   * ordinary Navigator turn that opened one has to fail loudly, or every
-   * "zero subscriptions" assertion in the loop is vacuous.
-   */
-  readonly setReplay: (runId: string, events: ReadonlyArray<PeerLoopSubscriptionEvent>) => void;
 }
 
 interface MakeOrchestrationIntegrationHarnessOptions {
@@ -396,7 +387,6 @@ export const makeOrchestrationIntegrationHarness = (
     const peerLoopRuns: { current: ReadonlyArray<PeerLoopRunSummary> } = { current: [] };
     const peerLoopSnapshots = new Map<string, PeerLoopRunStateFile>();
     const peerLoopNextRunId = { current: "run-1" };
-    const peerLoopReplays = new Map<string, ReadonlyArray<PeerLoopSubscriptionEvent>>();
     const peerLoopCalls: PeerLoopFakeCalls = {
       startRun: [],
       listRuns: [],
@@ -417,9 +407,6 @@ export const makeOrchestrationIntegrationHarness = (
       },
       setNextRunId: (runId) => {
         peerLoopNextRunId.current = runId;
-      },
-      setReplay: (runId, events) => {
-        peerLoopReplays.set(runId, events);
       },
     };
     const peerLoopServiceLayer = Layer.mock(PeerLoopService)({
@@ -494,12 +481,7 @@ export const makeOrchestrationIntegrationHarness = (
       },
       subscribeEvents: (input) => {
         peerLoopCalls.subscribeEvents.push(input.runId);
-        const replay = peerLoopReplays.get(input.runId);
-        // Fatal unless a test explicitly scripted a replay for this run. An
-        // ordinary turn reaching here is a bug, not a configuration gap.
-        return replay === undefined
-          ? Stream.die("subscribeEvents must not be reached by an ordinary Navigator turn")
-          : Stream.fromIterable(replay);
+        return Stream.die("subscribeEvents must not be reached by the Navigator loop");
       },
       diagnostics: Effect.succeed([]),
     });
@@ -510,7 +492,7 @@ export const makeOrchestrationIntegrationHarness = (
           // reads — a locally provided copy would be a second database.
           NavigatorExecutionContext.layer.pipe(Layer.provide(peerLoopServiceLayer))
         : Layer.succeed(NavigatorExecutionContext.NavigatorExecutionContext, {
-            forThread: ({ thread }) =>
+            forThread: (thread) =>
               thread.purpose === "navigator"
                 ? Effect.die("navigator execution context is not configured in this harness")
                 : Effect.succeed(null),
