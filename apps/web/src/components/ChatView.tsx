@@ -166,8 +166,18 @@ import {
   threadCapabilities,
   visibleRightPanelSurfaces,
 } from "~/navigatorCapabilities";
-import { groupExecutionsByProposal } from "~/navigatorExecution";
-import { useNavigatorExecutionLinks } from "~/state/navigatorExecutionCommand";
+import {
+  executeProposalAvailability,
+  groupExecutionsByProposal,
+  type ExecutableProposal,
+} from "~/navigatorExecution";
+import { consumeNavigatorConfirmation, routeNavigatorSend } from "~/navigatorConfirmation";
+import {
+  navigatorExecutionKey,
+  navigatorExecutionStore,
+  useNavigatorExecuteProposal,
+  useNavigatorExecutionLinks,
+} from "~/state/navigatorExecutionCommand";
 import {
   NavigatorProposalExecution,
   type NavigatorExecutionContext,
@@ -2251,6 +2261,30 @@ function ChatViewContent(props: ChatViewProps) {
       isNavigatorThread,
       latestTurnSettled,
     ],
+  );
+  const executeNavigatorProposal = useNavigatorExecuteProposal();
+  /*
+   * The one proposal a confirmation phrase could be about.
+   *
+   * `activeProposedPlan` is already the thread's own latest plan, gated on the
+   * turn having settled; `hasActionableProposedPlan` drops one a coding thread
+   * has implemented. Anything else — a plan carried over from another thread, a
+   * turn still running, no plan at all — leaves this null, and a confirmation
+   * phrase is then just something the owner said.
+   */
+  const confirmableProposal = useMemo<ExecutableProposal | null>(
+    () =>
+      isNavigatorThread &&
+      durableThreadIdForExecution !== null &&
+      hasActionableProposedPlan(activeProposedPlan) &&
+      activeProposedPlan !== null
+        ? {
+            id: activeProposedPlan.id,
+            implementedAt: activeProposedPlan.implementedAt,
+            implementationThreadId: activeProposedPlan.implementationThreadId,
+          }
+        : null,
+    [activeProposedPlan, durableThreadIdForExecution, isNavigatorThread],
   );
   /*
    * The sidebar shows whichever proposal the turn is about, and that can be a
@@ -4827,6 +4861,72 @@ function ChatViewContent(props: ChatViewProps) {
         composerPreviewAnnotations.length +
         composerReviewComments.length,
     });
+    /*
+     * A standalone confirmation of the current Execution Proposal.
+     *
+     * CHECKED BEFORE THE PLAN FOLLOW-UP BRANCH, which would otherwise swallow
+     * it as a refinement turn. Every other outcome of `routeNavigatorSend`
+     * falls through to the existing path byte for byte — a coding thread, a
+     * draft, a conversation with no settled proposal, a proposal that cannot be
+     * executed, anything with an attachment, and any text that is not exactly
+     * one of the recognized phrases.
+     */
+    if (confirmableProposal !== null && durableThreadIdForExecution !== null) {
+      const executionState = navigatorExecutionStore.read(
+        navigatorExecutionKey({
+          environmentId,
+          threadId: durableThreadIdForExecution,
+          proposedPlanId: confirmableProposal.id,
+        }),
+      );
+      const route = routeNavigatorSend({
+        text: trimmed,
+        hasAttachments:
+          composerImages.length > 0 ||
+          composerTerminalContexts.length > 0 ||
+          composerElementContexts.length > 0 ||
+          composerPreviewAnnotations.length > 0 ||
+          composerReviewComments.length > 0,
+        purpose: activeThreadPurpose,
+        isDurableThread: true,
+        proposal: confirmableProposal,
+        availability: executeProposalAvailability({
+          purpose: activeThreadPurpose,
+          isDurableThread: true,
+          latestTurnSettled,
+          proposal: confirmableProposal,
+          executionCount: executionsByProposal.get(confirmableProposal.id)?.length ?? 0,
+          executing: executionState.pending,
+          lastAttemptDisposition: executionState.failure?.disposition ?? null,
+        }),
+      });
+      /*
+       * Consumed as an action, not sent as a message.
+       *
+       * Nothing else moves: no provider turn, no optimistic owner message, no
+       * mode change, no navigation. The durable record of this action is the
+       * immutable proposal/run link the server writes and the child card that
+       * renders it — fabricating a message to stand in for it would put words
+       * in the owner's transcript that they never sent to anybody.
+       */
+      const consumed = await consumeNavigatorConfirmation({
+        route,
+        clearComposer: () => {
+          promptRef.current = "";
+          clearComposerDraftContent(composerDraftTarget);
+          composerRef.current?.resetCursorState();
+        },
+        // The same gate both Execute buttons use. A press and a phrase in the
+        // same tick resolve to one key and produce one RPC.
+        execute: (confirmed) =>
+          executeNavigatorProposal({
+            environmentId,
+            threadId: durableThreadIdForExecution,
+            proposedPlanId: confirmed.id,
+          }),
+      });
+      if (consumed) return;
+    }
     if (showPlanFollowUpPrompt && activeProposedPlan) {
       const followUp = resolvePlanFollowUpSubmission({
         draftText: trimmed,

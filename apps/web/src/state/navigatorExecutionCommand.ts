@@ -257,25 +257,45 @@ export const navigatorExecutionStore = createNavigatorExecutionStore();
 
 /* ---------------------------------------------------------------- hooks */
 
+export interface NavigatorExecutionTarget {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly proposedPlanId: OrchestrationProposedPlanId;
+}
+
+/**
+ * Execute one proposal, through the one gate that proposal has.
+ *
+ * THE SINGLE ENTRY POINT. The Execute button in the timeline, the one in the
+ * Plan sidebar, and a recognized confirmation phrase submitted in the composer
+ * all call this. They resolve to the same environment/thread/proposal key, so a
+ * press and a phrase landing in the same tick produce one RPC and one run.
+ */
+export function useNavigatorExecuteProposal(): (
+  target: NavigatorExecutionTarget,
+) => Promise<PeerLoopExecuteProposalResult | null> {
+  const executeProposal = useAtomCommand(peerLoopCommands.executeProposal, {
+    reportFailure: false,
+  });
+  return useCallback(
+    (target) =>
+      navigatorExecutionStore.execute(navigatorExecutionKey(target), {
+        // Exactly the environment wrapper and two ids. See the request builder.
+        run: () => executeProposal(buildExecuteProposalRequest(target)),
+      }),
+    [executeProposal],
+  );
+}
+
 /**
  * One proposal's execution state and the command that starts it.
  *
  * Every mounted copy of the action reads the same entry, so a press in the
  * timeline immediately shows as pending in the Plan sidebar too.
  */
-export function useNavigatorExecution(input: {
-  readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
-  readonly proposedPlanId: OrchestrationProposedPlanId;
-}) {
-  const executeProposal = useAtomCommand(peerLoopCommands.executeProposal, {
-    reportFailure: false,
-  });
-  const key = navigatorExecutionKey({
-    environmentId: input.environmentId,
-    threadId: input.threadId,
-    proposedPlanId: input.proposedPlanId,
-  });
+export function useNavigatorExecution(input: NavigatorExecutionTarget) {
+  const executeProposal = useNavigatorExecuteProposal();
+  const key = navigatorExecutionKey(input);
 
   useSyncExternalStore(
     navigatorExecutionStore.subscribe,
@@ -286,13 +306,8 @@ export function useNavigatorExecution(input: {
 
   const { environmentId, threadId, proposedPlanId } = input;
   const execute = useCallback(
-    () =>
-      navigatorExecutionStore.execute(key, {
-        // Exactly the environment wrapper and two ids. See the request builder.
-        run: () =>
-          executeProposal(buildExecuteProposalRequest({ environmentId, threadId, proposedPlanId })),
-      }),
-    [environmentId, executeProposal, key, proposedPlanId, threadId],
+    () => executeProposal({ environmentId, threadId, proposedPlanId }),
+    [environmentId, executeProposal, proposedPlanId, threadId],
   );
 
   const dismissFailure = useCallback(() => navigatorExecutionStore.dismissFailure(key), [key]);
@@ -465,24 +480,55 @@ const navigatorSnapshotAtomFor = (environmentId: EnvironmentId, runId: string) =
 type NavigatorSnapshotAtom = ReturnType<typeof navigatorSnapshotAtomFor> | typeof NO_SNAPSHOT_ATOM;
 
 /**
- * Who gets to refresh a shared snapshot when its run summary moves.
+ * Who gets to refresh a shared snapshot when its run summary moves, and for how
+ * long the answer is remembered.
  *
  * Both copies of an execution see the same new `updatedAt` in the same tick and
  * would both refresh the atom they share — two `run.attach` calls for one
  * change. The first to claim a (run, revision) pair does it; the second finds
  * the pair already claimed and does nothing.
+ *
+ * OWNERSHIP IS REFERENCE-COUNTED, because a plain map here is a leak: one entry
+ * per environment/run that an owner ever looked at, kept for the lifetime of
+ * the tab. Each mounted observer retains, each unmount releases, and the last
+ * release drops the entry. A claim against an unretained key is refused rather
+ * than creating one, so a stray call cannot resurrect the leak.
+ *
+ * React's StrictMode development mount runs setup → cleanup → setup, which
+ * takes the count 1 → 0 → 1 and forgets the remembered revision in between.
+ * That is harmless: the observer that re-retains has not seen a *new* revision,
+ * so it does not refresh — it only re-remembers the one it already had.
  */
 export function createSnapshotRefreshLedger() {
-  const claimed = new Map<string, string>();
+  const entries = new Map<string, { observers: number; revision: string | null }>();
   return {
-    /** True for the first caller of each (key, revision). False afterwards. */
+    retain: (key: string): void => {
+      const entry = entries.get(key);
+      if (entry === undefined) entries.set(key, { observers: 1, revision: null });
+      else entry.observers += 1;
+    },
+    release: (key: string): void => {
+      const entry = entries.get(key);
+      if (entry === undefined) return;
+      entry.observers -= 1;
+      if (entry.observers <= 0) entries.delete(key);
+    },
+    /**
+     * True for the first retained caller of each (key, revision).
+     *
+     * False for every later caller of the same pair, and false for a key
+     * nobody is observing — there is no card on screen to refresh for.
+     */
     claim: (key: string, revision: string): boolean => {
-      if (claimed.get(key) === revision) return false;
-      claimed.set(key, revision);
+      const entry = entries.get(key);
+      if (entry === undefined) return false;
+      if (entry.revision === revision) return false;
+      entry.revision = revision;
       return true;
     },
-    size: (): number => claimed.size,
-    reset: (): void => claimed.clear(),
+    observers: (key: string): number => entries.get(key)?.observers ?? 0,
+    size: (): number => entries.size,
+    reset: (): void => entries.clear(),
   } as const;
 }
 
@@ -522,18 +568,31 @@ export function useNavigatorExecutionSnapshot(input: {
   const refresh = useAtomRefresh(snapshotAtom);
 
   const { environmentId, runId, wanted, revision } = input;
+  const ledgerKey =
+    wanted && environmentId !== null
+      ? navigatorSnapshotKey({ environmentId: String(environmentId), runId })
+      : null;
+
+  // Ownership, on its own effect and keyed only on the entry. A revision change
+  // must not churn the reference count — and must not momentarily drop it to
+  // zero, which would discard the very revision the claim below compares to.
+  useEffect(() => {
+    if (ledgerKey === null) return;
+    snapshotRefreshLedger.retain(ledgerKey);
+    return () => snapshotRefreshLedger.release(ledgerKey);
+  }, [ledgerKey]);
+
   const observedRevision = useRef<string | null>(null);
   useEffect(() => {
-    if (!wanted || environmentId === null || revision === null) return;
-    const key = navigatorSnapshotKey({ environmentId: String(environmentId), runId });
+    if (ledgerKey === null || revision === null) return;
     const first = observedRevision.current === null;
     const changed = observedRevision.current !== revision;
     observedRevision.current = revision;
-    const claimed = snapshotRefreshLedger.claim(key, revision);
+    const claimed = snapshotRefreshLedger.claim(ledgerKey, revision);
     // Mounting the atom already issues the read; only a later revision needs a
     // refresh, and only the first copy to notice it performs one.
     if (!first && changed && claimed) refresh();
-  }, [environmentId, refresh, revision, runId, wanted]);
+  }, [ledgerKey, refresh, revision]);
 
   return useMemo(() => {
     if (!wanted || environmentId === null) return NO_EXECUTION_SNAPSHOT;

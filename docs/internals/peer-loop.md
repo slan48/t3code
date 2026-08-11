@@ -659,9 +659,10 @@ underneath — it makes agents act and spends subscription capacity. Peer Loop
 observation methods stay read-scoped and the existing explicit controls are
 unchanged.
 
-The web surface for this is described under **Executing a proposal** below. It
-is an explicit button and nothing else: no natural-language confirmation, and
-nothing infers agreement from prose.
+The web surface for this is described under **Executing a proposal** and
+**Confirming in words** below: an explicit button, and a closed list of
+standalone confirmation phrases matched whole. Nothing infers agreement from
+prose — discussing execution is never authorization to execute.
 
 ### The Navigator conversation surface
 
@@ -799,8 +800,7 @@ is useful; the server is what makes it safe.
 **The action is explicit, and the press is the confirmation.** An Execution
 Proposal on a durable Navigator thread carries an `Execute with Peer Loop`
 button with adjacent wording saying that it starts Peer Loop's Reviewer →
-Builder workflow in this project using the proposal shown above. Nothing reads
-agreement out of the conversation.
+Builder workflow in this project using the proposal shown above.
 
 It is offered only for a proposal that is settled, unlinked, and not already
 implemented by a coding thread. `apps/web/src/navigatorExecution.ts` answers
@@ -842,6 +842,57 @@ optional `safetyLimit` is not sent either: this surface does not offer the owner
 a way to choose one, and inventing a bound would be T3 Code making a Peer Loop
 decision.
 
+### Confirming in words
+
+An owner can also confirm by saying so, and that path is **another input to the
+same operation, not a second way to start a run**. A recognized phrase goes
+through the same per-proposal gate, sends the same `{ threadId, proposedPlanId }`
+request, and executes the same server-derived proposal. The owner's words are
+never sent as an objective.
+
+**The grammar is a closed list, matched whole.**
+`apps/web/src/navigatorConfirmation.ts` normalizes the composer text and
+compares it against five phrases:
+
+    ejecuta la propuesta · execute the proposal · hagamos eso · let's do it · lets do it
+
+Normalization folds a typographic apostrophe to `'` (a phone produces `let’s`,
+and refusing that would make the feature feel broken on the device most likely
+to use it), applies NFKC, strips combining marks so `ejecutá` reads as
+`ejecuta`, lowercases, collapses whitespace, and removes leading `¡` and
+trailing `.`, `!`, `…`. **`?` and `¿` are deliberately not stripped**: "let's do
+it?" is a question about doing it, not an instruction to do it.
+
+There is no model, no fuzzy match, no substring search and no sentiment
+inference, and the comparison is against the _entire_ normalized utterance. So
+"let's do it after changing the database", "hagamos eso pero primero…", "ok
+let's do it", a quoted example, a negation, a question and a slash command are
+all ordinary conversation. **Discussing execution is never authorization** — the
+difference between a discussion and an authorization is a Peer Loop run against
+a repository, and a recognizer that tried to be helpful about qualifications
+would occasionally launch work the owner was still thinking about.
+
+**Four things must all be true before the text is even considered:** the
+conversation is a durable Navigator thread; the proposal is that thread's own
+latest settled actionable one; `executeProposalAvailability` says it can be
+executed; and the composer carries nothing but the text — no image, terminal
+context, element context, preview annotation or review comment. An attachment
+means the owner was composing for Navigator, not confirming. Anything else falls
+through to the existing send path unchanged, and a Navigator conversation with
+no settled proposal treats the same words as conversation rather than inventing
+an objective from them.
+
+**A consumed confirmation is an action, not a message.** The composer is cleared
+and nothing else moves: no provider turn, no optimistic owner message, no
+interaction- or runtime-mode change, no navigation, and the composer stays
+available for the next thing the owner wants to say. The durable record of the
+action is the immutable proposal/run link the server writes and the child card
+that renders it. No provider message is fabricated to stand in for it — that
+would put words in the owner's own transcript that they never sent to anybody —
+and there is no second conversation store. The pending, error and partial-failure
+presentation is the button's, unchanged, and a consumed phrase is never
+automatically resubmitted.
+
 **Nothing is ever retried**, including timeouts, connection failures and
 defects. Both error families survive with their structure: a Peer Loop refusal
 keeps its code and the run a duplicate-run refusal names, a timeout keeps
@@ -851,6 +902,20 @@ is authoritative in both directions. `link-not-confirmed` says a run exists that
 T3 Code could not record, says not to press Execute again, links straight to
 `/peer-loop/$runId` — and **removes the Execute button**, because offering it
 beside that warning would invite a second run.
+
+**"This request may have started something" and "this proposal already has a
+run" are separate questions**, and a single boolean answered both badly. A
+`proposal-already-executed` refusal carries `mayHaveStarted: false` — this
+request started nothing — and yet the proposal demonstrably has a run, so
+re-offering Execute would be wrong. Each failure therefore carries an explicit
+retry disposition: `retryable` for a provable pre-start refusal, where the owner
+may press again once the cause is fixed; `inspect-existing` for a proposal that
+already has a run, which links to that run and withholds the action; and
+`unknown` for `link-not-confirmed`, a may-have-applied timeout and every
+unclassified client failure, which withholds it too. A project-level
+`PROJECT_HAS_UNFINISHED_RUN` refusal is `retryable` and still links to the run
+it names — that is a _different_ run in the same project, and it must not be
+mistaken for this proposal's execution.
 
 **An unclassified failure is unknown, not safe.** A dropped socket, a lost
 response or an unexpected throw out of the RPC layer proves nothing about the
@@ -906,6 +971,16 @@ refresh ledger lets only the first copy to notice a new summary `updatedAt`
 re-read it — one `run.attach` per change, not one per rendered copy. Nothing
 polls the snapshot and nothing opens `run.subscribeEvents`.
 
+That ledger is **reference-counted**, because a plain map there is a leak: one
+entry per environment/run an owner ever looked at, kept for the lifetime of the
+tab. Each mounted observer retains an entry and each unmount releases it; the
+last release drops it, and a claim against an unretained key is refused rather
+than creating one. Ownership lives on its own effect keyed only on the entry, so
+a revision change cannot churn the count or momentarily drop it to zero and
+discard the revision the next claim compares against. React's StrictMode
+setup → cleanup → setup is safe: the observer that re-retains has not seen a new
+revision, so it re-remembers rather than refreshing.
+
 **Structured DONE and OWNER_REQUIRED, from the inspector's own helpers.**
 `describeCompletionFromRecord` and `describeOwnerDecisionFromRecord` were split
 out of the advanced inspector's `describeCompletion` / `describeOwnerDecision`
@@ -931,14 +1006,15 @@ details" — where Peer Loop's explicit safe controls remain authoritative. Time
 use the same relative-time helper the Peer Loop index uses rather than exposing
 raw ISO instants.
 
-**Still forthcoming, and deliberately not present yet:** natural-language
-confirmation of an agreed proposal, an activity or event transcript inside the
-conversation, Navigator's own narrated explanation of an `OWNER_REQUIRED`
-question in its own words, and the mobile Navigator UI.
+**Still forthcoming, and deliberately not present yet:** richer historical-run
+context for a Navigator conversation — an activity or event transcript, and
+Navigator's own narrated explanation of an `OWNER_REQUIRED` question in its own
+words — and the mobile Navigator UI.
 
-Nothing else launches a run. The explicit Execute action described above is the
-only way a Navigator conversation starts one, and the link it records is the
-only thing T3 Code keeps about it.
+Nothing else launches a run. The Execute action and the closed confirmation
+grammar described above are two inputs to one operation, and between them the
+only way a Navigator conversation starts a run; the link it records is the only
+thing T3 Code keeps about it.
 
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live

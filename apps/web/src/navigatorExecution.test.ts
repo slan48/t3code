@@ -63,7 +63,7 @@ const eligible = {
   proposal: proposal(),
   executionCount: 0,
   executing: false,
-  lastAttemptMayHaveStarted: false,
+  lastAttemptDisposition: null,
 };
 
 const link = (input: {
@@ -177,10 +177,23 @@ describe("execute eligibility", () => {
   it("withholds the action while the last attempt's outcome is unknown", () => {
     // A lost response is not proof the server did nothing. Offering Execute
     // again here is how one intent becomes two Reviewer sessions.
-    expect(executeProposalAvailability({ ...eligible, lastAttemptMayHaveStarted: true })).toEqual({
-      canExecute: false,
-      blockedReason: "outcome-unknown",
-    });
+    expect(executeProposalAvailability({ ...eligible, lastAttemptDisposition: "unknown" })).toEqual(
+      { canExecute: false, blockedReason: "outcome-unknown" },
+    );
+  });
+
+  it("withholds the action when the proposal already has a run, however it learned", () => {
+    // `mayHaveStarted` is false for that refusal: THIS request started nothing.
+    // The proposal still has a run, and that is a different question.
+    expect(
+      executeProposalAvailability({ ...eligible, lastAttemptDisposition: "inspect-existing" }),
+    ).toEqual({ canExecute: false, blockedReason: "already-executed" });
+  });
+
+  it("leaves the action available after a provable pre-start refusal", () => {
+    expect(
+      executeProposalAvailability({ ...eligible, lastAttemptDisposition: "retryable" }).canExecute,
+    ).toBe(true);
   });
 
   it("reports an in-flight request as its own reason, not as unavailable", () => {
@@ -543,7 +556,7 @@ describe("a failure nothing typed explains", () => {
     expect(
       executeProposalAvailability({
         ...eligible,
-        lastAttemptMayHaveStarted: failure.mayHaveStarted,
+        lastAttemptDisposition: failure.disposition,
       }).canExecute,
     ).toBe(true);
   });

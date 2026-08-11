@@ -80,6 +80,23 @@ export type ExecuteProposalBlockedReason =
    */
   | "outcome-unknown";
 
+/**
+ * What the owner may do after a failed attempt.
+ *
+ * SEPARATE FROM `mayHaveStarted`, WHICH IS ABOUT THIS REQUEST. A
+ * `proposal-already-executed` refusal is `mayHaveStarted: false` — this request
+ * started nothing — and yet the proposal demonstrably has a run, so re-offering
+ * Execute would be wrong. Overloading one boolean to answer both questions was
+ * how those two cases got the same treatment.
+ */
+export type ExecutionRetryDisposition =
+  /** Provably nothing started and nothing exists. The owner may press again. */
+  | "retryable"
+  /** A run already exists for this proposal. Look at it; do not start another. */
+  | "inspect-existing"
+  /** This request may have started a run. Withhold until the owner has looked. */
+  | "unknown";
+
 export interface ExecuteProposalAvailability {
   readonly canExecute: boolean;
   readonly blockedReason: ExecuteProposalBlockedReason | null;
@@ -118,13 +135,14 @@ export function executeProposalAvailability(input: {
   /** True while this client's own Execute request is outstanding. */
   readonly executing: boolean;
   /**
-   * True when the last attempt may have left a run behind.
+   * What the last attempt left behind, or null if there was none.
    *
-   * Includes both the typed cases Peer Loop is explicit about and every
+   * `unknown` covers both the typed cases Peer Loop is explicit about and every
    * unclassified client failure, because a lost response cannot prove the
-   * server did nothing.
+   * server did nothing. `inspect-existing` is a different fact: this request
+   * started nothing, and a run exists anyway.
    */
-  readonly lastAttemptMayHaveStarted: boolean;
+  readonly lastAttemptDisposition: ExecutionRetryDisposition | null;
 }): ExecuteProposalAvailability {
   if (input.purpose !== "navigator") return blocked("not-a-navigator-thread");
   if (!input.isDurableThread) return blocked("draft-conversation");
@@ -135,7 +153,10 @@ export function executeProposalAvailability(input: {
     return blocked("already-implemented");
   }
   if (input.executing) return blocked("executing");
-  if (input.lastAttemptMayHaveStarted) return blocked("outcome-unknown");
+  if (input.lastAttemptDisposition === "unknown") return blocked("outcome-unknown");
+  // The server says this proposal already has a run even though the client's
+  // read model has not caught up. The failure notice links straight to it.
+  if (input.lastAttemptDisposition === "inspect-existing") return blocked("already-executed");
   return AVAILABLE;
 }
 
@@ -492,8 +513,16 @@ export interface NavigatorExecutionFailure {
    * not have to read a run id out of a sentence and retype it.
    */
   readonly inspectorRunId: string | null;
-  /** True when a Peer Loop run may exist despite the failure. Never retried. */
+  /**
+   * True when *this request* may have left a run behind. Never retried.
+   *
+   * Peer Loop's and the coordinator's own answer, passed through. It is not the
+   * same question as whether Execute should be offered again — see
+   * {@link NavigatorExecutionFailure.disposition}.
+   */
   readonly mayHaveStarted: boolean;
+  /** What the owner may do next. See {@link ExecutionRetryDisposition}. */
+  readonly disposition: ExecutionRetryDisposition;
 }
 
 const NEVER_RETRIED =
@@ -565,8 +594,30 @@ export function describeCoordinationError(
     },
     inspectorRunId: error.runId,
     mayHaveStarted: error.mayHaveStarted,
+    disposition: COORDINATION_DISPOSITIONS[error.reason],
   };
 }
+
+/**
+ * What each coordination reason leaves the owner able to do.
+ *
+ * Everything before `link-not-confirmed` happens before Peer Loop is called, so
+ * pressing Execute again once the cause is fixed is safe — except
+ * `proposal-already-executed`, where nothing started but a run exists anyway.
+ */
+const COORDINATION_DISPOSITIONS: Readonly<
+  Record<PeerLoopExecutionFailureReason, ExecutionRetryDisposition>
+> = {
+  "navigator-thread-not-found": "retryable",
+  "not-a-navigator-thread": "retryable",
+  "proposal-not-found": "retryable",
+  // `mayHaveStarted` is false and this is still not retryable: the run exists.
+  "proposal-already-executed": "inspect-existing",
+  "proposal-already-implemented": "retryable",
+  "project-not-found": "retryable",
+  "coordination-failed": "retryable",
+  "link-not-confirmed": "unknown",
+};
 
 /**
  * A Peer Loop refusal, timeout or transport failure from this same call.
@@ -579,8 +630,13 @@ export function describePeerLoopExecutionError(error: PeerLoopError): NavigatorE
   const presentation = describeError(error);
   return {
     presentation,
+    // A `PROJECT_HAS_UNFINISHED_RUN` refusal names a run in this *project*.
+    // That run is worth linking to and is NOT this proposal's execution, so the
+    // disposition stays retryable: nothing started here, and the owner may
+    // press Execute again once that other run finishes.
     inspectorRunId: existingRunIdFromRefusal(error),
     mayHaveStarted: presentation.mayHaveApplied,
+    disposition: presentation.mayHaveApplied ? "unknown" : "retryable",
   };
 }
 
@@ -611,6 +667,7 @@ export const EXECUTION_RESULT_UNKNOWN: NavigatorExecutionFailure = {
   },
   inspectorRunId: null,
   mayHaveStarted: true,
+  disposition: "unknown",
 };
 
 /* ----------------------------------------------------- inspector target */
@@ -630,5 +687,5 @@ export type NavigatorInspectorTarget =
 
 export function inspectorTargetFor(failure: NavigatorExecutionFailure): NavigatorInspectorTarget {
   if (failure.inspectorRunId !== null) return { kind: "run", runId: failure.inspectorRunId };
-  return failure.mayHaveStarted ? { kind: "index" } : { kind: "none" };
+  return failure.disposition === "unknown" ? { kind: "index" } : { kind: "none" };
 }

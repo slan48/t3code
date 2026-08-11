@@ -10,6 +10,7 @@
 import type {
   OrchestrationPeerLoopExecution,
   PeerLoopExecuteProposalResult,
+  PeerLoopExecutionFailureReason,
 } from "@t3tools/contracts";
 import {
   PeerLoopCommandRefusedError,
@@ -107,6 +108,40 @@ describe("the per-proposal gate", () => {
     expect(await first).toBe(RESULT);
     // The refused press returns null rather than a second run.
     expect(await second).toBeNull();
+  });
+
+  it("sends one request for a button press and a confirmation phrase at once", async () => {
+    // The Execute button and a recognized phrase submitted in the composer are
+    // two inputs to one operation. They resolve to the same
+    // environment/thread/proposal key, so the gate sees one intent.
+    const store = createNavigatorExecutionStore();
+    const gate = deferred<AsyncResult.AsyncResult<PeerLoopExecuteProposalResult, unknown>>();
+    const fromButton = vi.fn(() => gate.promise);
+    const fromPhrase = vi.fn(() => gate.promise);
+
+    const buttonKey = navigatorExecutionKey({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: PLAN_ID,
+    });
+    const phraseKey = navigatorExecutionKey({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: PLAN_ID,
+    });
+    expect(phraseKey).toBe(buttonKey);
+
+    const pressed = store.execute(buttonKey, { run: fromButton });
+    const confirmed = store.execute(phraseKey, { run: fromPhrase });
+
+    expect(fromButton).toHaveBeenCalledTimes(1);
+    expect(fromPhrase).not.toHaveBeenCalled();
+    gate.resolve(AsyncResult.success(RESULT));
+    // One RPC, one run, and the phrase's caller learns it did not start one.
+    expect(await pressed).toBe(RESULT);
+    expect(await confirmed).toBeNull();
+    // The same retained link either input would have produced.
+    expect(store.read(buttonKey).link).toEqual(EXECUTION);
   });
 
   it("keeps two different proposals independent", () => {
@@ -391,13 +426,16 @@ describe("what the store keeps", () => {
 
 /* -------------------------------------------------- snapshot refresh */
 
-describe("who refreshes a shared snapshot", () => {
+describe("who refreshes a shared snapshot, and for how long", () => {
   const KEY_A = navigatorSnapshotKey({ environmentId: "environment-local", runId: "run-77" });
 
-  it("lets exactly one copy claim each revision", () => {
+  it("lets exactly one retained copy claim each revision", () => {
     const ledger = createSnapshotRefreshLedger();
-    // Both the timeline copy and the sidebar copy see the same new `updatedAt`
-    // in the same tick. One `run.attach`, not two.
+    // The timeline copy and the sidebar copy both retain the entry, then both
+    // see the same new `updatedAt` in the same tick. One `run.attach`, not two.
+    ledger.retain(KEY_A);
+    ledger.retain(KEY_A);
+    expect(ledger.observers(KEY_A)).toBe(2);
     expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(true);
     expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(false);
     expect(ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z")).toBe(false);
@@ -405,22 +443,171 @@ describe("who refreshes a shared snapshot", () => {
 
   it("claims again when the summary actually moves", () => {
     const ledger = createSnapshotRefreshLedger();
+    ledger.retain(KEY_A);
     ledger.claim(KEY_A, "2026-03-01T10:05:00.000Z");
     expect(ledger.claim(KEY_A, "2026-03-01T10:06:00.000Z")).toBe(true);
     expect(ledger.claim(KEY_A, "2026-03-01T10:06:00.000Z")).toBe(false);
   });
 
+  it("refuses to claim for an entry nobody is observing", () => {
+    // No card on screen means nothing to refresh, and creating an entry here
+    // is exactly the unbounded growth this replaces.
+    const ledger = createSnapshotRefreshLedger();
+    expect(ledger.claim(KEY_A, "rev-1")).toBe(false);
+    expect(ledger.size()).toBe(0);
+  });
+
   it("keeps runs and environments apart", () => {
     const ledger = createSnapshotRefreshLedger();
     const other = navigatorSnapshotKey({ environmentId: "environment-cloud", runId: "run-77" });
+    const otherRun = navigatorSnapshotKey({ environmentId: "environment-local", runId: "run-9" });
     expect(other).not.toBe(KEY_A);
+    for (const key of [KEY_A, other, otherRun]) ledger.retain(key);
     ledger.claim(KEY_A, "rev-1");
     expect(ledger.claim(other, "rev-1")).toBe(true);
-    expect(
-      ledger.claim(
-        navigatorSnapshotKey({ environmentId: "environment-local", runId: "run-9" }),
-        "rev-1",
+    expect(ledger.claim(otherRun, "rev-1")).toBe(true);
+  });
+
+  it("keeps the entry until the last observer has gone", () => {
+    const ledger = createSnapshotRefreshLedger();
+    ledger.retain(KEY_A);
+    ledger.retain(KEY_A);
+    ledger.claim(KEY_A, "rev-1");
+
+    // The Plan sidebar closes. The timeline copy is still watching, so the
+    // remembered revision must survive — otherwise it would refresh again for
+    // a revision it has already read.
+    ledger.release(KEY_A);
+    expect(ledger.size()).toBe(1);
+    expect(ledger.observers(KEY_A)).toBe(1);
+    expect(ledger.claim(KEY_A, "rev-1")).toBe(false);
+
+    ledger.release(KEY_A);
+    expect(ledger.size()).toBe(0);
+    expect(ledger.observers(KEY_A)).toBe(0);
+  });
+
+  it("survives a StrictMode setup, cleanup, setup", () => {
+    const ledger = createSnapshotRefreshLedger();
+    ledger.retain(KEY_A);
+    ledger.release(KEY_A);
+    ledger.retain(KEY_A);
+    // Alive, owned once, and the intermediate cleanup left no second entry.
+    expect(ledger.size()).toBe(1);
+    expect(ledger.observers(KEY_A)).toBe(1);
+    ledger.release(KEY_A);
+    expect(ledger.size()).toBe(0);
+  });
+
+  it("does not grow across repeated mount and unmount cycles", () => {
+    // The leak this replaces: one entry per environment/run an owner ever
+    // looked at, kept for the lifetime of the tab.
+    const ledger = createSnapshotRefreshLedger();
+    for (let index = 0; index < 50; index += 1) {
+      const key = navigatorSnapshotKey({
+        environmentId: "environment-local",
+        runId: `run-${index}`,
+      });
+      ledger.retain(key);
+      ledger.retain(key);
+      ledger.claim(key, "rev-1");
+      ledger.release(key);
+      ledger.release(key);
+    }
+    expect(ledger.size()).toBe(0);
+  });
+
+  it("ignores a release nobody matched", () => {
+    const ledger = createSnapshotRefreshLedger();
+    ledger.release(KEY_A);
+    expect(ledger.size()).toBe(0);
+    expect(ledger.observers(KEY_A)).toBe(0);
+  });
+});
+
+/* --------------------------------------------------- retry disposition */
+
+describe("what the owner may do after a failure", () => {
+  const coordination = (
+    reason: PeerLoopExecutionFailureReason,
+    overrides: { readonly runId?: string | null; readonly mayHaveStarted?: boolean } = {},
+  ) =>
+    describeExecutionResultFailure(
+      failWith(
+        new PeerLoopExecutionCoordinationError({
+          reason,
+          detail: "internal",
+          threadId: THREAD_ID,
+          proposedPlanId: PLAN_ID as OrchestrationPeerLoopExecution["proposedPlanId"],
+          runId: overrides.runId ?? null,
+          mayHaveStarted: overrides.mayHaveStarted ?? false,
+        }),
       ),
-    ).toBe(true);
+    );
+
+  it("sends an already-executed proposal to its run despite mayHaveStarted: false", () => {
+    const failure = coordination("proposal-already-executed", { runId: "run-12" });
+    // The two facts are separate, and this is the case that proves it.
+    expect(failure.mayHaveStarted).toBe(false);
+    expect(failure.disposition).toBe("inspect-existing");
+    expect(failure.inspectorRunId).toBe("run-12");
+  });
+
+  it("keeps an ordinary pre-start coordination refusal retryable", () => {
+    const failure = coordination("project-not-found");
+    expect(failure.mayHaveStarted).toBe(false);
+    expect(failure.disposition).toBe("retryable");
+  });
+
+  it("marks a link that could not be confirmed as unknown", () => {
+    const failure = coordination("link-not-confirmed", { runId: "run-77", mayHaveStarted: true });
+    expect(failure.disposition).toBe("unknown");
+  });
+
+  it("links a project-level unfinished run without calling this proposal executed", () => {
+    // A different run in the same project. Worth pointing at, and no reason to
+    // stop the owner pressing Execute once it finishes.
+    const failure = describeExecutionResultFailure(
+      failWith(
+        new PeerLoopCommandRefusedError({
+          code: "PROJECT_HAS_UNFINISHED_RUN",
+          detail: "run-5 is still going",
+          data: { runId: "run-5" },
+        }),
+      ),
+    );
+    expect(failure.inspectorRunId).toBe("run-5");
+    expect(failure.disposition).toBe("retryable");
+  });
+
+  it("marks a timeout that may have applied as unknown, and one that did not as retryable", () => {
+    expect(
+      describeExecutionResultFailure(
+        failWith(
+          new PeerLoopTimeoutError({
+            method: "peer-loop/execute-proposal",
+            timeoutMs: 30_000,
+            mayHaveApplied: true,
+          }),
+        ),
+      ).disposition,
+    ).toBe("unknown");
+    expect(
+      describeExecutionResultFailure(
+        failWith(
+          new PeerLoopTimeoutError({
+            method: "peer-loop/execute-proposal",
+            timeoutMs: 30_000,
+            mayHaveApplied: false,
+          }),
+        ),
+      ).disposition,
+    ).toBe("retryable");
+  });
+
+  it("marks an unclassified failure as unknown", () => {
+    expect(describeExecutionResultFailure(failWith(new Error("socket closed"))).disposition).toBe(
+      "unknown",
+    );
   });
 });

@@ -115,9 +115,10 @@ function ProposalExecutionArea({
     proposal,
     executionCount: executions.length,
     executing: state.pending,
-    // An unknown outcome counts. A lost response is not proof the server did
-    // nothing, and Execute stays withheld until the owner has looked.
-    lastAttemptMayHaveStarted: state.failure?.mayHaveStarted === true,
+    // What the last attempt left behind, not merely whether it might have
+    // started something: an already-executed refusal started nothing here and
+    // still must not re-offer Execute.
+    lastAttemptDisposition: state.failure?.disposition ?? null,
   });
 
   const onExecute = useCallback(() => {
