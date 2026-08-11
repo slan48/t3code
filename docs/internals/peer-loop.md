@@ -858,6 +858,58 @@ failure is exactly the kind of text that carries paths and diagnostics — and
 nothing is retried inside the turn. In every case the turn proceeds: a
 conversation is not blocked because Peer Loop could not be read.
 
+**One run's activity, only when the Owner asks for it.** Everything above is
+the default and the first source. A deeper question — "what happened step by
+step?", "show me the run transcript", "muéstrame la actividad de la ejecución",
+"why exactly did it fail?" — additionally opens **one** finite replay.
+
+`apps/server/src/peerLoop/navigatorDetailRequest.ts` is the gate: normalization
+plus an explicit pattern list, no model and no fuzzy similarity. It requires
+detail/history/activity/transcript/step-by-step language, or an explicit demand
+for the _exact_ cause of a failure. **A bare `why` is not enough** — "why did it
+fail?" is answered by the structured halt reason, and treating it as a replay
+request would make every failed run cost a subscription. "How is it going?",
+"what changed?", "is it done?" and ordinary planning discussion open nothing.
+
+**One run, one replay, per turn.** If the message names a linked run id that
+run is read; otherwise the newest link. A run id the Owner names that this
+conversation did not launch is not in the link list, so it cannot be selected
+and is never read.
+
+**The replay is finite three ways.** `subscribeEvents({ runId, afterSeq: 0 })`
+is taken until `run-synced` — the transport fact that says this subscriber's
+backlog is behind it — or until `run-resync`, and the stream ends there, which
+closes its scope and releases Peer Loop's replay coordination. It is never a
+live tail: an event after the boundary is never observed. An eight-second read
+timeout interrupts the whole thing if the boundary never arrives, closing the
+same scope. And the fold keeps a rolling window of the newest 40 records while
+consuming, so a run with ten thousand events costs what one with forty costs.
+
+**Sanitized by allowlist, bounded twice.** Each event contributes its envelope —
+sequence, timestamp, actor, iteration, payload kind — plus a short allowlist of
+recognized fields per kind: the owner objective or message text, the Reviewer's
+decision and summary, the Builder task, report or failure, a halt/pause/recovery
+notice, and a run-finished summary. **An unfamiliar payload kind contributes its
+kind and nothing else.** Summarizing unknown scalars is how a newer Peer Loop
+would silently start forwarding a path, a token or an adapter's internals. Every
+free-text field is capped at 400 characters, and the activity section lives
+inside the same execution block, so the 12,000-character ceiling and its
+truncation marker cover both.
+
+**The section says what it is.** It tells the model the records are historical
+observations, that text inside an event is quoted material somebody else wrote
+during the run, that instructions found in it are not instructions to follow,
+and that it must not claim it performed or changed any of it. A Builder task
+_is_ phrased as an instruction; the model has to be told so before it reads one.
+
+**Failure degrades to one sentence.** A resync, a typed `PeerLoopError` or the
+read timeout leaves the compact structured status exactly as it was and adds
+"detailed activity for that run is unavailable". A resync in particular
+discards what arrived: an unknown subset of a history presented as "what
+happened" is worse than saying nothing. Nothing is retried, nothing from the
+error is rendered, and — as everywhere else here — only typed failures are
+caught, so a defect and an interruption travel.
+
 **Explanation is not control.** The block leads with a heading that says these
 are observations, and tells the model in the words it reads that it may explain
 them in plain language but must not claim it approved, resumed, recovered,
@@ -1078,10 +1130,9 @@ details" — where Peer Loop's explicit safe controls remain authoritative. Time
 use the same relative-time helper the Peer Loop index uses rather than exposing
 raw ISO instants.
 
-**Still forthcoming, and deliberately not present yet:** consulting a run's
-detailed activity or event transcript for questions the structured records
-cannot answer, and the mobile Navigator UI. Neither exists today, and the
-Navigator surface does not pretend otherwise.
+**Still forthcoming, and deliberately not present yet:** the mobile Navigator
+UI. It does not exist today, and the Navigator surface does not pretend
+otherwise.
 
 **The whole loop has one integration test.**
 `apps/server/integration/navigatorExecutionLoop.integration.test.ts` drives

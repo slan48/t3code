@@ -1108,10 +1108,18 @@ const make = Effect.gen(function* () {
      * touching Peer Loop at all.
      */
     const navigatorExecutionContextText = yield* navigatorExecutionContext.forThread({
-      id: thread.id,
-      purpose: thread.purpose,
-      projectId: thread.projectId,
-      peerLoopExecutions: thread.peerLoopExecutions,
+      thread: {
+        id: thread.id,
+        purpose: thread.purpose,
+        projectId: thread.projectId,
+        peerLoopExecutions: thread.peerLoopExecutions,
+      },
+      /*
+       * The Owner's words, read only to decide whether they asked for detail.
+       * `message.text` is what was persisted and what title generation already
+       * used; passing it here changes neither.
+       */
+      ownerMessageText: message.text,
     });
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({

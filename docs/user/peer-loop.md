@@ -170,6 +170,24 @@ about a run never touches it.
   it cannot decide, and the options it offered — and then point you at the
   execution details.
 
+### Asking for the detail
+
+Ordinary questions are answered from Peer Loop's structured results — the run's
+state, the Reviewer's summary, the question it escalated. That is the default,
+and it is enough most of the time.
+
+If you want more, ask for it plainly: **"what happened step by step?"**, "show
+me the execution activity", "show the run transcript", "why exactly did it
+fail?", "muéstrame la actividad de la ejecución". Navigator then reads a bounded
+slice of that run's recorded history — the most recent stretch of it — and
+explains it. It reads one run per question: the one you name, or the most recent
+one from this conversation.
+
+This is still only reading. It never runs, resumes or changes anything, and if
+the history cannot be read it says so and leaves the status it already had. For
+the complete activity feed, the full Builder task, and every control, open the
+execution details.
+
 Navigator reads. It never approves, resumes, recovers, pauses or sends an owner
 message, and it will tell you that rather than claim it did. **Approving,
 answering, pausing, resuming and resolving an interrupted turn all happen in the
