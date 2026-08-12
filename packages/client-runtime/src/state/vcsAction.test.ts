@@ -1,7 +1,9 @@
 import {
   EnvironmentId,
+  ThreadId,
   WS_METHODS,
   type GitActionProgressEvent,
+  type GitRunStackedActionInput,
   type GitRunStackedActionResult,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -568,6 +570,100 @@ describe("vcsActionState", () => {
 
     registry.dispose();
   });
+
+  /**
+   * The originating conversation reaches the wire.
+   *
+   * The server decides whether a repository mutation is allowed by resolving
+   * this thread in its own read model — `cwd` cannot tell a Navigator
+   * conversation from the coding thread beside it. If the id is dropped
+   * anywhere between the caller and the RPC input, that check silently becomes
+   * a no-op, so it is asserted on the payload the client actually sends.
+   */
+  it.effect("sends the originating thread with a stacked action, and omits it when unscoped", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const connectionState: SupervisorConnectionState = {
+          ...AVAILABLE_CONNECTION_STATE,
+          desired: true,
+          network: "online",
+          phase: "connected",
+          attempt: 1,
+          generation: 1,
+        };
+        const targetKey = { environmentId, cwd };
+        const sent: Array<GitRunStackedActionInput> = [];
+        const client = {
+          [WS_METHODS.gitRunStackedAction]: (input: GitRunStackedActionInput) => {
+            sent.push(input);
+            return Stream.make(
+              progress({
+                kind: "action_finished",
+                actionId: input.actionId,
+                cwd,
+                action,
+                result,
+              }),
+            );
+          },
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target,
+          state: yield* SubscriptionRef.make(connectionState),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (
+          _environmentId,
+          effect,
+        ) => Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+        const runStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["runStream"] = (
+          _environmentId,
+          stream,
+        ) => Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run,
+          runStream,
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(
+              Persistence.EnvironmentCacheStore,
+              cacheStore(() => undefined),
+            ),
+          ),
+        );
+        const manager = createVcsActionManager(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
+          Effect.sync(() => registry.dispose()),
+        );
+
+        yield* Effect.promise(() =>
+          manager.runStackedAction(targetKey).run(registry, {
+            actionId: "scoped-action",
+            action,
+            originThreadId: ThreadId.make("thread-1"),
+          }),
+        );
+        yield* Effect.promise(() =>
+          manager.runStackedAction(targetKey).run(registry, {
+            actionId: "unscoped-action",
+            action,
+          }),
+        );
+
+        expect(sent).toHaveLength(2);
+        expect(sent[0]?.originThreadId).toBe("thread-1");
+        // A caller with no conversation sends no origin at all rather than an
+        // empty or invented one, so genuinely unscoped callers are unchanged.
+        expect(sent[1]).not.toHaveProperty("originThreadId");
+      }),
+    ),
+  );
 
   it.effect("invalidates persisted refs after successful and failed stacked actions", () =>
     Effect.scoped(

@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import { type ScopedThreadRef } from "@t3tools/contracts";
+import { type ScopedThreadRef, type ThreadId } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -94,6 +94,24 @@ import { openPullRequestLink } from "~/lib/openPullRequestLink";
 interface GitActionsControlProps {
   gitCwd: string | null;
   activeThreadRef: ScopedThreadRef | null;
+  /**
+   * The durable thread the server resolves these mutations against.
+   *
+   * Null for a draft route and for callers with no conversation of their own;
+   * the request then carries no origin and the server treats it as unscoped,
+   * exactly as it did before this existed.
+   */
+  originThreadId: ThreadId | null;
+  /**
+   * `ThreadCapabilities.canUseSourceControlActions`, carried to the dispatch
+   * seam rather than only decided where this component is drawn.
+   *
+   * The header already declines to render this control for a conversation that
+   * may not mutate. This is the second half of that: a dialog that was open
+   * across the change, or any callback captured before it, is refused here
+   * instead of sending a request.
+   */
+  canMutate: boolean;
   draftId?: DraftId;
 }
 
@@ -369,6 +387,8 @@ interface PublishRepositoryDialogProps {
   readonly onOpenChange: (open: boolean) => void;
   readonly environmentId: ScopedThreadRef["environmentId"] | null;
   readonly gitCwd: string;
+  readonly originThreadId: ThreadId | null;
+  readonly canMutate: boolean;
 }
 
 function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
@@ -398,8 +418,9 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     () => ({
       environmentId: props.environmentId,
       cwd: props.gitCwd,
+      mutation: { threadId: props.originThreadId, allowed: props.canMutate },
     }),
-    [props.environmentId, props.gitCwd],
+    [props.canMutate, props.environmentId, props.gitCwd, props.originThreadId],
   );
   const publishRepositoryAction = useSourceControlPublishRepositoryAction(sourceControlScope);
   const publishAccountByProvider = useMemo(() => {
@@ -970,6 +991,8 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
 export default function GitActionsControl({
   gitCwd,
   activeThreadRef,
+  originThreadId,
+  canMutate,
   draftId,
 }: GitActionsControlProps) {
   const updateThreadMetadata = useAtomCommand(
@@ -1006,8 +1029,15 @@ export default function GitActionsControl({
     useState<PendingDefaultBranchAction | null>(null);
   const activeGitActionProgressRef = useRef<ActiveGitActionProgress | null>(null);
   const sourceControlScope = useMemo(
-    () => ({ environmentId: activeEnvironmentId, cwd: gitCwd }),
-    [activeEnvironmentId, gitCwd],
+    () => ({
+      environmentId: activeEnvironmentId,
+      cwd: gitCwd,
+      // Every mutating action this control offers goes through this scope, so
+      // the origin travels with the request and the capability is re-checked
+      // at dispatch rather than only where the menu is drawn.
+      mutation: { threadId: originThreadId, allowed: canMutate },
+    }),
+    [activeEnvironmentId, canMutate, gitCwd, originThreadId],
   );
   let runGitActionWithToast: (input: RunGitActionWithToastInput) => Promise<void>;
 
@@ -1989,6 +2019,8 @@ export default function GitActionsControl({
         onOpenChange={setIsPublishDialogOpen}
         environmentId={activeEnvironmentId}
         gitCwd={gitCwd}
+        originThreadId={originThreadId}
+        canMutate={canMutate}
       />
 
       <Dialog

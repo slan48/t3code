@@ -193,10 +193,25 @@ export const ChatHeader = memo(function ChatHeader({
             openInCwd={openInCwd}
           />
         )}
-        {activeProjectName && (
+        {/*
+          Commit, push, create PR, pull, init and publish are all repository
+          mutations, so a conversation that may not make one does not get the
+          control at all — absent, not disabled. The capability record answers
+          it once; nothing inside the Git components asks what purpose the
+          thread has.
+        */}
+        {activeProjectName && capabilities.canUseSourceControlActions && (
           <GitActionsControl
             gitCwd={gitCwd}
             activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
+            /*
+              The durable thread the server resolves this request against. A
+              draft route has no durable thread yet, and sending its local id
+              would be refused as unknown — so it sends none, exactly like the
+              project-level callers that legitimately have no conversation.
+            */
+            originThreadId={draftId ? null : activeThreadId}
+            canMutate={capabilities.canUseSourceControlActions}
             {...(draftId ? { draftId } : {})}
           />
         )}

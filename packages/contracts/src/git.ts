@@ -113,6 +113,21 @@ export const GitRunStackedActionInput = Schema.Struct({
   actionId: TrimmedNonEmptyStringSchema,
   cwd: TrimmedNonEmptyStringSchema,
   action: GitStackedAction,
+  /**
+   * The durable thread this action was started from, when it was started from
+   * one at all.
+   *
+   * Commit, push and PR are repository mutations, and which conversation asked
+   * for one is a policy question the server has to be able to answer: a
+   * Navigator thread may not make them. `cwd` cannot answer it — a Navigator
+   * conversation and a coding thread can name the same directory.
+   *
+   * Optional because genuinely unscoped callers exist (project-level and
+   * non-chat entry points). The chat header always sends its active durable
+   * thread, and a thread id the server cannot resolve is refused rather than
+   * treated as unscoped.
+   */
+  originThreadId: Schema.optional(ThreadId),
   commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
   featureBranch: Schema.optional(Schema.Boolean),
   filePaths: Schema.optional(

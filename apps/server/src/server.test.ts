@@ -5583,6 +5583,270 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  /*
+   * Which conversation asked, decided from the server's own read model.
+   *
+   * RPC authorization is environment-scoped and knows nothing about threads,
+   * and both of these payloads name a `cwd` — which a Navigator conversation
+   * and the coding thread beside it share. So a crafted request naming a
+   * Navigator thread is exactly what has to be refused here, and refused
+   * BEFORE the Git or provider service is touched: a commit that happened and
+   * then errored is not a rejection.
+   */
+  const NAVIGATOR_THREAD_ID = ThreadId.make("thread-navigator");
+
+  const threadShellsByPurpose = (threadId: ThreadId) =>
+    Effect.succeed(
+      threadId === NAVIGATOR_THREAD_ID
+        ? Option.some(
+            makeDefaultOrchestrationThreadShell({ id: NAVIGATOR_THREAD_ID, purpose: "navigator" }),
+          )
+        : threadId === defaultThreadId
+          ? Option.some(makeDefaultOrchestrationThreadShell({ purpose: "coding" }))
+          : Option.none(),
+    );
+
+  it.effect("refuses a stacked git action from a navigator thread before running git", () =>
+    Effect.gen(function* () {
+      let stackedActionCalls = 0;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellById: threadShellsByPurpose,
+          },
+          gitManager: {
+            runStackedAction: () =>
+              Effect.sync(() => {
+                stackedActionCalls += 1;
+              }).pipe(Effect.andThen(Effect.die("git must not run for a navigator thread"))),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.gitRunStackedAction]({
+            actionId: "action-1",
+            cwd: "/tmp/repo",
+            action: "commit_push",
+            originThreadId: NAVIGATOR_THREAD_ID,
+          }).pipe(Stream.runCollect, Effect.result),
+        ),
+      );
+
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "SourceControlThreadForbiddenError");
+      assert.equal(result.failure.reason, "navigator_thread");
+      assert.equal(result.failure.threadId, NAVIGATOR_THREAD_ID);
+      // Nothing was attempted. This is the whole point of the gate's position.
+      assert.equal(stackedActionCalls, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "refuses publishing a repository from a navigator thread before any provider call",
+    () =>
+      Effect.gen(function* () {
+        let publishCalls = 0;
+
+        yield* buildAppUnderTest({
+          layers: {
+            projectionSnapshotQuery: {
+              getThreadShellById: threadShellsByPurpose,
+            },
+            sourceControlRepositoryService: {
+              publishRepository: () =>
+                Effect.sync(() => {
+                  publishCalls += 1;
+                }).pipe(Effect.andThen(Effect.die("publish must not run for a navigator thread"))),
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const result = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.sourceControlPublishRepository]({
+              cwd: "/tmp/repo",
+              provider: "github",
+              repository: "acme/demo",
+              visibility: "private",
+              originThreadId: NAVIGATOR_THREAD_ID,
+            }).pipe(Effect.result),
+          ),
+        );
+
+        assertTrue(result._tag === "Failure");
+        assertTrue(result.failure._tag === "SourceControlThreadForbiddenError");
+        assert.equal(result.failure.reason, "navigator_thread");
+        // No remote was created and nothing was pushed.
+        assert.equal(publishCalls, 0);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("refuses a mutation naming a thread this server does not have", () =>
+    Effect.gen(function* () {
+      let publishCalls = 0;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellById: threadShellsByPurpose,
+          },
+          sourceControlRepositoryService: {
+            publishRepository: () =>
+              Effect.sync(() => {
+                publishCalls += 1;
+              }).pipe(Effect.andThen(Effect.die("publish must not run for an unknown thread"))),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.sourceControlPublishRepository]({
+            cwd: "/tmp/repo",
+            provider: "github",
+            repository: "acme/demo",
+            visibility: "private",
+            originThreadId: ThreadId.make("thread-does-not-exist"),
+          }).pipe(Effect.result),
+        ),
+      );
+
+      // Fails safe: an id nobody can resolve must not be a way to be treated as
+      // an unscoped caller, which would make the rule optional.
+      assertTrue(result._tag === "Failure");
+      assertTrue(result.failure._tag === "SourceControlThreadForbiddenError");
+      assert.equal(result.failure.reason, "unknown_thread");
+      assert.equal(publishCalls, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("lets a coding thread and an unscoped caller through to the git service", () =>
+    Effect.gen(function* () {
+      const stackedActions: Array<string> = [];
+      let publishCalls = 0;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellById: threadShellsByPurpose,
+          },
+          gitManager: {
+            invalidateLocalStatus: () => Effect.void,
+            invalidateRemoteStatus: () => Effect.void,
+            invalidateStatus: () => Effect.void,
+            runStackedAction: (input, options) =>
+              Effect.gen(function* () {
+                stackedActions.push(input.cwd);
+                const result = {
+                  action: "commit" as const,
+                  branch: { status: "skipped_not_requested" as const },
+                  commit: {
+                    status: "created" as const,
+                    commitSha: "abc123",
+                    subject: "feat: demo",
+                  },
+                  push: { status: "skipped_not_requested" as const },
+                  pr: { status: "skipped_not_requested" as const },
+                  toast: {
+                    title: "Committed abc123",
+                    description: "feat: demo",
+                    cta: {
+                      kind: "run_action" as const,
+                      label: "Push",
+                      action: { kind: "push" as const },
+                    },
+                  },
+                };
+                yield* (
+                  options?.progressReporter?.publish({
+                    actionId: options.actionId ?? input.actionId,
+                    cwd: input.cwd,
+                    action: input.action,
+                    kind: "action_finished",
+                    result,
+                  }) ?? Effect.void
+                );
+                return result;
+              }),
+          },
+          sourceControlRepositoryService: {
+            publishRepository: () =>
+              Effect.sync(() => {
+                publishCalls += 1;
+              }).pipe(
+                Effect.as({
+                  repository: {
+                    provider: "github" as const,
+                    nameWithOwner: "acme/demo",
+                    url: "https://github.com/acme/demo",
+                    sshUrl: "git@github.com:acme/demo.git",
+                  },
+                  remoteName: "origin",
+                  remoteUrl: "git@github.com:acme/demo.git",
+                  branch: "main",
+                  status: "pushed" as const,
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+
+      // An ordinary coding thread is untouched by this work.
+      const coding = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.gitRunStackedAction]({
+            actionId: "action-1",
+            cwd: "/tmp/repo",
+            action: "commit",
+            originThreadId: defaultThreadId,
+          }).pipe(
+            Stream.runCollect,
+            Effect.map((events) => Array.from(events)),
+          ),
+        ),
+      );
+      assert.equal(coding.at(-1)?.kind, "action_finished");
+
+      // And so is a caller that genuinely has no originating conversation.
+      const unscoped = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.gitRunStackedAction]({
+            actionId: "action-2",
+            cwd: "/tmp/repo",
+            action: "commit",
+          }).pipe(
+            Stream.runCollect,
+            Effect.map((events) => Array.from(events)),
+          ),
+        ),
+      );
+      assert.equal(unscoped.at(-1)?.kind, "action_finished");
+      assert.deepEqual(stackedActions, ["/tmp/repo", "/tmp/repo"]);
+
+      const published = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.sourceControlPublishRepository]({
+            cwd: "/tmp/repo",
+            provider: "github",
+            repository: "acme/demo",
+            visibility: "private",
+            originThreadId: defaultThreadId,
+          }),
+        ),
+      );
+      assert.equal(published.status, "pushed");
+      assert.equal(publishCalls, 1);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("completes websocket rpc git.pull before background git status refresh finishes", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest({

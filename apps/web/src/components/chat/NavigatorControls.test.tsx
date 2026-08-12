@@ -7,7 +7,12 @@
  * not be drawn. Each one is paired with the coding case, because the other
  * half of this work is that ordinary threads are untouched.
  */
-import { ApprovalRequestId, EnvironmentId } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  EnvironmentId,
+  ThreadId,
+  type ResolvedKeybindingsConfig,
+} from "@t3tools/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -17,6 +22,7 @@ import {
   NAVIGATOR_PROPOSAL_WORDING,
   threadCapabilities,
 } from "~/navigatorCapabilities";
+import { ChatHeader } from "./ChatHeader";
 import { ComposerFooterModeControls } from "./ComposerFooterModeControls";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
 import { providerBlocksComposerSubmit } from "~/navigatorConfirmation";
@@ -24,6 +30,8 @@ import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { PanelLayoutControls } from "./PanelLayoutControls";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-local");
+const EMPTY_KEYBINDINGS = { rules: [] } as unknown as ResolvedKeybindingsConfig;
+const NO_SCRIPT_ACTION = async () => ({ ok: true }) as never;
 const PLAN = "# Split the migration\n\n1. Add the column.\n2. Backfill.";
 
 /* ------------------------------------------------------------ approvals */
@@ -174,6 +182,58 @@ describe("panel layout controls", () => {
   });
 });
 
+/* ------------------------------------------------- chat header git actions */
+
+/**
+ * The global Git control in the chat header.
+ *
+ * Commit, push, create PR, pull, init and publish repository are all repository
+ * mutations, so the whole control is absent for a planning conversation rather
+ * than drawn and disabled — a greyed-out Commit still says a Navigator thread
+ * has a checkout it might commit, and it does not.
+ */
+describe("the chat header's Git actions", () => {
+  const render = (purpose: "navigator" | "coding") =>
+    renderToStaticMarkup(
+      <ChatHeader
+        capabilities={threadCapabilities(purpose)}
+        activeThreadEnvironmentId={ENVIRONMENT_ID}
+        activeThreadId={ThreadId.make("thread-1")}
+        activeThreadTitle="Split the migration"
+        activeProjectName="demo"
+        activeProjectCwd="/repos/demo"
+        openInCwd="/repos/demo"
+        activeProjectScripts={[]}
+        preferredScriptId={null}
+        keybindings={EMPTY_KEYBINDINGS}
+        availableEditors={[]}
+        rightPanelOpen={false}
+        gitCwd="/repos/demo"
+        onNewThreadInProject={() => undefined}
+        onRunProjectScript={() => undefined}
+        onAddProjectScript={NO_SCRIPT_ACTION}
+        onUpdateProjectScript={NO_SCRIPT_ACTION}
+        onDeleteProjectScript={NO_SCRIPT_ACTION}
+      />,
+    );
+
+  it("draws no Commit or Publish affordance in a planning conversation", () => {
+    const markup = render("navigator");
+    expect(markup).not.toContain('aria-label="Git actions"');
+    expect(markup).not.toContain(">Commit<");
+    expect(markup).not.toContain('aria-label="Git action options"');
+    // The header itself is untouched: the conversation is still named.
+    expect(markup).toContain("Split the migration");
+  });
+
+  it("keeps the whole control for a coding thread", () => {
+    const markup = render("coding");
+    expect(markup).toContain('aria-label="Git actions"');
+    expect(markup).toContain(">Commit<");
+    expect(markup).toContain('aria-label="Git action options"');
+  });
+});
+
 /* ------------------------------------------- provider-less confirmation */
 
 describe("the primary send action with no provider configured", () => {
@@ -305,6 +365,7 @@ describe("capabilities consumed by these components", () => {
     expect(navigator.canAcceptApprovals).toBe(false);
     expect(navigator.canImplementPlan).toBe(false);
     expect(navigator.canStartRepositoryMutation).toBe(false);
+    expect(navigator.canUseSourceControlActions).toBe(false);
     expect(navigator.canRunProjectScripts).toBe(false);
     expect(navigator.canUseTerminals).toBe(false);
     expect(navigator.canRevertCheckpoint).toBe(false);

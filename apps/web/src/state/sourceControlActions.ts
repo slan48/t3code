@@ -17,6 +17,7 @@ import type {
   SourceControlRepositoryVisibility,
   ThreadId,
 } from "@t3tools/contracts";
+import { SourceControlThreadForbiddenError } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -39,6 +40,74 @@ export type SourceControlActionKind =
 export interface SourceControlActionScope {
   readonly environmentId: EnvironmentId | null;
   readonly cwd: string | null;
+  /**
+   * Which conversation is asking, and whether it may ask at all.
+   *
+   * HIDING THE CONTROL IS NOT THE GUARANTEE. A dialog that was already open
+   * when the thread changed, a toast retry, or a callback captured before the
+   * capability flipped can all still fire; this is where such a call is refused
+   * without a request leaving the browser. The server refuses it again from its
+   * own read model — this only keeps T3 Code from asking for something it knows
+   * is not allowed.
+   *
+   * Omitted entirely by callers with no originating conversation, which stay
+   * exactly as they were.
+   */
+  readonly mutation?: SourceControlMutationOrigin;
+}
+
+export interface SourceControlMutationOrigin {
+  /** The durable thread, or null for a draft/unscoped caller. */
+  readonly threadId: ThreadId | null;
+  /** `ThreadCapabilities.canUseSourceControlActions`. */
+  readonly allowed: boolean;
+}
+
+export type SourceControlMutationGate =
+  | {
+      readonly kind: "refused";
+      readonly result: AsyncResult.Failure<never, SourceControlThreadForbiddenError>;
+    }
+  | { readonly kind: "allowed"; readonly origin: { readonly originThreadId?: ThreadId } };
+
+/**
+ * The one thing every mutating action in this module asks before dispatching.
+ *
+ * Two answers in one place so they cannot drift apart: whether this scope may
+ * mutate at all, and — when it may — the origin the request has to carry so the
+ * server can decide again from its own read model. A caller that skipped this
+ * would both bypass the local refusal and send a request the server cannot
+ * attribute, so there is deliberately no second way to build either.
+ *
+ * The refusal is the same typed error the server sends back, so a surface
+ * presenting it does not need to know which side said no.
+ */
+export function sourceControlMutationGate(
+  scope: SourceControlActionScope,
+  operation: string,
+): SourceControlMutationGate {
+  const mutation = scope.mutation;
+  if (mutation !== undefined && !mutation.allowed) {
+    return {
+      kind: "refused",
+      result: AsyncResult.failure<never, SourceControlThreadForbiddenError>(
+        Cause.fail(
+          new SourceControlThreadForbiddenError({
+            operation,
+            reason: "navigator_thread",
+            threadId: mutation.threadId,
+            detail:
+              "This conversation cannot change the repository. Open the coding thread that owns this checkout.",
+          }),
+        ),
+      ),
+    };
+  }
+  const threadId = mutation?.threadId ?? null;
+  return {
+    kind: "allowed",
+    origin: threadId === null ? {} : { originThreadId: threadId },
+  };
 }
 
 interface SourceControlActionState<
@@ -141,6 +210,8 @@ export function useSourceControlActionRunning(
 export function useVcsInitAction(scope: SourceControlActionScope) {
   const init = useAtomCommand(vcsEnvironment.init, { reportFailure: false });
   const action = useCallback(async () => {
+    const gate = sourceControlMutationGate(scope, "vcs.init");
+    if (gate.kind === "refused") return gate.result;
     const target = resolveScope(scope);
     if (target === null) {
       return AsyncResult.failure<never, VcsActionUnavailableError>(
@@ -172,6 +243,8 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
       : null,
   );
   const action = useCallback(async () => {
+    const gate = sourceControlMutationGate(scope, "vcs.pull");
+    if (gate.kind === "refused") return gate.result;
     const target = resolveScope(scope);
     if (target === null) {
       return AsyncResult.failure<never, VcsActionUnavailableError>(
@@ -220,6 +293,10 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       filePaths?: string[];
       onProgress?: (event: GitActionProgressEvent) => void;
     }) => {
+      // Checked at dispatch, not at render: this is the last point a stale
+      // callback or a dialog left open across a thread change can be stopped.
+      const gate = sourceControlMutationGate(scope, "git.runStackedAction");
+      if (gate.kind === "refused") return gate.result;
       if (resolveScope(scope) === null) {
         return AsyncResult.failure<never, VcsActionUnavailableError>(
           Cause.fail(
@@ -234,6 +311,7 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       return runStackedAction({
         actionId: input.actionId,
         action: input.action,
+        ...gate.origin,
         ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
         ...(input.featureBranch ? { featureBranch: true } : {}),
         ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
@@ -273,6 +351,8 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
       remoteName: string;
       protocol: SourceControlCloneProtocol;
     }) => {
+      const gate = sourceControlMutationGate(scope, "sourceControl.publishRepository");
+      if (gate.kind === "refused") return gate.result;
       const target = resolveScope(scope);
       if (target === null) {
         return AsyncResult.failure<never, VcsActionUnavailableError>(
@@ -290,6 +370,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
         input: {
           cwd: target.cwd,
           ...input,
+          ...gate.origin,
         },
       });
     },

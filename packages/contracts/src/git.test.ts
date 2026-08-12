@@ -14,6 +14,7 @@ const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
   GitPreparePullRequestThreadInput,
 );
 const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedActionInput);
+const encodeRunStackedActionInput = Schema.encodeSync(GitRunStackedActionInput);
 const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 
@@ -83,6 +84,23 @@ describe("GitRunStackedActionInput", () => {
 
     expect(parsed.actionId).toBe("action-1");
     expect(parsed.action).toBe("create_pr");
+    // An unscoped caller sends no originating conversation at all, and the
+    // field stays absent rather than decoding to null.
+    expect(parsed).not.toHaveProperty("originThreadId");
+  });
+
+  it("carries the originating thread when the caller has one", () => {
+    // Which conversation asked is the only thing that distinguishes a Navigator
+    // request from a coding one: a `cwd` is shared by both.
+    const parsed = decodeRunStackedActionInput({
+      actionId: "action-1",
+      cwd: "/repo",
+      action: "commit_push",
+      originThreadId: "thread-1",
+    });
+
+    expect(parsed.originThreadId).toBe("thread-1");
+    expect(encodeRunStackedActionInput(parsed)).toMatchObject({ originThreadId: "thread-1" });
   });
 });
 

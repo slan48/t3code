@@ -193,6 +193,7 @@ import {
   SourceControlRepositoryError,
   SourceControlRepositoryInfo,
   SourceControlRepositoryLookupInput,
+  SourceControlThreadForbiddenError,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 
@@ -482,7 +483,13 @@ export const WsSourceControlPublishRepositoryRpc = Rpc.make(
   {
     payload: SourceControlPublishRepositoryInput,
     success: SourceControlPublishRepositoryResult,
-    error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+    error: Schema.Union([
+      SourceControlRepositoryError,
+      // Refused because of the conversation it came from, before anything was
+      // created or pushed.
+      SourceControlThreadForbiddenError,
+      EnvironmentAuthorizationError,
+    ]),
   },
 );
 
@@ -555,7 +562,13 @@ export const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
 export const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   payload: GitRunStackedActionInput,
   success: GitActionProgressEvent,
-  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitManagerServiceError,
+    // Refused because of the conversation it came from, before any Git command
+    // runs. Distinct from a Git failure: nothing was attempted.
+    SourceControlThreadForbiddenError,
+    EnvironmentAuthorizationError,
+  ]),
   stream: true,
 });
 

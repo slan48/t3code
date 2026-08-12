@@ -35,6 +35,16 @@ export interface ThreadCapabilities {
   readonly canRevertCheckpoint: boolean;
   /** Diff/review actions that start a repository mutation. */
   readonly canStartRepositoryMutation: boolean;
+  /**
+   * The chat header's Git control: commit, push, create PR, pull, init and
+   * publish repository.
+   *
+   * Every one of those writes to the repository or to a hosting provider, so
+   * the whole control goes rather than individual menu items — a Navigator
+   * conversation has no checkout of its own to commit. Read-only Git surfaces
+   * (status, diff, the file tree) are unaffected and stay.
+   */
+  readonly canUseSourceControlActions: boolean;
   /** Answer a provider approval with `accept` / `acceptForSession`. */
   readonly canAcceptApprovals: boolean;
   /**
@@ -58,6 +68,7 @@ export const CODING_CAPABILITIES: ThreadCapabilities = {
   canRunProjectScripts: true,
   canRevertCheckpoint: true,
   canStartRepositoryMutation: true,
+  canUseSourceControlActions: true,
   canAcceptApprovals: true,
   canDeclineApprovals: true,
   canConverse: true,
@@ -80,6 +91,7 @@ const NAVIGATOR_CAPABILITIES: ThreadCapabilities = {
   canRunProjectScripts: false,
   canRevertCheckpoint: false,
   canStartRepositoryMutation: false,
+  canUseSourceControlActions: false,
   canAcceptApprovals: false,
   canDeclineApprovals: true,
   canConverse: true,

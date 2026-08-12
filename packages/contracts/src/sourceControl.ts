@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { VcsDriverKind } from "./vcs.ts";
 
 export const SourceControlProviderKind = Schema.Literals([
@@ -87,6 +87,15 @@ export const SourceControlPublishRepositoryInput = Schema.Struct({
   visibility: SourceControlRepositoryVisibility,
   remoteName: Schema.optional(TrimmedNonEmptyString),
   protocol: Schema.optional(SourceControlCloneProtocol),
+  /**
+   * The durable thread this publish was started from, when there is one.
+   *
+   * Publishing creates a remote repository and pushes to it. Same reasoning as
+   * `GitRunStackedActionInput.originThreadId`: which conversation asked is the
+   * only thing that distinguishes a Navigator request from a coding one, and
+   * `cwd` cannot.
+   */
+  originThreadId: Schema.optional(ThreadId),
 });
 export type SourceControlPublishRepositoryInput = typeof SourceControlPublishRepositoryInput.Type;
 
@@ -165,6 +174,45 @@ export class SourceControlProviderError extends Schema.TaggedErrorClass<SourceCo
 ) {
   override get message(): string {
     return `Source control provider ${this.provider} failed in ${this.operation}: ${this.detail}`;
+  }
+}
+
+/**
+ * A repository mutation refused because of the conversation it came from.
+ *
+ * Not an authorization failure: the client session holds the operate scope it
+ * needs, and asking for a wider one would not help. Not a Git failure either —
+ * nothing was attempted. It is a policy answer about the originating thread,
+ * and it is its own error so a client can say which conversation was refused
+ * and why rather than reporting a mysterious Git problem.
+ *
+ * `unknown_thread` is the fail-safe branch: a request naming a thread the
+ * server cannot resolve is refused, because treating it as unscoped would make
+ * an unresolvable id the way around the rule. `thread_lookup_failed` is the
+ * same instinct applied to the read model being unavailable — a server that
+ * cannot say which conversation asked does not commit on its behalf.
+ */
+export const SourceControlThreadForbiddenReason = Schema.Literals([
+  "navigator_thread",
+  "unknown_thread",
+  "thread_lookup_failed",
+]);
+export type SourceControlThreadForbiddenReason = typeof SourceControlThreadForbiddenReason.Type;
+
+export class SourceControlThreadForbiddenError extends Schema.TaggedErrorClass<SourceControlThreadForbiddenError>()(
+  "SourceControlThreadForbiddenError",
+  {
+    /** The mutation that was refused, e.g. `git.runStackedAction`. */
+    operation: TrimmedNonEmptyString,
+    reason: SourceControlThreadForbiddenReason,
+    /** Null only when a caller sent no thread at all. */
+    threadId: Schema.NullOr(ThreadId),
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Source control operation ${this.operation} is not allowed from this conversation: ${this.detail}`;
   }
 }
 

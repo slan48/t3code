@@ -73,6 +73,7 @@ import {
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { requireSourceControlMutationAllowed } from "./orchestration/sourceControlThreadPolicy.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import {
@@ -1607,9 +1608,19 @@ const makeWsRpcLayer = (
         [WS_METHODS.sourceControlPublishRepository]: (input) =>
           observeRpcEffect(
             WS_METHODS.sourceControlPublishRepository,
-            sourceControlRepositories
-              .publishRepository(input)
-              .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            // The gate comes first, so a refused conversation never reaches the
+            // provider that would create the remote and push to it.
+            requireSourceControlMutationAllowed({
+              projectionSnapshotQuery,
+              operation: WS_METHODS.sourceControlPublishRepository,
+              originThreadId: input.originThreadId,
+            }).pipe(
+              Effect.andThen(
+                sourceControlRepositories
+                  .publishRepository(input)
+                  .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+              ),
+            ),
             {
               "rpc.aggregate": "source-control",
             },
@@ -1792,23 +1803,37 @@ const makeWsRpcLayer = (
         [WS_METHODS.gitRunStackedAction]: (input) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
-            Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
-                  actionId: input.actionId,
-                  progressReporter: {
-                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
-                  },
-                })
-                .pipe(
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) => Queue.failCause(queue, cause),
-                    onSuccess: () =>
-                      refreshGitStatus(input.cwd).pipe(
-                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
+            // Commit, push and PR are repository mutations. The gate resolves
+            // the originating conversation and refuses before the stream that
+            // would run Git is even opened, so a Navigator request costs the
+            // repository nothing.
+            Stream.unwrap(
+              requireSourceControlMutationAllowed({
+                projectionSnapshotQuery,
+                operation: WS_METHODS.gitRunStackedAction,
+                originThreadId: input.originThreadId,
+              }).pipe(
+                Effect.as(
+                  Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
+                    gitWorkflow
+                      .runStackedAction(input, {
+                        actionId: input.actionId,
+                        progressReporter: {
+                          publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                        },
+                      })
+                      .pipe(
+                        Effect.matchCauseEffect({
+                          onFailure: (cause) => Queue.failCause(queue, cause),
+                          onSuccess: () =>
+                            refreshGitStatus(input.cwd).pipe(
+                              Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
+                            ),
+                        }),
                       ),
-                  }),
+                  ),
                 ),
+              ),
             ),
             { "rpc.aggregate": "vcs" },
           ),

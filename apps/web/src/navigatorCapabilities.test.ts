@@ -30,6 +30,10 @@ describe("navigator capabilities", () => {
       canRunProjectScripts: false,
       canRevertCheckpoint: false,
       canStartRepositoryMutation: false,
+      // Commit, push, create PR, pull, init and publish repository all write
+      // to the repository or to a hosting provider. A planning conversation
+      // has no checkout of its own to write to.
+      canUseSourceControlActions: false,
       // Clearing a pending request is explicitly allowed by the server, and
       // blocking it would strand a conversation with an unanswerable question.
       canAcceptApprovals: false,
