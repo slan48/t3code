@@ -12,7 +12,10 @@ import type {
 } from "@t3tools/contracts";
 import { PeerLoopCommandRefusedError } from "@t3tools/contracts";
 import { peerLoopResumeCursor } from "@t3tools/client-runtime/state/peer-loop-reducer";
+import { rechunkPeerLoopEvents } from "@t3tools/client-runtime/state/peer-loop";
 import * as Cause from "effect/Cause";
+import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { AtomRegistry, Atom } from "effect/unstable/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -30,7 +33,7 @@ import {
 } from "./peerLoop";
 import { peerLoopFailure } from "./peerLoopCommands";
 import { NO_PROJECTS_ATOM, peerLoopProjectsAtomFor } from "../routes/peer-loop.index";
-import { describeControls } from "~/peerLoopPresentation";
+import { describeControls, describeOwnerDecision } from "~/peerLoopPresentation";
 
 const runId = "run-1";
 
@@ -73,6 +76,42 @@ const attached = (eventHighWaterMark = 5, id = runId): PeerLoopSubscriptionEvent
   snapshot: {
     runId: id,
     state: runState(),
+    control: {
+      available: true,
+      reason: "live_in_this_bridge",
+      liveWriter: null,
+      resumable: false,
+    },
+    eventHighWaterMark,
+    replayFromSeq: 0,
+    live: true,
+  },
+});
+
+/**
+ * The snapshot a run that has stopped for its owner actually carries.
+ *
+ * The reported failure was this one rendering as a raw id with no question, no
+ * options and dead controls, so the regression uses the real shape rather than
+ * a working run that would hide it.
+ */
+const attachedOwnerRequired = (eventHighWaterMark = 5, id = runId): PeerLoopSubscriptionEvent => ({
+  kind: "run-attached",
+  runId: id,
+  snapshot: {
+    runId: id,
+    state: runState({
+      runId: id,
+      state: "owner_required",
+      haltReason: { kind: "OWNER_REQUIRED", message: "Push or keep local?" },
+      lastReviewerDecision: {
+        decision: "OWNER_REQUIRED",
+        summary: "The branch is ready but publishing it is not mine to decide.",
+        ownerQuestion: "Push this branch to origin, or keep it local?",
+        whyOwnerIsRequired: "Pushing is an outward-facing action the owner has to approve.",
+        options: ["Push to origin", "Keep it local"],
+      },
+    }),
     control: {
       available: true,
       reason: "live_in_this_bridge",
@@ -836,6 +875,212 @@ describe("Peer Loop observation disposal", () => {
       expect(events.active()).toBe(0);
       registry.dispose();
     }
+  });
+});
+
+/**
+ * A subscription that is a real stream, delivered the way the socket delivers.
+ *
+ * The fake above pushes one `setSelf` per event, which is a stream that has
+ * already been split into single-item chunks. THE REAL ONE IS NOT SPLIT. The
+ * atom's stream adapter pulls whatever has arrived as one array and keeps only
+ * its last element, so the shape that matters — a burst that lands together —
+ * is only reachable by driving an actual `Stream` through an actual stream
+ * atom, which is what this does. `transform` is the production function, not a
+ * local copy: take the rechunk out of `rechunkPeerLoopEvents` and these fail.
+ */
+function makeStreamedEvents(
+  transform: (
+    stream: Stream.Stream<PeerLoopSubscriptionEvent>,
+  ) => Stream.Stream<PeerLoopSubscriptionEvent>,
+) {
+  const stats = new Map<string, FakeSubscription>();
+  const releases = new Map<string, (events: readonly PeerLoopSubscriptionEvent[]) => void>();
+
+  const family = Atom.family((key: string) =>
+    Atom.make((get): Stream.Stream<PeerLoopSubscriptionEvent> => {
+      const current = stats.get(key) ?? { opened: 0, disposed: 0 };
+      stats.set(key, { ...current, opened: current.opened + 1 });
+      // The burst is withheld until the test releases it, so it lands on a
+      // subscription that is already live — as it does in the browser — rather
+      // than during this atom's own first computation.
+      let release: (events: readonly PeerLoopSubscriptionEvent[]) => void = () => undefined;
+      const arrival = new Promise<readonly PeerLoopSubscriptionEvent[]>((resolve) => {
+        release = resolve;
+      });
+      releases.set(key, release);
+      get.addFinalizer(() => {
+        const at = stats.get(key) ?? { opened: 0, disposed: 0 };
+        stats.set(key, { ...at, disposed: at.disposed + 1 });
+        if (releases.get(key) === release) releases.delete(key);
+      });
+      return transform(
+        Stream.unwrap(
+          Effect.map(
+            Effect.promise(() => arrival),
+            // ONE CHUNK CARRYING EVERYTHING. That is the shape the socket
+            // delivers and the shape the atom adapter used to collapse.
+            (events) => Stream.fromIterable(events),
+          ),
+        ),
+      );
+    }).pipe(Atom.setIdleTTL(0), Atom.withLabel(`streamed-peer-loop-events:${key}`)),
+  ) as unknown as (
+    key: string,
+  ) => Atom.Atom<AsyncResult.AsyncResult<PeerLoopSubscriptionEvent, unknown>>;
+
+  const id = (environmentId: unknown, run: string, afterSeq: number) =>
+    `${String(environmentId)}|${run}|${afterSeq}`;
+
+  return {
+    atom: (environmentId: unknown, run: string, afterSeq: number) =>
+      family(id(environmentId, run, afterSeq)),
+    stats: (environmentId: unknown, run: string, afterSeq: number) =>
+      stats.get(id(environmentId, run, afterSeq)) ?? { opened: 0, disposed: 0 },
+    active: (): number =>
+      [...stats.values()].reduce((total, entry) => total + entry.opened - entry.disposed, 0),
+    /** The whole burst at once — no read, no render, no gap between items. */
+    burst: (
+      environmentId: unknown,
+      run: string,
+      afterSeq: number,
+      events: readonly PeerLoopSubscriptionEvent[],
+    ): void => {
+      const release = releases.get(id(environmentId, run, afterSeq));
+      if (release === undefined) throw new Error(`no open subscription for ${run}`);
+      release(events);
+    },
+    opened: (environmentId: unknown, run: string, afterSeq: number): boolean =>
+      releases.has(id(environmentId, run, afterSeq)),
+  } as const;
+}
+
+/**
+ * Opening the page, and opening it again.
+ *
+ * THE SERVER SENDS A BURST, NOT A CONVERSATION. `subscribeEvents` concatenates
+ * the transport fact, the `run-attached` snapshot, `run-synced` when the attach
+ * was already caught up, and then the whole replayed backlog — all of it ready
+ * at once. Nothing pauses between the items and nothing waits for a browser to
+ * paint, so they arrive together and the atom pulls them as one chunk.
+ *
+ * That is what the page was losing: everything but the final item, which is why
+ * a run that had stopped for its owner rendered as a raw id, Idle, with partial
+ * activity, no question, no options and dead controls.
+ */
+describe("Peer Loop detail entry and re-entry", () => {
+  const detailBurst = (run: string): readonly PeerLoopSubscriptionEvent[] => [
+    {
+      kind: "transport",
+      transport: { state: "connected", changedAt: "", detail: null, protocolVersion: 1 },
+    },
+    attachedOwnerRequired(4, run),
+    runEvent(1, true, run),
+    runEvent(2, true, run),
+    runEvent(3, true, run),
+    runEvent(4, true, run),
+    { kind: "run-synced", runId: run, afterSeq: 4, eventHighWaterMark: 4 },
+  ];
+
+  let streamedCount = 0;
+
+  /** The same harness shape, over the streamed subscription. */
+  const streamedHarness = (environmentIdAtom: Atom.Atom<typeof ENV_A | null>) => {
+    streamedCount += 1;
+    const run = `${runId}-streamed-${streamedCount}`;
+    const events = makeStreamedEvents(rechunkPeerLoopEvents);
+    const atoms = createPeerLoopRunObservationAtoms({
+      environmentIdAtom,
+      eventsAtom: (environmentId, name, afterSeq) => events.atom(environmentId, name, afterSeq),
+    });
+    const registry = AtomRegistry.make();
+    return {
+      events,
+      atoms,
+      registry,
+      run,
+      keyA: { environmentId: ENV_A, runId: run } as const,
+      read: () => registry.get(atoms.observation(run)),
+    } as const;
+  };
+
+  /** Assert everything the detail page needs, from one observation. */
+  const expectAuthoritative = (observation: ReturnType<typeof streamedHarness>["read"]) => {
+    const value = observation();
+    // The subscription's own snapshot: run state, project label and controls.
+    expect(value.view.state?.state).toBe("owner_required");
+    expect(value.view.state?.projectPath).toBe("/repos/demo");
+    expect(value.view.control?.available).toBe(true);
+    expect(value.empty).toBe(false);
+    // Every replayed item, in order, none coalesced away.
+    expect(value.view.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+    expect(value.view.afterSeq).toBe(4);
+    expect(value.view.needsResync).toBe(false);
+    // The escalated question, its reasons and its options reached the surface.
+    expect(describeOwnerDecision(value.view)).toEqual({
+      question: "Push this branch to origin, or keep it local?",
+      why: "Pushing is an outward-facing action the owner has to approve.",
+      options: ["Push to origin", "Keep it local"],
+    });
+    // And the controls the page offers are usable rather than dead.
+    expect(describeControls(value.view)).toMatchObject({
+      canSendOwnerMessage: true,
+      canPause: true,
+    });
+  };
+
+  it("folds a whole ordered burst that arrives with no read between the items", async () => {
+    const { events, atoms, registry, run, read } = streamedHarness(envAtom());
+    registry.mount(atoms.observation(run));
+    read();
+    await vi.waitFor(() => expect(events.opened(ENV_A, run, 0)).toBe(true));
+
+    events.burst(ENV_A, run, 0, detailBurst(run));
+    await vi.waitFor(() => expect(read().view.afterSeq).toBe(4));
+
+    expectAuthoritative(read);
+    // One mount, one subscription: the snapshot came from this stream and no
+    // second attach was issued to get it.
+    expect(events.stats(ENV_A, run, 0).opened).toBe(1);
+
+    registry.dispose();
+  });
+
+  it("restores state and activity on re-entry, without an application reload", async () => {
+    const harnessed = streamedHarness(envAtom());
+    const { events, atoms, registry, run, keyA, read } = harnessed;
+
+    const unmount = registry.mount(atoms.observation(run));
+    read();
+    await vi.waitFor(() => expect(events.opened(ENV_A, run, 0)).toBe(true));
+    events.burst(ENV_A, run, 0, detailBurst(run));
+    await vi.waitFor(() => expect(read().view.afterSeq).toBe(4));
+    expectAuthoritative(read);
+
+    // Leaving the route: this exact pair is disposed and its stream stops.
+    disposePeerLoopRun(registry, atoms, keyA);
+    unmount();
+    expect(peerLoopRunStore.read(keyA)).toBe(undefined);
+    await vi.waitFor(() => expect(events.active()).toBe(0));
+
+    // Coming straight back: a fresh observation at cursor 0, and the second
+    // burst folds exactly like the first. No reload, and no reattachment at a
+    // cursor this client can no longer vouch for.
+    const remount = registry.mount(atoms.observation(run));
+    expect(registry.get(atoms.cursor(keyA))).toBe(0);
+    read();
+    await vi.waitFor(() => expect(events.opened(ENV_A, run, 0)).toBe(true));
+    events.burst(ENV_A, run, 0, detailBurst(run));
+    await vi.waitFor(() => expect(read().view.afterSeq).toBe(4));
+
+    expect(read().cursor).toBe(0);
+    expectAuthoritative(read);
+    // Two visits, two streams, both at cursor 0 and never at a discarded one.
+    expect(events.stats(ENV_A, run, 0).opened).toBe(2);
+    expect(events.stats(ENV_A, run, 4).opened).toBe(0);
+
+    remount();
+    registry.dispose();
   });
 });
 

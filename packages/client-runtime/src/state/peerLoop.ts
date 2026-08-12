@@ -11,7 +11,9 @@
  *
  * @module PeerLoopAtoms
  */
+import type { PeerLoopSubscriptionEvent } from "@t3tools/contracts";
 import { WS_METHODS } from "@t3tools/contracts";
+import * as Stream from "effect/Stream";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -40,6 +42,33 @@ export const PEER_LOOP_RUNS_POLL_MS = 5_000;
  * occupied for nobody.
  */
 export const PEER_LOOP_EVENTS_IDLE_TTL_MS = 0;
+
+/**
+ * One subscription event per chunk, on the client side of the socket.
+ *
+ * THE ATOM ADAPTER KEEPS ONLY THE LAST ITEM OF EACH CHUNK IT PULLS. That is
+ * `makeStream` in `effect/unstable/reactivity`: `step(arr)` calls `setSelf` once
+ * with `Arr.lastNonEmpty(arr)`, so every earlier element of a multi-element
+ * chunk is dropped before any fold can see it.
+ *
+ * A run's opening burst is exactly that shape. `peerLoop.subscribeEvents`
+ * concatenates the transport fact, the `run-attached` snapshot, `run-synced`
+ * when the attach was already caught up, and the whole replayed backlog, all
+ * available at once. The server rechunks its own egress to singletons, but that
+ * guarantee ends at the wire: the RPC client pulls whatever has arrived as one
+ * chunk, so the burst reaches the atom as one array and collapses to its final
+ * element — no snapshot, no state, no owner question, no controls, and only the
+ * last activity item. Rechunking here restores the guarantee at the boundary
+ * that actually loses it.
+ *
+ * Deliberately not applied to every subscription in `runtime.ts`: streams whose
+ * meaning IS "the latest value" — resource telemetry, VCS status, terminal
+ * metadata — are correct as they are and would only recompute more often. This
+ * is for the one stream whose every item is a separate durable fact.
+ */
+export const rechunkPeerLoopEvents = <E, R>(
+  stream: Stream.Stream<PeerLoopSubscriptionEvent, E, R>,
+): Stream.Stream<PeerLoopSubscriptionEvent, E, R> => Stream.rechunk(stream, 1);
 
 export function createPeerLoopEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -80,6 +109,9 @@ export function createPeerLoopEnvironmentAtoms<R, E>(
       label: "environment-data:peer-loop:events",
       tag: WS_METHODS.peerLoopSubscribeEvents,
       idleTtlMs: PEER_LOOP_EVENTS_IDLE_TTL_MS,
+      // Every item is its own durable fact, so none of them may be coalesced
+      // away by the chunk the atom adapter happens to pull. See above.
+      transform: rechunkPeerLoopEvents,
     }),
   };
 }

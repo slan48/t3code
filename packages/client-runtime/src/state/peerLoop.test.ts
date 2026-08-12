@@ -7,16 +7,21 @@
  * caching one. The polls are the opposite: their answers are worth keeping for
  * a few seconds.
  */
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import { Atom } from "effect/unstable/reactivity";
 import { describe, expect, it } from "vite-plus/test";
 
+import type { PeerLoopSubscriptionEvent } from "@t3tools/contracts";
 import { WS_METHODS } from "@t3tools/contracts";
 
 import {
   createPeerLoopEnvironmentAtoms,
   createPeerLoopEnvironmentCommands,
   PEER_LOOP_EVENTS_IDLE_TTL_MS,
+  rechunkPeerLoopEvents,
 } from "./peerLoop.ts";
 
 const environmentId = "env-1" as never;
@@ -60,6 +65,34 @@ describe("Peer Loop atom lifetimes", () => {
     expect(moved).not.toBe(first);
     expect(other).not.toBe(first);
   });
+});
+
+describe("Peer Loop event delivery", () => {
+  /**
+   * Every item reaches the fold, not just the last one that arrived together.
+   *
+   * The atom's stream adapter keeps only the final element of each chunk it
+   * pulls, so a run's opening burst — transport, `run-attached`, the whole
+   * replayed backlog — collapsed to its last item and the detail page rendered a
+   * raw run id with no state, no owner question and no controls. This asserts
+   * the delivery shape that prevents it, at the value level rather than through
+   * the reactivity layer that consumes it.
+   */
+  effectIt.effect("splits an arriving burst into one item per chunk", () =>
+    Effect.gen(function* () {
+      const items = [1, 2, 3, 4, 5];
+      const chunks = yield* rechunkPeerLoopEvents(
+        // One chunk carrying everything, which is how a burst that arrives
+        // together reaches the client.
+        Stream.fromIterable(items) as unknown as Stream.Stream<PeerLoopSubscriptionEvent>,
+      ).pipe(Stream.chunks, Stream.runCollect);
+
+      // One item per chunk, all of them, in order — so nothing can be coalesced
+      // away by an adapter that only keeps a chunk's last element.
+      expect(chunks.map((chunk) => chunk.length)).toEqual([1, 1, 1, 1, 1]);
+      expect(chunks.flatMap((chunk) => [...chunk])).toEqual(items);
+    }),
+  );
 });
 
 describe("Peer Loop commands", () => {
