@@ -420,7 +420,9 @@ export function rewindPeerLoopRun(key: PeerLoopRunKey): number {
  * beside it.
  *
  * Disposal only. Nothing is refreshed and no subscription is reopened: leaving
- * the pair is exactly when the stream should stop, not restart.
+ * the pair is exactly when the stream should stop, not restart. What it does
+ * leave behind is a note that this pair was disposed — see
+ * `reattachPeerLoopRunAfterDisposal`, which is what the next visit needs.
  */
 export function disposePeerLoopRun(
   registry: Pick<PeerLoopRestartRegistry, "get" | "set">,
@@ -436,6 +438,47 @@ export function disposePeerLoopRun(
   // recompute synchronously, and a recompute that still had the subscription's
   // last event would retain the pair again on the way out.
   peerLoopRunStore.forget(key);
+  disposedPairs.add(peerLoopRunKey(key));
+}
+
+/** Pairs whose stream was torn down and whose node may still be in the registry. */
+const disposedPairs = new Set<string>();
+
+/**
+ * Open a genuinely new subscription for a pair this session has already left.
+ *
+ * THE NODE OUTLIVES THE STREAM, BRIEFLY, AND AN IN-APP RE-ENTRY LANDS IN THAT
+ * WINDOW. `Atom.setIdleTTL(0)` removes an unobserved node, but the removal is
+ * *scheduled*; a route change unmounts the old page and mounts the new one in
+ * the same tick. So coming straight back to a run found the events node still
+ * in the registry with its stream fiber already finalized, reused it, and read
+ * a value nothing would ever update again: raw run id, Idle, no activity, dead
+ * controls, "Reading this run from Peer Loop…" forever — a halted run emits
+ * nothing further to shake it loose. Only a full browser reload, which builds a
+ * new registry, escaped it.
+ *
+ * Refreshing the pair's event atom is what makes that zombie unusable: it
+ * disposes the lifetime and marks the node stale, so the read this mount is
+ * about to do rebuilds it and attaches again.
+ *
+ * ONLY FOR A PAIR THIS SESSION ACTUALLY DISPOSED. A first visit has no node to
+ * replace, and refreshing there would tear down the subscription the mount just
+ * opened and issue a second `run.attach` for nothing. The note is consumed, so
+ * repeated mounts of the same pair refresh exactly once.
+ */
+export function reattachPeerLoopRunAfterDisposal(
+  registry: Pick<PeerLoopRestartRegistry, "get" | "refresh">,
+  atoms: PeerLoopRunObservationAtoms,
+  key: PeerLoopRunKey,
+): boolean {
+  if (!disposedPairs.delete(peerLoopRunKey(key))) return false;
+  registry.refresh(atoms.events(key, registry.get(atoms.cursor(key))));
+  return true;
+}
+
+/** Test seam: forget which pairs were disposed. */
+export function clearPeerLoopDisposalMarks(): void {
+  disposedPairs.clear();
 }
 
 /** The registry operations a restart needs. Narrow, so a test can supply them. */

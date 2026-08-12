@@ -8,6 +8,7 @@ import {
   disposePeerLoopRun,
   peerLoopObservationAtoms,
   peerLoopRunObservationAtom,
+  reattachPeerLoopRunAfterDisposal,
   restartPeerLoopObservation,
 } from "../state/peerLoop";
 import {
@@ -56,6 +57,16 @@ function PeerLoopRunRoute() {
   useEffect(() => {
     if (environmentId === null) return;
     const key = { environmentId, runId };
+    /*
+     * Coming back to a pair this session already left.
+     *
+     * The observation this route reads is disposed on the way out, but the
+     * registry removes the unobserved node on a scheduled task — and leaving
+     * and re-entering happens in one tick, so the mount above can land on the
+     * node whose stream was already finalized. This replaces it; on a first
+     * visit there is nothing to replace and it does nothing.
+     */
+    reattachPeerLoopRunAfterDisposal(registry, peerLoopObservationAtoms, key);
     return () => disposePeerLoopRun(registry, peerLoopObservationAtoms, key);
   }, [environmentId, registry, runId]);
 

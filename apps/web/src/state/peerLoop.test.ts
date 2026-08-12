@@ -10,20 +10,36 @@ import type {
   PeerLoopRunStateFile,
   PeerLoopSubscriptionEvent,
 } from "@t3tools/contracts";
-import { PeerLoopCommandRefusedError } from "@t3tools/contracts";
+import { PeerLoopCommandRefusedError, WS_METHODS } from "@t3tools/contracts";
 import { peerLoopResumeCursor } from "@t3tools/client-runtime/state/peer-loop-reducer";
-import { rechunkPeerLoopEvents } from "@t3tools/client-runtime/state/peer-loop";
+import {
+  createPeerLoopEnvironmentAtoms,
+  rechunkPeerLoopEvents,
+} from "@t3tools/client-runtime/state/peer-loop";
+import {
+  AVAILABLE_CONNECTION_STATE,
+  EnvironmentRegistry,
+  EnvironmentSupervisor,
+  PrimaryConnectionTarget,
+} from "@t3tools/client-runtime/connection";
+import type { RpcSession, WsRpcProtocolClient } from "@t3tools/client-runtime/rpc";
+import { it as effectIt } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { AtomRegistry, Atom } from "effect/unstable/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
   advancePeerLoopRun,
+  clearPeerLoopDisposalMarks,
   createPeerLoopRunObservationAtoms,
   disposePeerLoopRun,
+  reattachPeerLoopRunAfterDisposal,
   forgetPeerLoopRun,
   peerLoopRunKey,
   peerLoopRunStateCount,
@@ -151,6 +167,7 @@ const fold = (
 
 beforeEach(() => {
   peerLoopRunStore.clear();
+  clearPeerLoopDisposalMarks();
 });
 
 describe("Peer Loop run subscription fold", () => {
@@ -254,6 +271,13 @@ describe("Peer Loop run subscription fold", () => {
     expect(state.view.needsResync).toBe(false);
     expect(state.view.activity.map((entry) => entry.seq)).toEqual([1, 4]);
   });
+});
+
+const TEST_TARGET = new PrimaryConnectionTarget({
+  environmentId: "env-a" as never,
+  label: "Test environment",
+  httpBaseUrl: "https://environment.example.test",
+  wsBaseUrl: "wss://environment.example.test",
 });
 
 const ENV_A = "env-a" as never;
@@ -1174,4 +1198,262 @@ describe("Peer Loop boundary facts survive as separate values", () => {
 
     registry.dispose();
   });
+});
+
+/* --------------------------------------------- the real production atom path */
+
+/**
+ * The route's own lifecycle, over the REAL Peer Loop environment atoms.
+ *
+ * Everything above this point substitutes its own `eventsAtom`, which is enough
+ * to prove the fold but says nothing about the atom that actually holds the
+ * `peerLoop.subscribeEvents` RPC open. THE BUG LIVES IN THAT ATOM'S LIFETIME,
+ * not in the fold: leaving the detail route and coming straight back has to
+ * open a second subscription and receive the attach snapshot again, because the
+ * first subscription's snapshot and backlog were consumed and thrown away.
+ *
+ * So this builds a fake authenticated environment around
+ * `createPeerLoopEnvironmentAtoms` — the same factory `apps/web` ships — and
+ * drives the registry through mount → dispose → unmount → remount with the same
+ * atom-family identities and no new registry, which is exactly what an in-app
+ * re-entry is. A page reload would create a new registry and prove nothing.
+ */
+describe("Peer Loop detail re-entry over the real subscription atom", () => {
+  interface OpenedSubscription {
+    readonly input: { readonly runId: string; readonly afterSeq: number };
+    disposed: boolean;
+    release: (events: readonly PeerLoopSubscriptionEvent[]) => void;
+  }
+
+  const ownerRequiredAttached = (run: string): PeerLoopSubscriptionEvent => ({
+    kind: "run-attached",
+    runId: run,
+    snapshot: {
+      runId: run,
+      state: runState({
+        runId: run,
+        state: "owner_required",
+        haltReason: { kind: "OWNER_REQUIRED", message: "Publish it?" },
+        lastReviewerDecision: {
+          decision: "OWNER_REQUIRED",
+          summary: "The local commit is verified.",
+          ownerQuestion: "What should happen next with the verified local commit?",
+          whyOwnerIsRequired: "Pushing to a remote is reserved for the owner.",
+          options: ["Keep it local", "Publish it yourself"],
+        },
+      }),
+      control: {
+        available: true,
+        reason: "live_in_this_bridge",
+        liveWriter: null,
+        resumable: false,
+      },
+      eventHighWaterMark: 4,
+      replayFromSeq: 0,
+      live: true,
+    },
+  });
+
+  /**
+   * The ordered opening burst the server sends on every attach.
+   *
+   * `extraSeq` makes the second visit's replay distinguishable from the first
+   * one's leftovers: an activity list that ends at 4 could be a stale view, one
+   * that ends at 5 can only have come from a second subscription.
+   */
+  const openingBurst = (
+    run: string,
+    extraSeq: number | null = null,
+  ): ReadonlyArray<PeerLoopSubscriptionEvent> => {
+    const replayed = [1, 2, 3, 4, ...(extraSeq === null ? [] : [extraSeq])];
+    const highWaterMark = replayed[replayed.length - 1] ?? 0;
+    return [
+      {
+        kind: "transport",
+        transport: { state: "connected", changedAt: "", detail: null, protocolVersion: 1 },
+      },
+      ownerRequiredAttached(run),
+      ...replayed.map((seq) => runEvent(seq, true, run)),
+      {
+        kind: "run-synced",
+        runId: run,
+        afterSeq: highWaterMark,
+        eventHighWaterMark: highWaterMark,
+      },
+    ];
+  };
+
+  /** Deterministic: yield to the runtime until the condition holds, never sleep. */
+  const until = (predicate: () => boolean, label: string) =>
+    Effect.gen(function* () {
+      for (let attempt = 0; attempt < 1_000; attempt += 1) {
+        if (predicate()) return;
+        yield* Effect.yieldNow;
+      }
+      throw new Error(`timed out waiting for ${label}`);
+    });
+
+  effectIt.effect("reopens the subscription and restores the run on in-app re-entry", () =>
+    Effect.gen(function* () {
+      const run = `${runId}-real-subscription`;
+      const opened: Array<OpenedSubscription> = [];
+
+      const client = {
+        [WS_METHODS.peerLoopSubscribeEvents]: (input: {
+          readonly runId: string;
+          readonly afterSeq: number;
+        }) => {
+          const record: OpenedSubscription = {
+            input,
+            disposed: false,
+            release: () => undefined,
+          };
+          const arrival = new Promise<readonly PeerLoopSubscriptionEvent[]>((resolve) => {
+            record.release = resolve;
+          });
+          opened.push(record);
+          return Stream.unwrap(
+            Effect.map(
+              Effect.promise(() => arrival),
+              // One chunk carrying the whole burst, exactly as it arrives over
+              // the socket; the production transform rechunks it.
+              (events) => Stream.fromIterable(events),
+            ),
+          ).pipe(
+            Stream.ensuring(
+              Effect.sync(() => {
+                record.disposed = true;
+              }),
+            ),
+          );
+        },
+      } as unknown as WsRpcProtocolClient;
+
+      const supervisor = EnvironmentSupervisor.of({
+        target: TEST_TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(
+          Option.some({
+            client,
+            initialConfig: Effect.never,
+            ready: Effect.void,
+            probe: Effect.void,
+            closed: Effect.never,
+          } as RpcSession),
+        ),
+        prepared: yield* SubscriptionRef.make(Option.none()),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } as unknown as EnvironmentSupervisor["Service"]);
+
+      const followStream: EnvironmentRegistry["Service"]["followStream"] = (
+        _environmentId,
+        stream,
+      ) => Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+      const runStream: EnvironmentRegistry["Service"]["runStream"] = (_environmentId, stream) =>
+        Stream.provideService(stream, EnvironmentSupervisor, supervisor);
+      const run_: EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+        Effect.provideService(effect, EnvironmentSupervisor, supervisor);
+      const environmentRegistry = EnvironmentRegistry.of({
+        followStream,
+        runStream,
+        run: run_,
+      } as unknown as EnvironmentRegistry["Service"]);
+
+      // The real factory, over a runtime that resolves the fake environment.
+      const peerLoopAtoms = createPeerLoopEnvironmentAtoms(
+        Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)) as never,
+      );
+      const atoms = createPeerLoopRunObservationAtoms({
+        environmentIdAtom: Atom.make<typeof ENV_A | null>(ENV_A),
+        // THE PRODUCTION ATOM. Same family, same identity, same idle TTL.
+        eventsAtom: (environmentId, name, afterSeq) =>
+          peerLoopAtoms.events({
+            environmentId: environmentId as never,
+            input: { runId: name, afterSeq },
+          }) as never,
+      });
+      const registry = AtomRegistry.make();
+      const key = { environmentId: ENV_A, runId: run } as const;
+      const read = () => registry.get(atoms.observation(run));
+
+      /* ---------------------------------------------------- first entry */
+
+      // The route's order: the component reads/mounts the observation, then its
+      // effect body runs. Both halves, exactly as `peer-loop.$runId.tsx` does.
+      const unmountFirst = registry.mount(atoms.observation(run));
+      read();
+      const refreshedOnFirstEntry = reattachPeerLoopRunAfterDisposal(registry, atoms, key);
+      // Nothing to replace on a first visit, so no second attach is issued.
+      expect(refreshedOnFirstEntry).toBe(false);
+      yield* until(() => opened.length === 1, "the first subscription to open");
+      expect(opened[0]?.input).toEqual({ runId: run, afterSeq: 0 });
+
+      opened[0]?.release(openingBurst(run));
+      yield* until(() => read().view.activity.length === 4, "the first burst to fold");
+
+      const first = read();
+      expect(first.view.state?.state).toBe("owner_required");
+      expect(first.view.control?.available).toBe(true);
+      expect(first.view.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+      expect(describeOwnerDecision(first.view)?.options).toEqual([
+        "Keep it local",
+        "Publish it yourself",
+      ]);
+
+      /* ------------------------------------- leaving, in React's own order */
+
+      // The route effect's cleanup runs first, then the subscription drops.
+      disposePeerLoopRun(registry, atoms, key);
+      unmountFirst();
+      // Removal is scheduled, not synchronous; let the registry settle exactly
+      // as it does between a route unmount and the next route's mount.
+      yield* until(() => opened[0]?.disposed === true, "the first subscription to be disposed");
+
+      /* --------------------------------------------------- coming back */
+
+      const unmountSecond = registry.mount(atoms.observation(run));
+      read();
+      // The re-entry half of the same effect: this pair was disposed, so the
+      // node left behind by the tick it was disposed in is replaced.
+      expect(reattachPeerLoopRunAfterDisposal(registry, atoms, key)).toBe(true);
+
+      // Exactly one new subscription for the second visit, at a valid cursor.
+      yield* until(() => opened.length === 2, "the second subscription to open");
+      expect(opened.length).toBe(2);
+      expect(opened[1]?.input).toEqual({ runId: run, afterSeq: 0 });
+      expect(opened[0]?.disposed).toBe(true);
+
+      // One more replayed event than the first visit had, so the assertions
+      // below cannot pass on a stale view left over from the first one.
+      opened[1]?.release(openingBurst(run, 5));
+      yield* until(() => read().view.activity.length === 5, "the second burst to fold");
+
+      // The authoritative state is back without a reload.
+      const second = read();
+      expect(second.view.state?.state).toBe("owner_required");
+      expect(second.view.control?.available).toBe(true);
+      // Rebuilt from the second subscription, not carried over from the first.
+      expect(second.view.activity.map((entry) => entry.seq)).toEqual([1, 2, 3, 4, 5]);
+      expect(second.view.afterSeq).toBe(5);
+      expect(second.view.needsResync).toBe(false);
+      expect(second.empty).toBe(false);
+      expect(describeOwnerDecision(second.view)).toEqual({
+        question: "What should happen next with the verified local commit?",
+        why: "Pushing to a remote is reserved for the owner.",
+        options: ["Keep it local", "Publish it yourself"],
+      });
+      expect(describeControls(second.view)).toMatchObject({
+        canSendOwnerMessage: true,
+        canPause: true,
+      });
+
+      // And no third attach was issued to get any of it.
+      expect(opened.length).toBe(2);
+
+      unmountSecond();
+      registry.dispose();
+    }),
+  );
 });
