@@ -6262,6 +6262,127 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  /*
+   * The Navigator execution link is thread detail, and the socket is the only
+   * way an open conversation learns about one it did not itself just create.
+   *
+   * Nothing else recovers it: a client that stayed subscribed advances its
+   * resume cursor past the link on the next event of any kind, and both a warm
+   * remount and a catch-up resume then ask only for what came *after* that
+   * cursor. A link dropped here is dropped for the life of that cache — the
+   * proposal stays executable and a second Peer Loop run is one press away.
+   */
+  it.effect("delivers a live peer loop execution link to the subscribed thread", () =>
+    Effect.gen(function* () {
+      const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+      const liveEvents = yield* PubSub.unbounded<OrchestrationEvent>();
+      const linkedEvent = {
+        sequence: 2,
+        eventId: EventId.make("event-peer-loop-execution-linked"),
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.peer-loop-execution-linked",
+        payload: {
+          threadId: defaultThreadId,
+          proposedPlanId: "plan-1",
+          runId: "run-1",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.peer-loop-execution-linked" }>;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            streamDomainEvents: Stream.fromPubSub(liveEvents),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () =>
+              Effect.gen(function* () {
+                yield* Effect.sleep("25 millis");
+                yield* PubSub.publish(liveEvents, linkedEvent);
+                return Option.some({ snapshotSequence: 1, thread });
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      ).pipe(Effect.timeout("2 seconds"));
+
+      const [first, second] = Array.from(items);
+      assert.equal(first?.kind, "snapshot");
+      // The snapshot this client started from had no link at all, so the event
+      // is the only thing that can put one in its detail state.
+      assert.deepEqual(
+        first?.kind === "snapshot" ? [...first.snapshot.thread.peerLoopExecutions] : null,
+        [],
+      );
+      assert.equal(second?.kind, "event");
+      assert.deepEqual(second?.kind === "event" ? second.event : null, linkedEvent);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
+  );
+
+  it.effect("replays a peer loop execution link to a resuming thread subscription", () =>
+    Effect.gen(function* () {
+      const linkedEvent = {
+        sequence: 3,
+        eventId: EventId.make("event-replay-peer-loop-execution-linked"),
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.peer-loop-execution-linked",
+        payload: {
+          threadId: defaultThreadId,
+          proposedPlanId: "plan-1",
+          runId: "run-1",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.peer-loop-execution-linked" }>;
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(3),
+            readEvents: () => Stream.make(linkedEvent),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const items = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 2,
+            requestCompletionMarker: true,
+          }).pipe(Stream.take(2), Stream.runCollect),
+        ),
+      );
+
+      // A warm client resuming from its own cursor gets the link it missed
+      // rather than resuming past it.
+      const [first, second] = Array.from(items);
+      assert.equal(first?.kind, "event");
+      assert.deepEqual(first?.kind === "event" ? first.event : null, linkedEvent);
+      assert.equal(second?.kind, "synchronized");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("subscribeShell sends a fresh snapshot instead of replaying a large gap", () =>
     Effect.gen(function* () {
       let readEventsCalls = 0;
