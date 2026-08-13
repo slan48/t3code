@@ -120,6 +120,9 @@ export const RPC_REQUIRED_SCOPES = {
   // Executing a proposal starts a Peer Loop run: it makes agents act and spends
   // subscription capacity, exactly like `startRun` it calls underneath.
   [WS_METHODS.peerLoopExecuteProposal]: AuthOrchestrationOperateScope,
+  // Answering a run's owner decision releases a halted loop: agents act again,
+  // exactly as they do for the `sendOwnerMessage` it calls underneath.
+  [WS_METHODS.peerLoopAnswerOwnerDecision]: AuthOrchestrationOperateScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

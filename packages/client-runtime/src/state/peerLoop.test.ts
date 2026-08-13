@@ -106,6 +106,7 @@ describe("Peer Loop commands", () => {
       commands.pauseRun,
       commands.recoverRun,
       commands.executeProposal,
+      commands.answerOwnerDecision,
     ]) {
       expect(command).toBeDefined();
     }
@@ -117,5 +118,14 @@ describe("Peer Loop commands", () => {
     // derive both. There is no UI on the second one yet.
     expect(commands.executeProposal).not.toBe(commands.startRun);
     expect(WS_METHODS.peerLoopExecuteProposal).toBe("peerLoop.executeProposal");
+  });
+
+  it("offers answering an owner decision, distinct from messaging a run", () => {
+    // `sendOwnerMessage` carries whatever text a caller supplies;
+    // `answerOwnerDecision` carries a fingerprint and an index and lets the
+    // server resolve the text from the run's own fresh decision. Keeping them
+    // as separate commands is what lets the server authorize them separately.
+    expect(commands.answerOwnerDecision).not.toBe(commands.sendOwnerMessage);
+    expect(WS_METHODS.peerLoopAnswerOwnerDecision).toBe("peerLoop.answerOwnerDecision");
   });
 });

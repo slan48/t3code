@@ -45,6 +45,7 @@ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
+import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as NavigatorExecutionContext from "./peerLoop/NavigatorExecutionContext.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -390,6 +391,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       PeerLoopExecutionCoordinator.layer,
+      PeerLoopOwnerDecisionCoordinator.layer,
       NavigatorExecutionContext.layer,
       ServerSettingsLayerLive,
     ),

@@ -75,6 +75,7 @@ import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngi
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { requireSourceControlMutationAllowed } from "./orchestration/sourceControlThreadPolicy.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
+import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
@@ -378,6 +379,8 @@ const makeWsRpcLayer = (
       const peerLoop = yield* PeerLoopService.PeerLoopService;
       const peerLoopExecutionCoordinator =
         yield* PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator;
+      const peerLoopOwnerDecisionCoordinator =
+        yield* PeerLoopOwnerDecisionCoordinator.PeerLoopOwnerDecisionCoordinator;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -2043,6 +2046,15 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.peerLoopExecuteProposal,
             peerLoopExecutionCoordinator.executeProposal(input),
+            { "rpc.aggregate": "peer-loop" },
+          ),
+        // Also not a pass-through: T3 Code proves the run belongs to the
+        // conversation, re-reads the run, and resolves the option text from
+        // that reading. Peer Loop's own errors still come back untouched.
+        [WS_METHODS.peerLoopAnswerOwnerDecision]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.peerLoopAnswerOwnerDecision,
+            peerLoopOwnerDecisionCoordinator.answerOwnerDecision(input),
             { "rpc.aggregate": "peer-loop" },
           ),
         [WS_METHODS.previewList]: (input) =>

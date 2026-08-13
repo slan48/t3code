@@ -93,9 +93,12 @@ import {
   PeerLoopSubscriptionEvent,
 } from "./peerLoop.ts";
 import {
+  PeerLoopAnswerOwnerDecisionInput,
+  PeerLoopAnswerOwnerDecisionResult,
   PeerLoopExecuteProposalInput,
   PeerLoopExecuteProposalResult,
   PeerLoopExecutionCoordinationError,
+  PeerLoopOwnerDecisionCoordinationError,
 } from "./peerLoopExecution.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
@@ -269,6 +272,7 @@ export const WS_METHODS = {
   peerLoopRecoverRun: PEER_LOOP_WS_METHODS.recoverRun,
   peerLoopSubscribeEvents: PEER_LOOP_WS_METHODS.subscribeEvents,
   peerLoopExecuteProposal: PEER_LOOP_WS_METHODS.executeProposal,
+  peerLoopAnswerOwnerDecision: PEER_LOOP_WS_METHODS.answerOwnerDecision,
 
   // Server meta
   serverProbe: "server.probe",
@@ -913,6 +917,25 @@ export const WsPeerLoopExecuteProposalRpc = Rpc.make(WS_METHODS.peerLoopExecuteP
   ]),
 });
 
+/**
+ * Answering a linked run's owner decision.
+ *
+ * Same shape of contract as executing a proposal, and the same reason for it:
+ * the three error families stay apart. Peer Loop's own refusals and timeouts
+ * travel as themselves, a structurally invalid request is its own sanitized
+ * coordination error, and a view that has gone stale is not an error at all —
+ * it is the `refresh-required` outcome inside the success type.
+ */
+export const WsPeerLoopAnswerOwnerDecisionRpc = Rpc.make(WS_METHODS.peerLoopAnswerOwnerDecision, {
+  payload: PeerLoopAnswerOwnerDecisionInput,
+  success: PeerLoopAnswerOwnerDecisionResult,
+  error: Schema.Union([
+    PeerLoopError,
+    PeerLoopOwnerDecisionCoordinationError,
+    EnvironmentAuthorizationError,
+  ]),
+});
+
 export const WsPeerLoopSubscribeEventsRpc = Rpc.make(WS_METHODS.peerLoopSubscribeEvents, {
   payload: PeerLoopSubscribeEventsInput,
   success: PeerLoopSubscriptionEvent,
@@ -1026,6 +1049,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPeerLoopRecoverRunRpc,
   WsPeerLoopSubscribeEventsRpc,
   WsPeerLoopExecuteProposalRpc,
+  WsPeerLoopAnswerOwnerDecisionRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

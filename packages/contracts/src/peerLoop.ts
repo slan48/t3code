@@ -927,6 +927,15 @@ export const PEER_LOOP_WS_METHODS = {
    * types; this module stays a pure bridge contract.
    */
   executeProposal: "peerLoop.executeProposal",
+  /**
+   * Answer the question a linked run has stopped to ask its owner.
+   *
+   * Coordination, not a second owner-message path: the server proves the run
+   * belongs to the thread, re-reads the run, and resolves the option text from
+   * what it just read. A client sends a fingerprint and an index and nothing
+   * else. Its input and result live in `peerLoopExecution.ts`.
+   */
+  answerOwnerDecision: "peerLoop.answerOwnerDecision",
 } as const;
 
 /**

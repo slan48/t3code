@@ -162,5 +162,21 @@ export function createPeerLoopEnvironmentCommands<R, E>(
       label: "peer-loop:execute-proposal",
       tag: WS_METHODS.peerLoopExecuteProposal,
     }),
+    /**
+     * Answer the question a linked run has stopped to ask.
+     *
+     * Sends a thread, a run, the fingerprint of the decision the owner was
+     * looking at, and which option they picked — never the option's text. The
+     * server proves the run belongs to the conversation, re-reads the run, and
+     * resolves the text from that reading, so a stale view cannot answer a
+     * question the run has already left.
+     *
+     * The result distinguishes a delivered answer from a view that needs
+     * refreshing; neither is an error. There is no UI on this yet.
+     */
+    answerOwnerDecision: createEnvironmentRpcCommand(runtime, {
+      label: "peer-loop:answer-owner-decision",
+      tag: WS_METHODS.peerLoopAnswerOwnerDecision,
+    }),
   };
 }

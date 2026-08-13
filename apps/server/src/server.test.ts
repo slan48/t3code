@@ -95,6 +95,7 @@ import * as ServerSettings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
+import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -749,6 +750,11 @@ const buildAppUnderTest = (options?: {
           // executing a proposal must never start one from a test.
           Layer.mock(PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator)({
             executeProposal: () =>
+              Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+          }),
+          // And answering a decision must never reach a bridge from a test.
+          Layer.mock(PeerLoopOwnerDecisionCoordinator.PeerLoopOwnerDecisionCoordinator)({
+            answerOwnerDecision: () =>
               Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
           }),
           Layer.mock(PortScanner.PortDiscovery)({
