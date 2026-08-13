@@ -50,11 +50,14 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   describeExecution,
   describeExecutionDetail,
+  describeOwnerDecisionAction,
   executionSnapshotIsUseful,
   selectNavigatorSnapshotAtom,
   type NavigatorExecutionDetail,
   type NavigatorExecutionPresentation,
 } from "~/navigatorExecution";
+import { peerLoopOwnerDecisionFingerprint } from "@t3tools/shared/peerLoopDecisionFingerprint";
+
 import { consumeNavigatorConfirmation, routeNavigatorSend } from "~/navigatorConfirmation";
 import { deriveNavigatorExecution } from "~/components/ChatView.logic";
 import {
@@ -749,6 +752,8 @@ describe("a child execution whose run keeps moving", () => {
   const SECOND_OWNER_REVISION = "2026-03-01T10:07:00.000Z";
 
   const RUN_ID = "run-77";
+  /** The conversation this run is linked to, for the answerable-decision view. */
+  const DECISION_THREAD = ThreadId.make("thread-navigator-decision");
   const SNAPSHOT_LINK: OrchestrationPeerLoopExecution = {
     runId: RUN_ID,
     proposedPlanId: PLAN_ID as OrchestrationProposedPlanId,
@@ -1093,6 +1098,27 @@ describe("a child execution whose run keeps moving", () => {
         pending = null;
       },
       settled: (): boolean => committed === null || !registry.get(committed.atom).waiting,
+      /**
+       * The explicit re-read an answered decision performs.
+       *
+       * Exactly what `useNavigatorExecutionSnapshot`'s `refresh` does, and
+       * deliberately outside the revision ledger: a request this client just
+       * made changed the run, so waiting for a summary to move would be waiting
+       * for the wrong thing.
+       */
+      refreshNow: (): void => {
+        registry.refresh(current().atom);
+      },
+      /** The decision the card would offer to answer, if any. */
+      action: () =>
+        describeOwnerDecisionAction({
+          snapshot: snapshotOf(current()),
+          threadId: DECISION_THREAD,
+          runId: current().presentation.runId,
+          linkedToThread: true,
+          capable: true,
+          fingerprintOf: peerLoopOwnerDecisionFingerprint,
+        }),
       /** Exactly what the card renders under its status line. */
       detail: (): NavigatorExecutionDetail =>
         describeExecutionDetail({
@@ -1326,6 +1352,91 @@ describe("a child execution whose run keeps moving", () => {
       // Nothing on screen, nothing retained.
       expect(snapshotRefreshLedger.size()).toBe(0);
       harness.registry.dispose();
+    }),
+  );
+
+  effectIt.effect("replaces a stale question with the current one, revision or not", () =>
+    Effect.gen(function* () {
+      /*
+       * THE STALE-ANSWER PATH, END TO END.
+       *
+       * The owner clicks an option on Q1; the Reviewer has already moved to Q2.
+       * The server answers `refresh-required` and sends nothing. What the card
+       * must then do is re-read the RUN, not wait for the summary: the run
+       * list's own `updatedAt` may not have reached this client at all, and the
+       * revision ledger — correctly — will not re-read for a revision it has
+       * already read. The explicit refresh is what makes Q2 appear.
+       */
+      const harness = yield* bridge(asking(Q1, OWNER_REVISION));
+      const timeline = card({ harness });
+
+      commit([timeline], [waitingOnOwner(OWNER_REVISION, "Which database?")]);
+      yield* until(() => harness.attaches.length === 1 && timeline.settled(), "the first reading");
+      expect(timeline.action()?.options.map((option) => option.label)).toEqual([
+        "Primary",
+        "Replica",
+      ]);
+      const firstFingerprint = timeline.action()?.fingerprint;
+
+      // The Reviewer asks something else. The run list has not moved yet.
+      harness.serve(asking(Q2, OWNER_REVISION));
+      timeline.refreshNow();
+      yield* until(
+        () => harness.attaches.length === 2 && timeline.settled(),
+        "the re-read an answered click performs",
+      );
+
+      // Same summary revision, and the card is nevertheless showing Q2.
+      expect(timeline.detail()).toMatchObject({
+        kind: "owner-required",
+        decision: { question: Q2 },
+      });
+      expect(timeline.action()?.fingerprint).not.toBe(firstFingerprint);
+      navigatorExecutionStore.reset();
+    }),
+  );
+
+  effectIt.effect("shows the run's next state after an answer that landed", () =>
+    Effect.gen(function* () {
+      // The other outcome: the answer was delivered and the run resumed. The
+      // same explicit re-read replaces the question with what it is doing now,
+      // and the card offers nothing to answer.
+      const harness = yield* bridge(asking(Q1, OWNER_REVISION));
+      const timeline = card({ harness });
+
+      commit([timeline], [waitingOnOwner(OWNER_REVISION, "Which database?")]);
+      yield* until(() => harness.attaches.length === 1 && timeline.settled(), "the first reading");
+      expect(timeline.action()).not.toBeNull();
+
+      harness.serve(completed);
+      timeline.refreshNow();
+      yield* until(
+        () => harness.attaches.length === 2 && timeline.settled(),
+        "the re-read after the answer landed",
+      );
+      // No decision to answer any more, and no error anywhere on the card.
+      expect(timeline.action()).toBeNull();
+      navigatorExecutionStore.reset();
+    }),
+  );
+
+  effectIt.effect("offers no answer while an owner response is already queued", () =>
+    Effect.gen(function* () {
+      const queued = asking(Q1, OWNER_REVISION);
+      const harness = yield* bridge({
+        ...queued,
+        queuedOwnerMessages: [
+          { id: "queued-1", text: "Primary", queuedAt: "2026-03-01T10:02:00.000Z" },
+        ],
+      } as never);
+      const timeline = card({ harness });
+
+      commit([timeline], [waitingOnOwner(OWNER_REVISION, "Which database?")]);
+      yield* until(() => harness.attaches.length === 1 && timeline.settled(), "the first reading");
+      // The question is still shown; there is simply nothing to press.
+      expect(timeline.detail()).toMatchObject({ kind: "owner-required" });
+      expect(timeline.action()).toBeNull();
+      navigatorExecutionStore.reset();
     }),
   );
 

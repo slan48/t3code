@@ -55,6 +55,22 @@ export interface ThreadCapabilities {
    * with a question it could never answer.
    */
   readonly canDeclineApprovals: boolean;
+  /**
+   * Answer the owner question a linked Peer Loop run has stopped on.
+   *
+   * A DIFFERENT QUESTION FROM `canAcceptApprovals`, and deliberately not the
+   * same answer. A provider approval releases *this conversation's* agent to
+   * touch the repository, which is exactly what a planning conversation must
+   * not do. This releases a Reviewer/Builder loop the owner already started
+   * from an Execution Proposal, in that run's own project — the mutation was
+   * authorized when the run was launched, and the decision belongs to the run.
+   *
+   * UI HYGIENE ONLY, and less than half of the rule. The control additionally
+   * requires a durable thread, a child execution linked to it, and a fresh
+   * structured question in the run's own snapshot; the server proves the link
+   * again and re-reads the run before anything is sent.
+   */
+  readonly canAnswerLinkedOwnerDecision: boolean;
   /** Ordinary conversation and plan refinement. Always true. */
   readonly canConverse: boolean;
 }
@@ -71,6 +87,10 @@ export const CODING_CAPABILITIES: ThreadCapabilities = {
   canUseSourceControlActions: true,
   canAcceptApprovals: true,
   canDeclineApprovals: true,
+  // A coding thread has no Execution Proposals and therefore no linked runs.
+  // There is nothing for it to answer, and offering the control would mean
+  // inventing a run to answer it against.
+  canAnswerLinkedOwnerDecision: false,
   canConverse: true,
 };
 
@@ -94,6 +114,10 @@ const NAVIGATOR_CAPABILITIES: ThreadCapabilities = {
   canUseSourceControlActions: false,
   canAcceptApprovals: false,
   canDeclineApprovals: true,
+  // The one thing a Navigator conversation may release, and only for a run it
+  // started itself. See the field's own note for why this is not the same
+  // question as accepting a provider approval.
+  canAnswerLinkedOwnerDecision: true,
   canConverse: true,
 };
 

@@ -35,6 +35,7 @@ import {
   describeExecution,
   describeExecutionDetail,
   type NavigatorExecutionDetail,
+  type NavigatorOwnerDecisionAction,
 } from "~/navigatorExecution";
 import { navigatorExecutionKey, navigatorExecutionStore } from "~/state/navigatorExecutionCommand";
 import { ProposedPlanCard } from "../chat/ProposedPlanCard";
@@ -708,6 +709,146 @@ describe("a child execution waiting on the owner", () => {
     const markup = await ownerCard({ kind: "owner-required-missing" });
     expect(markup).toContain("The Reviewer needs your decision");
     expect(markup).toContain("recorded no structured question");
+  });
+});
+
+/* ------------------------------------------ answering an owner decision */
+
+describe("the option controls on a waiting child execution", () => {
+  const decision = {
+    kind: "owner-required" as const,
+    decision: {
+      question: "What should happen next with the verified local commit?",
+      why: "Publishing is reserved for the owner.",
+      options: ["Publish it yourself.", "Keep the commit local only."],
+    },
+  };
+
+  const action: NavigatorOwnerDecisionAction = {
+    runId: "run-77",
+    threadId: THREAD_ID,
+    fingerprint: "0123456789abcdef0123456789abcdef",
+    options: [
+      { index: 0, label: "Publish it yourself." },
+      { index: 1, label: "" },
+      { index: 2, label: "Keep the commit local only." },
+    ],
+  };
+
+  const waitingCard = (input: {
+    readonly action?: NavigatorOwnerDecisionAction | null;
+    readonly answering?: boolean;
+    readonly answerFailure?: Parameters<typeof NavigatorExecutionCard>[0]["answerFailure"];
+  }) =>
+    render(
+      <NavigatorExecutionCard
+        presentation={describeExecution({
+          link: link({ runId: "run-77" }),
+          runs: [
+            summary({
+              state: "owner_required",
+              haltReason: { kind: "OWNER_REQUIRED", message: "Publish or keep local?" },
+            }),
+          ],
+          unreadable: [],
+          nowMs: NOW_MS,
+        })}
+        detail={decision}
+        action={input.action ?? null}
+        answering={input.answering ?? false}
+        answerFailure={input.answerFailure ?? null}
+      />,
+    );
+
+  it("draws a button per option, keeping the question and the reason", () => {
+    return waitingCard({ action }).then((markup) => {
+      expect(markup).toContain("The Reviewer needs your decision");
+      expect(markup).toContain("What should happen next with the verified local commit?");
+      expect(markup).toContain("Publishing is reserved for the owner.");
+      // Two buttons: the empty option is not drawn.
+      expect(markup.match(/<button/gu) ?? []).toHaveLength(2);
+      expect(markup).toContain("Publish it yourself.");
+      expect(markup).toContain("Keep the commit local only.");
+      expect(markup).toContain("exactly as the Reviewer wrote it");
+    });
+  });
+
+  it("offers nothing to press when there is no answerable decision", async () => {
+    // The question and its options still belong on screen — a card that cannot
+    // answer says so by having no controls, not by hiding the decision.
+    const markup = await waitingCard({ action: null });
+    expect(markup).toContain("What should happen next with the verified local commit?");
+    expect(markup).toContain("Publish it yourself.");
+    expect(markup).not.toContain("<button");
+  });
+
+  it("disables every option while an answer is in flight", async () => {
+    const markup = await waitingCard({ action, answering: true });
+    // Both buttons, both disabled: a second click cannot become a second
+    // answer while the first is outstanding.
+    expect(markup.match(/disabled=""/gu) ?? []).toHaveLength(2);
+    expect(markup).toContain("Sending your answer to Peer Loop");
+  });
+
+  it("shows a bounded failure beside the still-usable options", async () => {
+    const markup = await waitingCard({
+      action,
+      answerFailure: {
+        title: "Peer Loop would not take that answer",
+        detail: "Re-read the run and try again.",
+        code: "INVALID_RUN_STATE",
+      },
+    });
+    expect(markup).toContain("Peer Loop would not take that answer");
+    expect(markup).toContain("INVALID_RUN_STATE");
+    // Retryable: the buttons are still there and still enabled.
+    expect(markup.match(/<button/gu) ?? []).toHaveLength(2);
+    expect(markup).not.toContain('disabled=""');
+  });
+
+  it("renders no controls at all on a coding thread", async () => {
+    // The whole execution area is absent on a coding conversation, so there is
+    // nothing to answer with and no run to answer.
+    const markup = await render(
+      <NavigatorProposalExecution
+        context={context({
+          purpose: "coding",
+          executionsByProposal: new Map([[PLAN_ID, [link({ runId: "run-77" })]]]),
+        })}
+        proposal={proposal}
+      />,
+    );
+    expect(markup).not.toContain("<button");
+    expect(markup).not.toContain("Peer Loop");
+  });
+
+  it("still offers no way to answer from a DONE or working card", async () => {
+    for (const detail of [
+      {
+        kind: "completion",
+        completion: { summary: "s", finalState: "f" },
+        head: null,
+        branch: null,
+      },
+      { kind: "completion-missing" },
+      { kind: "loading" },
+      { kind: "none" },
+    ] as ReadonlyArray<NavigatorExecutionDetail>) {
+      const markup = await render(
+        <NavigatorExecutionCard
+          presentation={describeExecution({
+            link: link({ runId: "run-77" }),
+            runs: [summary({ state: "done" })],
+            unreadable: [],
+            nowMs: NOW_MS,
+          })}
+          detail={detail}
+          action={action}
+        />,
+      );
+      // The action only ever reaches the OWNER_REQUIRED block.
+      expect(markup, detail.kind).not.toContain("<button");
+    }
   });
 });
 

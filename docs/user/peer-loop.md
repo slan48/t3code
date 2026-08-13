@@ -166,14 +166,28 @@ about a run never touches it.
 - When the run **finishes**, ask what changed and Navigator answers from Peer
   Loop's own record: the Reviewer's summary, the final state, and the commit the
   repository was left on.
-- When the Reviewer needs **you**, Navigator can tell you the exact question, why
-  it cannot decide, and the options it offered — and then point you at the
-  execution details.
+- When the Reviewer needs **you**, the run's card in the conversation shows the
+  exact question, why it cannot decide, and a button for each option it offered.
+  Picking one answers the run and it carries on — no page reload, no waiting for
+  the next poll.
 
-Navigator reads. It never approves, resumes, recovers, pauses or sends an owner
-message, and it will tell you that rather than claim it did. **Approving,
-answering, pausing, resuming and resolving an interrupted turn all happen in the
-execution details**, using the controls described earlier on this page.
+The card sends the option you picked and nothing else: not the words on the
+button, and not anything typed in the composer. Before it delivers your answer,
+T3 Code re-reads the run and checks it is still asking that same question. If
+the Reviewer has moved on in the meantime — a second question, work resumed, the
+run finished — nothing is sent and the card simply shows you where the run
+actually is. Answering twice by clicking twice is not possible; every option is
+disabled while your answer is on its way, in both the conversation and the Plan
+sidebar.
+
+Typing a confirmation phrase never answers a question. `let's do it` and its
+siblings execute a proposal and nothing else.
+
+Everything else Navigator still only reads: it never approves, resumes, recovers,
+pauses or sends a free-text owner message, and it will tell you that rather than
+claim it did. **Approving, pausing, resuming and resolving an interrupted turn
+happen in the execution details**, using the controls described earlier on this
+page.
 
 ### When an Execute does not come back
 

@@ -231,11 +231,15 @@ export const PeerLoopAnswerOwnerDecisionResult = Schema.Union([
     outcome: Schema.Literal("refresh-required"),
     reason: PeerLoopOwnerDecisionRefreshReason,
     /**
-     * What the run is asking now, when it is still asking something.
+     * Which decision the run is on now, when it is still asking something.
      *
-     * Null when the run is not waiting on its owner at all. A surface can use
-     * this to re-render without a second round trip; it is a fingerprint, so it
-     * carries no question text.
+     * Null when the run is not waiting on its owner at all.
+     *
+     * A NAME, NOT THE DECISION. It says only that the question has changed and
+     * which one it is now — there is no text in it, so a surface cannot render
+     * the new question from this and must re-read the run's snapshot. It is
+     * useful for deciding whether a re-read is even needed and for telling two
+     * stale clicks apart, and for nothing else.
      */
     currentDecisionFingerprint: Schema.NullOr(PeerLoopDecisionFingerprint),
   }),

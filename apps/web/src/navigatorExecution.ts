@@ -621,6 +621,113 @@ export function describeExecutionDetail(input: {
     : { kind: "owner-required", decision: owner };
 }
 
+/* --------------------------------------------------- answering a decision */
+
+/**
+ * One option, and the index Peer Loop gave it.
+ *
+ * THE INDEX IS THE OPTION'S OWN, NOT ITS POSITION ON SCREEN. Presentation is
+ * allowed to bound a long label or drop an empty one; renumbering what is left
+ * would send an owner's click to a different sentence, and the server resolves
+ * the text by exactly this number out of the decision it re-reads.
+ */
+export interface NavigatorOwnerDecisionOption {
+  /** The position in Peer Loop's own `options` array. Never re-derived. */
+  readonly index: number;
+  readonly label: string;
+}
+
+/**
+ * What an owner may actually answer, from the run's own snapshot.
+ *
+ * Null whenever anything about the answer would be a guess: no fresh reading,
+ * a run that is not waiting, a waiting run with no structured question, an
+ * answer already queued, a conversation with no durable thread or no link to
+ * this run, or a purpose that may not answer at all.
+ */
+export interface NavigatorOwnerDecisionAction {
+  readonly runId: string;
+  readonly threadId: ThreadId;
+  /** Names the exact decision on screen. Recomputed server-side before use. */
+  readonly fingerprint: string;
+  /** Every option Peer Loop recorded, in its order, with its own index. */
+  readonly options: ReadonlyArray<NavigatorOwnerDecisionOption>;
+}
+
+/**
+ * The answerable decision this card is showing, or none.
+ *
+ * DERIVED FROM THE ATTACHED SNAPSHOT AND NOTHING ELSE. Not the run-list
+ * summary, which has no question in it; not the presented detail, whose text is
+ * bounded for display; not a durable orchestration record, which holds no
+ * mutable run state at all. The fingerprint has to name what Peer Loop wrote,
+ * character for character, or the server will rightly refuse it.
+ */
+export function describeOwnerDecisionAction(input: {
+  readonly snapshot: NavigatorExecutionSnapshot;
+  /** This conversation's durable thread. Null in a draft. */
+  readonly threadId: ThreadId | null;
+  readonly runId: string;
+  /** True once T3 Code holds a link from this thread to this run. */
+  readonly linkedToThread: boolean;
+  /** The conversation's purpose capability. UI hygiene, checked again below. */
+  readonly capable: boolean;
+  /** The fingerprint of the decision, from the shared helper. */
+  readonly fingerprintOf: (input: {
+    readonly decision: PeerLoopRunStateFile["lastReviewerDecision"];
+    readonly iteration: number;
+  }) => string | null;
+}): NavigatorOwnerDecisionAction | null {
+  if (!input.capable) return null;
+  if (input.threadId === null || !input.linkedToThread) return null;
+  if (input.snapshot.status !== "ready") return null;
+  const state = input.snapshot.state;
+  if (state === null) return null;
+  if (state.state !== "owner_required") return null;
+  const decision = state.lastReviewerDecision;
+  if (decision === null || decision.decision !== "OWNER_REQUIRED") return null;
+  // An answer is already on its way. A second one would be delivered too, and
+  // the server refuses it anyway — so the control does not offer it.
+  if (state.queuedOwnerMessages.length > 0) return null;
+  const fingerprint = input.fingerprintOf({ decision, iteration: state.iteration });
+  if (fingerprint === null) return null;
+  return {
+    runId: input.runId,
+    threadId: input.threadId,
+    fingerprint,
+    options: decision.options.map((label, index) => ({ index, label })),
+  };
+}
+
+/** How much of an option is shown before it is unreadable. The click is exact. */
+export const NAVIGATOR_OPTION_DISPLAY_CHARS = 160;
+
+/**
+ * The options a card draws, with their own indices intact.
+ *
+ * An option Peer Loop recorded as empty has nothing to put on a button, so it
+ * is not drawn — and every other option keeps the number it came with. That is
+ * the whole reason this returns the index rather than relying on the caller's
+ * own loop counter.
+ */
+export function presentOwnerDecisionOptions(
+  options: ReadonlyArray<NavigatorOwnerDecisionOption>,
+): ReadonlyArray<NavigatorOwnerDecisionOption> {
+  const shown: Array<NavigatorOwnerDecisionOption> = [];
+  for (const option of options) {
+    const trimmed = option.label.trim();
+    if (trimmed.length === 0) continue;
+    shown.push({
+      index: option.index,
+      label:
+        trimmed.length <= NAVIGATOR_OPTION_DISPLAY_CHARS
+          ? trimmed
+          : `${trimmed.slice(0, NAVIGATOR_OPTION_DISPLAY_CHARS - 1)}\u2026`,
+    });
+  }
+  return shown;
+}
+
 /* ------------------------------------------------------------- failures */
 
 export interface NavigatorExecutionFailure {
@@ -788,6 +895,56 @@ export const EXECUTION_RESULT_UNKNOWN: NavigatorExecutionFailure = {
   mayHaveStarted: true,
   disposition: "unknown",
 };
+
+/* --------------------------------------------- answering, when it fails */
+
+/**
+ * What an owner is told when answering itself failed.
+ *
+ * BOUNDED, AND NEVER A RAW SERVER STRING. Peer Loop's own refusals keep their
+ * code because a code tells an operator which thing to fix; a coordination
+ * refusal gets one fixed sentence per reason; anything else is a connection
+ * that did not hold. A stale view is NOT here at all — it is an outcome, and
+ * the card re-reads and re-renders instead of showing an alarm.
+ */
+export interface NavigatorDecisionAnswerFailure {
+  readonly title: string;
+  readonly detail: string | null;
+  readonly code: string | null;
+}
+
+const OWNER_DECISION_COORDINATION_DETAILS: Readonly<Record<string, string>> = {
+  "run-not-linked-to-thread":
+    "This conversation does not have a record of that run, so it cannot answer it.",
+  "option-out-of-range": "That option is no longer part of this decision. Re-read the run.",
+  "link-unreadable":
+    "T3 Code could not read its own record of this conversation's runs. Nothing was sent.",
+};
+
+const ANSWER_FAILED_UNKNOWN: NavigatorDecisionAnswerFailure = {
+  title: "The answer was not delivered",
+  detail: "The connection failed before Peer Loop answered. Nothing else changed; try again.",
+  code: null,
+};
+
+export function describeOwnerDecisionAnswerFailure(error: unknown): NavigatorDecisionAnswerFailure {
+  if (typeof error !== "object" || error === null) return ANSWER_FAILED_UNKNOWN;
+  const tagged = error as { readonly _tag?: unknown; readonly reason?: unknown };
+  if (tagged._tag === "PeerLoopOwnerDecisionCoordinationError") {
+    const reason = typeof tagged.reason === "string" ? tagged.reason : "";
+    return {
+      title: "Peer Loop would not take that answer",
+      // A fixed sentence per reason. Nothing from the server is interpolated.
+      detail: OWNER_DECISION_COORDINATION_DETAILS[reason] ?? "Re-read the run and try again.",
+      code: null,
+    };
+  }
+  if (typeof tagged._tag === "string" && tagged._tag.startsWith("PeerLoop")) {
+    const presented = describeError(error as PeerLoopError);
+    return { title: presented.title, detail: presented.detail, code: presented.code };
+  }
+  return ANSWER_FAILED_UNKNOWN;
+}
 
 /* ----------------------------------------------------- inspector target */
 

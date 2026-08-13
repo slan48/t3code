@@ -38,13 +38,35 @@ describe("navigator capabilities", () => {
       // blocking it would strand a conversation with an unanswerable question.
       canAcceptApprovals: false,
       canDeclineApprovals: true,
+      // The one thing a planning conversation may release: a run it started
+      // itself, in that run's own project, on a mutation the owner authorized
+      // when they pressed Execute. Not the same question as accepting a
+      // provider approval for THIS conversation's agent, which stays off.
+      canAnswerLinkedOwnerDecision: true,
       canConverse: true,
     });
+  });
+
+  it("keeps answering a linked run apart from accepting an approval", () => {
+    const navigator = threadCapabilities("navigator");
+    expect(navigator.canAcceptApprovals).toBe(false);
+    expect(navigator.canAnswerLinkedOwnerDecision).toBe(true);
+    // A coding thread has no Execution Proposals and so no linked runs. It
+    // keeps every approval capability it has today.
+    const coding = threadCapabilities("coding");
+    expect(coding.canAcceptApprovals).toBe(true);
+    expect(coding.canAnswerLinkedOwnerDecision).toBe(false);
   });
 
   it("leaves coding threads with everything they have today", () => {
     const coding = threadCapabilities("coding");
     for (const [name, allowed] of Object.entries(coding)) {
+      // Except the one capability that only exists for linked Peer Loop runs,
+      // which a coding conversation never has.
+      if (name === "canAnswerLinkedOwnerDecision") {
+        expect(allowed, "coding threads answer no linked run").toBe(false);
+        continue;
+      }
       expect(allowed, `coding threads must retain ${name}`).toBe(true);
     }
   });

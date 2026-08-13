@@ -26,6 +26,7 @@ import type {
   EnvironmentId,
   OrchestrationPeerLoopExecution,
   OrchestrationProposedPlanId,
+  PeerLoopAnswerOwnerDecisionResult,
   PeerLoopExecuteProposalResult,
   PeerLoopRunStateFile,
   PeerLoopRunSummary,
@@ -42,6 +43,9 @@ import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import {
   buildExecuteProposalRequest,
   describeCoordinationError,
+  describeOwnerDecisionAnswerFailure,
+  type NavigatorDecisionAnswerFailure,
+  type NavigatorOwnerDecisionAction,
   NO_EXECUTION_ATTEMPT,
   NO_EXECUTION_SNAPSHOT,
   proposalExecutionAvailability,
@@ -665,7 +669,19 @@ export function useNavigatorExecutionSnapshot(input: {
   readonly runId: string;
   readonly wanted: boolean;
   readonly revision: string | null;
-}): NavigatorExecutionSnapshot {
+}): NavigatorExecutionSnapshot & {
+  /**
+   * Re-read this run now, whatever the ledger remembers.
+   *
+   * FOR AN ACTION THIS CLIENT JUST TOOK, and nothing else. The revision ledger
+   * decides who re-reads when a *summary* moves, which is a question about
+   * polling; answering a decision is a question about a request whose whole
+   * point was to change the run. The two never conflict: the reading that comes
+   * back is stamped, so the ledger's own comparison stays true afterwards, and
+   * a card that is not showing an answerable decision never calls this.
+   */
+  readonly refresh: () => void;
+} {
   const snapshotAtom = selectNavigatorSnapshotAtom<NavigatorSnapshotAtom>({
     environmentId: input.environmentId,
     runId: input.runId,
@@ -705,7 +721,7 @@ export function useNavigatorExecutionSnapshot(input: {
     observeSnapshotRevision({ key: ledgerKey, revision, reading, refresh });
   }, [ledgerKey, reading, refresh, revision]);
 
-  return snapshot;
+  return useMemo(() => ({ ...snapshot, refresh }), [refresh, snapshot]);
 }
 
 /**
@@ -725,4 +741,200 @@ export function navigatorSnapshotOf(input: {
   const value = Option.getOrNull(AsyncResult.value(input.result));
   if (value === null) return { status: "loading", state: null };
   return { status: "ready", state: value.state };
+}
+
+/* ------------------------------------------- answering an owner decision */
+
+export interface NavigatorDecisionAnswerState {
+  /** True while this client's own answer is outstanding, for every copy. */
+  readonly pending: boolean;
+  readonly failure: NavigatorDecisionAnswerFailure | null;
+}
+
+const IDLE_DECISION_ANSWER: NavigatorDecisionAnswerState = { pending: false, failure: null };
+
+/** Length-prefixed, like every other composite key in this module. */
+export const navigatorDecisionKey = (input: {
+  readonly environmentId: string;
+  readonly runId: string;
+}): string => `${input.environmentId.length}:${input.environmentId}:${input.runId}`;
+
+/**
+ * One gate per run, held outside React, for the same reason the Execute gate is.
+ *
+ * The decision block is rendered twice — the timeline card and the Plan sidebar
+ * are separate components with separate callbacks — so a hook-local flag would
+ * give one run two gates, and two clicks in the same tick would send two
+ * answers to a Reviewer that asked one question. Keyed by environment and run,
+ * so both copies are the same control and neither can act while the other is
+ * mid-flight.
+ *
+ * KEYED BY RUN, NOT BY DECISION. Two options of one question are still one
+ * answer, and the second click must be refused just as firmly as a repeat of
+ * the first.
+ */
+export function createNavigatorDecisionAnswerStore() {
+  const states = new Map<string, NavigatorDecisionAnswerState>();
+  const inFlight = new Set<string>();
+  const listeners = new Set<() => void>();
+  let version = 0;
+
+  const isIdle = (state: NavigatorDecisionAnswerState): boolean =>
+    !state.pending && state.failure === null;
+
+  const publish = (key: string, state: NavigatorDecisionAnswerState): void => {
+    // Idle by shape, so a dismissed failure leaves no entry behind and the map
+    // cannot grow one row per run an owner ever looked at.
+    if (isIdle(state)) states.delete(key);
+    else states.set(key, state);
+    version += 1;
+    for (const listener of listeners) listener();
+  };
+
+  return {
+    read: (key: string): NavigatorDecisionAnswerState => states.get(key) ?? IDLE_DECISION_ANSWER,
+    version: (): number => version,
+    subscribe: (listener: () => void): (() => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    isBusy: (key: string): boolean => inFlight.has(key),
+    /** A read-only seam, so a test can prove nothing accumulates. */
+    size: (): number => states.size,
+
+    /**
+     * Send one answer, or refuse.
+     *
+     * Returns null when the gate refused — a second click while the first is
+     * outstanding. A failure is terminal and inline; the owner decides whether
+     * to try again.
+     */
+    answer: async (
+      key: string,
+      runner: () => Promise<AsyncResult.AsyncResult<PeerLoopAnswerOwnerDecisionResult, unknown>>,
+    ): Promise<PeerLoopAnswerOwnerDecisionResult | null> => {
+      if (inFlight.has(key)) return null;
+      inFlight.add(key);
+      publish(key, { pending: true, failure: null });
+      try {
+        const result = await runner();
+        if (AsyncResult.isSuccess(result)) {
+          publish(key, IDLE_DECISION_ANSWER);
+          return result.value;
+        }
+        publish(key, {
+          pending: false,
+          failure: describeOwnerDecisionAnswerFailure(
+            AsyncResult.isFailure(result)
+              ? Option.getOrNull(Cause.findErrorOption(result.cause))
+              : null,
+          ),
+        });
+        return null;
+      } catch {
+        // A defect is still terminal: left to escape it would keep every copy
+        // of the control disabled for ever.
+        publish(key, { pending: false, failure: describeOwnerDecisionAnswerFailure(null) });
+        return null;
+      } finally {
+        inFlight.delete(key);
+      }
+    },
+
+    dismissFailure: (key: string): void => {
+      const current = states.get(key);
+      if (current === undefined || current.failure === null) return;
+      publish(key, { ...current, failure: null });
+    },
+
+    /** Tests only. Nothing in the app forgets an outstanding answer. */
+    reset: (): void => {
+      states.clear();
+      inFlight.clear();
+      version += 1;
+      for (const listener of listeners) listener();
+    },
+  } as const;
+}
+
+export type NavigatorDecisionAnswerStore = ReturnType<typeof createNavigatorDecisionAnswerStore>;
+
+/** One store for the app: two copies of a decision must share one gate. */
+export const navigatorDecisionAnswerStore = createNavigatorDecisionAnswerStore();
+
+/**
+ * Answer one linked run's owner decision.
+ *
+ * The request is the whole safety story and it is four fields: a thread, a run,
+ * the fingerprint of the decision on screen, and which option. No text of any
+ * kind travels — the server resolves the option out of a reading it takes for
+ * itself, and refuses the fingerprint if the run has moved on.
+ *
+ * BOTH OUTCOMES RE-READ. Answered means the run is about to move, and the card
+ * should show that without waiting for a poll. Refresh-required means the card
+ * is already showing something the run has left, which is precisely when a
+ * re-read is owed — and it is a re-read of the *snapshot*, not only the summary,
+ * because a Reviewer can ask a second question without the run list's own
+ * `updatedAt` having reached this client yet.
+ */
+export function useNavigatorOwnerDecisionAnswer(input: {
+  readonly environmentId: EnvironmentId | null;
+  readonly runId: string;
+  /** Re-read the run list. Never starts anything. */
+  readonly refreshRuns: () => void;
+  /** Re-read this run's attached snapshot, unconditionally. */
+  readonly refreshSnapshot: () => void;
+}) {
+  const answerOwnerDecision = useAtomCommand(peerLoopCommands.answerOwnerDecision, {
+    reportFailure: false,
+  });
+
+  useSyncExternalStore(
+    navigatorDecisionAnswerStore.subscribe,
+    navigatorDecisionAnswerStore.version,
+    navigatorDecisionAnswerStore.version,
+  );
+
+  const { environmentId, runId, refreshRuns, refreshSnapshot } = input;
+  const key =
+    environmentId === null
+      ? null
+      : navigatorDecisionKey({ environmentId: String(environmentId), runId });
+  const state = key === null ? IDLE_DECISION_ANSWER : navigatorDecisionAnswerStore.read(key);
+
+  const answer = useCallback(
+    async (action: NavigatorOwnerDecisionAction, optionIndex: number): Promise<void> => {
+      if (environmentId === null || key === null) return;
+      const result = await navigatorDecisionAnswerStore.answer(key, () =>
+        answerOwnerDecision({
+          environmentId,
+          // EXACTLY THESE FOUR. Not the option's text, not the question, not
+          // the reason, not the snapshot the client is holding.
+          input: {
+            threadId: action.threadId,
+            runId: action.runId,
+            decisionFingerprint: action.fingerprint,
+            optionIndex,
+          },
+        }),
+      );
+      // A refused second click returns null and must not re-read: the first
+      // click's own completion does that.
+      if (result === null) return;
+      // Both outcomes. `answered` because the run is moving; `refresh-required`
+      // because this card is demonstrably behind, and re-reading is the whole
+      // of the response — no error, no success, just the current question.
+      refreshRuns();
+      refreshSnapshot();
+    },
+    [answerOwnerDecision, environmentId, key, refreshRuns, refreshSnapshot],
+  );
+
+  const dismissFailure = useCallback(() => {
+    if (key !== null) navigatorDecisionAnswerStore.dismissFailure(key);
+  }, [key]);
+
+  return { state, answer, dismissFailure } as const;
 }

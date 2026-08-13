@@ -16,15 +16,26 @@
  * @module NavigatorProposalExecution
  */
 import { Link } from "@tanstack/react-router";
-import type { EnvironmentId, OrchestrationPeerLoopExecution, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationPeerLoopExecution,
+  ThreadId,
+  ThreadPurpose,
+} from "@t3tools/contracts";
+import { peerLoopOwnerDecisionFingerprint } from "@t3tools/shared/peerLoopDecisionFingerprint";
 import { memo, useCallback, useEffect, useRef } from "react";
 
 import { cn } from "~/lib/utils";
+import { threadCapabilities } from "~/navigatorCapabilities";
 import {
   compactRunId,
   describeExecution,
   describeExecutionDetail,
+  describeOwnerDecisionAction,
   executionSnapshotIsUseful,
+  presentOwnerDecisionOptions,
+  type NavigatorDecisionAnswerFailure,
+  type NavigatorOwnerDecisionAction,
   inspectorTargetFor,
   showsExecutionArea,
   type ExecutableProposal,
@@ -38,6 +49,7 @@ import {
   useNavigatorExecution,
   useNavigatorExecutionRuns,
   useNavigatorExecutionSnapshot,
+  useNavigatorOwnerDecisionAnswer,
 } from "~/state/navigatorExecutionCommand";
 import { Button } from "../ui/button";
 import { PeerLoopPill } from "../peerLoop/PeerLoopPrimitives";
@@ -187,6 +199,9 @@ function ProposalExecutionArea({
             <li key={`${link.proposedPlanId}:${link.runId}`} className="min-w-0">
               <NavigatorExecutionChild
                 environmentId={context.environmentId}
+                threadId={threadId}
+                purpose={context.purpose}
+                refreshRuns={refresh}
                 presentation={describeExecution({ link, runs, unreadable, nowMs: Date.now() })}
               />
             </li>
@@ -239,10 +254,18 @@ const FailureInspectorLink = memo(function FailureInspectorLink({
  */
 const NavigatorExecutionChild = memo(function NavigatorExecutionChild({
   environmentId,
+  threadId,
+  purpose,
   presentation,
+  refreshRuns,
 }: {
   readonly environmentId: EnvironmentId;
+  /** The conversation this run is linked to. The link is why it may answer. */
+  readonly threadId: ThreadId;
+  readonly purpose: ThreadPurpose;
   readonly presentation: NavigatorExecutionPresentation;
+  /** Re-read the summaries once an answer lands. */
+  readonly refreshRuns: () => void;
 }) {
   const wanted = executionSnapshotIsUseful(presentation.status);
   const snapshot = useNavigatorExecutionSnapshot({
@@ -254,7 +277,39 @@ const NavigatorExecutionChild = memo(function NavigatorExecutionChild({
     revision: presentation.status.kind === "summary" ? presentation.status.updatedAt : null,
   });
   const detail = describeExecutionDetail({ status: presentation.status, snapshot });
-  return <NavigatorExecutionCard presentation={presentation} detail={detail} />;
+
+  /*
+   * What the owner may answer, from the reading this card is holding.
+   *
+   * Never from `detail`, whose text is bounded for display, and never from the
+   * run-list summary, which has no question in it at all. The fingerprint has
+   * to name what Peer Loop wrote character for character.
+   */
+  const action = describeOwnerDecisionAction({
+    snapshot,
+    threadId,
+    runId: presentation.runId,
+    linkedToThread: true,
+    capable: threadCapabilities(purpose).canAnswerLinkedOwnerDecision,
+    fingerprintOf: peerLoopOwnerDecisionFingerprint,
+  });
+  const { state: answerState, answer } = useNavigatorOwnerDecisionAnswer({
+    environmentId,
+    runId: presentation.runId,
+    refreshRuns,
+    refreshSnapshot: snapshot.refresh,
+  });
+
+  return (
+    <NavigatorExecutionCard
+      presentation={presentation}
+      detail={detail}
+      action={action}
+      answering={answerState.pending}
+      answerFailure={answerState.failure}
+      onAnswer={answer}
+    />
+  );
 });
 
 /**
@@ -268,9 +323,21 @@ const NavigatorExecutionChild = memo(function NavigatorExecutionChild({
 export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
   presentation,
   detail = NO_DETAIL,
+  action = null,
+  answering = false,
+  answerFailure = null,
+  onAnswer,
 }: {
   readonly presentation: NavigatorExecutionPresentation;
   readonly detail?: NavigatorExecutionDetail;
+  /** The answerable decision, when the snapshot holds a fresh one. */
+  readonly action?: NavigatorOwnerDecisionAction | null;
+  /** True while this client's answer is in flight, for every copy of the card. */
+  readonly answering?: boolean;
+  readonly answerFailure?: NavigatorDecisionAnswerFailure | null;
+  readonly onAnswer?:
+    | ((action: NavigatorOwnerDecisionAction, optionIndex: number) => void)
+    | undefined;
 }) {
   const { status } = presentation;
   return (
@@ -310,7 +377,13 @@ export const NavigatorExecutionCard = memo(function NavigatorExecutionCard({
         </p>
       )}
 
-      <NavigatorExecutionDetailBlock detail={detail} />
+      <NavigatorExecutionDetailBlock
+        detail={detail}
+        action={action}
+        answering={answering}
+        answerFailure={answerFailure}
+        onAnswer={onAnswer}
+      />
 
       {/*
         The link out, and only the link. Pause, resume, recovery and owner
@@ -342,8 +415,18 @@ const NO_DETAIL: NavigatorExecutionDetail = { kind: "none" };
  */
 const NavigatorExecutionDetailBlock = memo(function NavigatorExecutionDetailBlock({
   detail,
+  action = null,
+  answering = false,
+  answerFailure = null,
+  onAnswer,
 }: {
   readonly detail: NavigatorExecutionDetail;
+  readonly action?: NavigatorOwnerDecisionAction | null;
+  readonly answering?: boolean;
+  readonly answerFailure?: NavigatorDecisionAnswerFailure | null;
+  readonly onAnswer?:
+    | ((action: NavigatorOwnerDecisionAction, optionIndex: number) => void)
+    | undefined;
 }) {
   if (detail.kind === "none") return null;
 
@@ -409,20 +492,96 @@ const NavigatorExecutionDetailBlock = memo(function NavigatorExecutionDetailBloc
       </p>
       <p className="text-xs text-foreground">{detail.decision.question}</p>
       <p className="text-xs text-muted-foreground">{detail.decision.why}</p>
-      {detail.decision.options.length === 0 ? null : (
-        <ul className="flex min-w-0 list-disc flex-col gap-0.5 ps-4">
-          {detail.decision.options.map((option) => (
-            <li key={option} className="text-xs text-muted-foreground">
-              {option}
-            </li>
-          ))}
-        </ul>
+      {action === null ? (
+        /*
+         * The options as text, exactly as before.
+         *
+         * This is what a card shows when it cannot answer: no durable thread,
+         * no link, a conversation that may not answer, an answer already
+         * queued, or a reading that has not arrived. The question and its
+         * options still belong on screen — the inspector is where it is
+         * answered instead.
+         */
+        detail.decision.options.length === 0 ? null : (
+          <ul className="flex min-w-0 list-disc flex-col gap-0.5 ps-4">
+            {detail.decision.options.map((option) => (
+              <li key={option} className="text-xs text-muted-foreground">
+                {option}
+              </li>
+            ))}
+          </ul>
+        )
+      ) : (
+        <OwnerDecisionOptions action={action} answering={answering} onAnswer={onAnswer} />
+      )}
+      {answerFailure === null ? null : (
+        <div role="alert" className="flex min-w-0 flex-col gap-0.5">
+          <p className="text-xs font-medium text-foreground">{answerFailure.title}</p>
+          {answerFailure.detail === null ? null : (
+            <p className="text-xs text-muted-foreground">{answerFailure.detail}</p>
+          )}
+          {answerFailure.code === null ? null : (
+            <p className="font-mono text-xs break-all text-muted-foreground">
+              {answerFailure.code}
+            </p>
+          )}
+        </div>
       )}
       {/*
-        No inline approve, recover, resume, pause or owner message. Answering is
-        a live command against Peer Loop's control snapshot, and the inspector
-        is where those controls know whether Peer Loop would accept them.
+        Answering is the one control here. No recover, resume, pause or free
+        owner message: those need the run's live control snapshot and belong in
+        the advanced inspector, which is the one place they are safe.
       */}
+    </div>
+  );
+});
+
+/**
+ * One button per option Peer Loop recorded.
+ *
+ * THE INDEX ON THE BUTTON IS PEER LOOP'S OWN. An option too long to read is
+ * shortened and an empty one is not drawn, and neither changes the number sent
+ * — the server resolves the text by that number out of a reading it takes for
+ * itself, so a renumbered click would answer with a different sentence.
+ *
+ * Every button is disabled while any answer for this run is in flight. The two
+ * copies of this card share one gate, so a second click cannot become a second
+ * answer to a question that was asked once.
+ */
+const OwnerDecisionOptions = memo(function OwnerDecisionOptions({
+  action,
+  answering,
+  onAnswer,
+}: {
+  readonly action: NavigatorOwnerDecisionAction;
+  readonly answering: boolean;
+  readonly onAnswer?:
+    | ((action: NavigatorOwnerDecisionAction, optionIndex: number) => void)
+    | undefined;
+}) {
+  const options = presentOwnerDecisionOptions(action.options);
+  if (options.length === 0) return null;
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5 pt-1">
+      <div className="flex min-w-0 flex-wrap gap-1.5">
+        {options.map((option) => (
+          <Button
+            key={option.index}
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full min-w-0 self-start py-1 text-start text-xs whitespace-normal"
+            disabled={answering}
+            onClick={() => onAnswer?.(action, option.index)}
+          >
+            {option.label}
+          </Button>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        {answering
+          ? "Sending your answer to Peer Loop…"
+          : "Peer Loop receives the option you pick, exactly as the Reviewer wrote it."}
+      </p>
     </div>
   );
 });

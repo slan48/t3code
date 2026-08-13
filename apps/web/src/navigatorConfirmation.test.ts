@@ -486,3 +486,42 @@ describe("a confirmation on a proposal whose last attempt was refused", () => {
     navigatorExecutionStore.reset();
   });
 });
+
+/* -------------------------------------- what a phrase still cannot do */
+
+describe("phrases and owner decisions", () => {
+  it("routes every confirmation phrase to execution, never to an answer", () => {
+    /*
+     * THE BOUNDARY THAT MUST NOT MOVE. A linked run stopping to ask its owner
+     * a question is answered by pressing one of the options Peer Loop
+     * recorded — by index, against a fingerprint of that exact question. A
+     * phrase names no run, no decision and no option, so `hagamos eso` cannot
+     * mean "pick something" for a run: the only thing it can ever produce is
+     * an execution of the proposal in front of the owner.
+     */
+    for (const phrase of NAVIGATOR_CONFIRMATION_PHRASES) {
+      const routed = route({ text: phrase });
+      expect(routed.kind, phrase).toBe("execute");
+      if (routed.kind === "execute") {
+        // A proposal, and nothing that could name a run or an option.
+        expect(Object.keys(routed.proposal).toSorted(), phrase).toEqual([
+          "id",
+          "implementationThreadId",
+          "implementedAt",
+          "turnId",
+        ]);
+      }
+    }
+  });
+
+  it("has no route that could answer a decision at all", () => {
+    // The whole vocabulary is two kinds. Adding an answer to it would be a
+    // phrase that releases a Builder, which is exactly what is refused here.
+    const kinds = new Set(
+      [...NAVIGATOR_CONFIRMATION_PHRASES, "what about step 3?", "hagamos eso pero primero…"].map(
+        (text) => route({ text }).kind,
+      ),
+    );
+    expect([...kinds].toSorted()).toEqual(["execute", "send"]);
+  });
+});
