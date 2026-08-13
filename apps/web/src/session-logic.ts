@@ -291,6 +291,14 @@ export function formatElapsed(startIso: string, endIso: string | undefined): str
 type LatestTurnTiming = Pick<OrchestrationLatestTurn, "turnId" | "startedAt" | "completedAt">;
 type SessionActivityState = Pick<NonNullable<Thread["session"]>, "status" | "activeTurnId">;
 
+/**
+ * Whether the thread's most recent turn is over.
+ *
+ * ABOUT THE THREAD, NOT ABOUT ANY ONE THING THE TURN PRODUCED. A conversation
+ * with no latest-turn record reads as unsettled here, which is right for "is
+ * this conversation busy" and wrong for "may this proposal be acted on" — see
+ * {@link unsettledTurnId}, which is what a per-item decision has to ask.
+ */
 export function isLatestTurnSettled(
   latestTurn: LatestTurnTiming | null,
   session: SessionActivityState | null,
@@ -300,6 +308,35 @@ export function isLatestTurnSettled(
   if (!session) return true;
   if (session.status === "running") return false;
   return true;
+}
+
+/**
+ * The one turn whose output can still change, or null when nothing is in flight.
+ *
+ * THE ABSENCE OF A LATEST-TURN RECORD IS NOT EVIDENCE THAT A TURN IS RUNNING,
+ * and that distinction is the whole reason this exists. `latest_turn_id` is
+ * cleared on the server the moment a session stops being "running" — the
+ * projection writes `session.activeTurnId`, which is null for every settled
+ * session — so a rehydrated thread routinely arrives with `latestTurn: null`
+ * however many turns it has completed. Asking {@link isLatestTurnSettled} about
+ * that thread answers "unsettled", and anything gated on it silently disappears
+ * until an unrelated provider turn repopulates the field.
+ *
+ * So the question is narrowed to the one that is actually answerable from a
+ * hydrated snapshot: which turn, if any, is still producing? A running session
+ * names it. A latest-turn record that never completed names it. Nothing else
+ * does, and "nothing" is a real answer rather than a reason to withhold.
+ */
+export function unsettledTurnId(
+  latestTurn: LatestTurnTiming | null,
+  session: SessionActivityState | null,
+): TurnId | null {
+  if (session?.status === "running" && session.activeTurnId !== null) return session.activeTurnId;
+  if (latestTurn === null) return null;
+  // Started and not finished is in flight. A record with neither timestamp is a
+  // turn this client cannot place, and it is not claimed to be running.
+  if (latestTurn.startedAt !== null && latestTurn.completedAt === null) return latestTurn.turnId;
+  return null;
 }
 
 export function deriveActiveWorkStartedAt(

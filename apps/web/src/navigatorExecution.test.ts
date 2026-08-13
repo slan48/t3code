@@ -19,6 +19,7 @@ import {
   PeerLoopTimeoutError,
   PEER_LOOP_EXECUTION_FAILURE_REASONS,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -34,11 +35,14 @@ import {
   groupExecutionsByProposal,
   inspectorTargetFor,
   localLinkIsDurable,
+  NO_EXECUTION_ATTEMPT,
   NO_EXECUTION_SNAPSHOT,
+  proposalExecutionAvailability,
   reconcileExecutionLinks,
   selectNavigatorRunListAtom,
   selectNavigatorSnapshotAtom,
   showsExecutionArea,
+  type NavigatorExecutionFacts,
   type NavigatorExecutionSnapshot,
 } from "./navigatorExecution";
 
@@ -48,18 +52,25 @@ const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
 /** Fixed, so the relative-time label is deterministic. */
 const NOW_MS = Date.parse("2026-03-01T10:20:00.000Z");
 
+const PLAN_TURN_ID = TurnId.make("turn-that-produced-the-plan");
+
 const proposal = (
-  overrides: Partial<{ implementedAt: string | null; implementationThreadId: string | null }> = {},
+  overrides: Partial<{
+    implementedAt: string | null;
+    implementationThreadId: string | null;
+    turnId: TurnId | null;
+  }> = {},
 ) => ({
   id: PLAN_ID,
   implementedAt: overrides.implementedAt ?? null,
   implementationThreadId: overrides.implementationThreadId ?? null,
+  turnId: overrides.turnId === undefined ? PLAN_TURN_ID : overrides.turnId,
 });
 
 const eligible = {
   purpose: "navigator" as const,
   isDurableThread: true,
-  latestTurnSettled: true,
+  proposalSettled: true,
   proposal: proposal(),
   executionCount: 0,
   executing: false,
@@ -142,7 +153,7 @@ describe("execute eligibility", () => {
   });
 
   it("waits for the turn to settle, and for a proposal to exist", () => {
-    expect(executeProposalAvailability({ ...eligible, latestTurnSettled: false })).toEqual({
+    expect(executeProposalAvailability({ ...eligible, proposalSettled: false })).toEqual({
       canExecute: false,
       blockedReason: "proposal-not-settled",
     });
@@ -562,6 +573,160 @@ describe("a failure nothing typed explains", () => {
   });
 });
 
+/* --------------------------------------- availability, once, for everyone */
+
+describe("the availability every surface reads", () => {
+  const facts = (overrides: Partial<NavigatorExecutionFacts> = {}): NavigatorExecutionFacts => ({
+    environmentId: ENVIRONMENT_ID,
+    threadId: THREAD_ID,
+    purpose: "navigator",
+    // What a conversation loaded from the server carries: nothing in flight.
+    // The absence of a latest-turn record is not a turn that is running.
+    unsettledTurnId: null,
+    executionsByProposal: new Map(),
+    ...overrides,
+  });
+
+  it("offers the action again after a provable pre-start refusal", () => {
+    // WHAT A MOUNT AFTER A REFUSAL LOOKS LIKE. `CONTROL_UNAVAILABLE` and
+    // `PROJECT_HAS_UNFINISHED_RUN` both prove nothing started, so the proposal
+    // is executable on the first render — no turn, no regeneration, no refresh.
+    expect(
+      proposalExecutionAvailability({
+        facts: facts(),
+        proposal: proposal(),
+        attempt: { pending: false, disposition: "retryable" },
+      }),
+    ).toEqual({ canExecute: true, blockedReason: null });
+  });
+
+  it("keeps an unknown outcome withheld, and an existing run pointed at", () => {
+    expect(
+      proposalExecutionAvailability({
+        facts: facts(),
+        proposal: proposal(),
+        attempt: { pending: false, disposition: "unknown" },
+      }).blockedReason,
+    ).toBe("outcome-unknown");
+    expect(
+      proposalExecutionAvailability({
+        facts: facts(),
+        proposal: proposal(),
+        attempt: { pending: false, disposition: "inspect-existing" },
+      }).blockedReason,
+    ).toBe("already-executed");
+  });
+
+  it("withholds only the proposal the running turn is producing", () => {
+    // THE DISTINCTION THE THREAD-WIDE ANSWER COULD NOT MAKE. One turn is in
+    // flight; the plan it is rewriting is not final, and everything the
+    // conversation finished earlier still is.
+    const producing = facts({ unsettledTurnId: PLAN_TURN_ID });
+    expect(
+      proposalExecutionAvailability({
+        facts: producing,
+        proposal: proposal(),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }),
+    ).toEqual({ canExecute: false, blockedReason: "proposal-not-settled" });
+    expect(
+      proposalExecutionAvailability({
+        facts: producing,
+        proposal: proposal({ turnId: TurnId.make("turn-earlier") }),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).canExecute,
+    ).toBe(true);
+    // A plan whose turn the read model does not carry cannot be claimed as the
+    // output of the turn that is running.
+    expect(
+      proposalExecutionAvailability({
+        facts: producing,
+        proposal: proposal({ turnId: null }),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).canExecute,
+    ).toBe(true);
+  });
+
+  it("counts only this proposal's own links", () => {
+    const linked = facts({
+      executionsByProposal: new Map([["plan-other", [link({ runId: "run-elsewhere" })]]]),
+    });
+    // Another proposal's run says nothing about this one.
+    expect(
+      proposalExecutionAvailability({
+        facts: linked,
+        proposal: proposal(),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).canExecute,
+    ).toBe(true);
+    expect(
+      proposalExecutionAvailability({
+        facts: facts({ executionsByProposal: new Map([[PLAN_ID, [link({ runId: "run-77" })]]]) }),
+        proposal: proposal(),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).blockedReason,
+    ).toBe("already-executed");
+  });
+
+  it("answers for a conversation with no proposal without inventing one", () => {
+    expect(
+      proposalExecutionAvailability({
+        facts: facts(),
+        proposal: null,
+        attempt: NO_EXECUTION_ATTEMPT,
+      }),
+    ).toEqual({ canExecute: false, blockedReason: "no-proposal" });
+  });
+
+  it("reads a draft conversation off the facts rather than being told", () => {
+    // The one input a caller used to hardcode. A conversation with no durable
+    // thread id has nothing to execute against, and that is derivable.
+    expect(
+      proposalExecutionAvailability({
+        facts: facts({ threadId: null }),
+        proposal: proposal(),
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).blockedReason,
+    ).toBe("draft-conversation");
+  });
+
+  it("keeps every structural gate, whatever the last attempt was", () => {
+    for (const attempt of [
+      NO_EXECUTION_ATTEMPT,
+      { pending: false, disposition: "retryable" } as const,
+    ]) {
+      expect(
+        proposalExecutionAvailability({
+          facts: facts({ purpose: "coding" }),
+          proposal: proposal(),
+          attempt,
+        }).blockedReason,
+      ).toBe("not-a-navigator-thread");
+      expect(
+        proposalExecutionAvailability({
+          facts: facts({ unsettledTurnId: PLAN_TURN_ID }),
+          proposal: proposal(),
+          attempt,
+        }).blockedReason,
+      ).toBe("proposal-not-settled");
+      expect(
+        proposalExecutionAvailability({
+          facts: facts(),
+          proposal: proposal({ implementedAt: "2026-02-01T00:00:00.000Z" }),
+          attempt,
+        }).blockedReason,
+      ).toBe("already-implemented");
+      expect(
+        proposalExecutionAvailability({
+          facts: facts(),
+          proposal: proposal(),
+          attempt: { ...attempt, pending: true },
+        }).blockedReason,
+      ).toBe("executing");
+    }
+  });
+});
+
 /* ------------------------------------------- conditional snapshot read */
 
 describe("when a structured snapshot is worth reading", () => {
@@ -749,6 +914,26 @@ describe("the structured block under a child card", () => {
       describeExecutionDetail({
         status: statusFor(summary({ state: "done" })),
         snapshot: ready(null),
+      }),
+    ).toEqual({ kind: "completion-missing" });
+  });
+
+  it("reports a finished run held against an owner question as no completion", () => {
+    // WHAT A SNAPSHOT THAT DID NOT REFRESH LOOKS LIKE. The status came from the
+    // run list and says DONE; the reading under it was taken while the run was
+    // still waiting on the owner. Neither the question nor a completion is
+    // shown, which is right for this pair and is why the reading has to move —
+    // see the mounted regressions in `state/navigatorExecutionCommand.test.ts`.
+    expect(
+      describeExecutionDetail({
+        status: statusFor(summary({ state: "done" })),
+        snapshot: ready({
+          decision: "OWNER_REQUIRED",
+          summary: "Blocked on a choice.",
+          ownerQuestion: "Which database should the backfill target?",
+          whyOwnerIsRequired: "Both are in use and only you know which is canonical.",
+          options: ["Primary", "Replica"],
+        }),
       }),
     ).toEqual({ kind: "completion-missing" });
   });

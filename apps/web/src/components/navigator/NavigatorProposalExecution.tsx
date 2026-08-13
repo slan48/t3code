@@ -16,12 +16,7 @@
  * @module NavigatorProposalExecution
  */
 import { Link } from "@tanstack/react-router";
-import type {
-  EnvironmentId,
-  OrchestrationPeerLoopExecution,
-  ThreadId,
-  ThreadPurpose,
-} from "@t3tools/contracts";
+import type { EnvironmentId, OrchestrationPeerLoopExecution, ThreadId } from "@t3tools/contracts";
 import { memo, useCallback, useEffect, useRef } from "react";
 
 import { cn } from "~/lib/utils";
@@ -29,16 +24,17 @@ import {
   compactRunId,
   describeExecution,
   describeExecutionDetail,
-  executeProposalAvailability,
   executionSnapshotIsUseful,
   inspectorTargetFor,
   showsExecutionArea,
   type ExecutableProposal,
   type NavigatorExecutionDetail,
+  type NavigatorExecutionFacts,
   type NavigatorExecutionFailure,
   type NavigatorExecutionPresentation,
 } from "~/navigatorExecution";
 import {
+  navigatorExecutionAvailability,
   useNavigatorExecution,
   useNavigatorExecutionRuns,
   useNavigatorExecutionSnapshot,
@@ -49,20 +45,13 @@ import { PeerLoopPill } from "../peerLoop/PeerLoopPrimitives";
 /**
  * What the conversation knows, handed down once.
  *
- * Assembled in `ChatView` and deliberately free of anything Peer Loop reports:
- * this object travels through the timeline's row context, and putting a
- * five-second poll in it would re-render every row in the conversation twelve
- * times a minute. Run summaries are read inside the card that needs them, where
- * the atom family gives every reader the same single query.
+ * Assembled in `ChatView` and shared with the composer's confirmation, which
+ * decides from this same object rather than from a copy of its own. Run
+ * summaries are deliberately absent: this travels through the timeline's row
+ * context, and putting a five-second poll in it would re-render every row in
+ * the conversation twelve times a minute.
  */
-export interface NavigatorExecutionContext {
-  readonly environmentId: EnvironmentId;
-  /** Null for a draft conversation: there is nothing durable to execute. */
-  readonly threadId: ThreadId | null;
-  readonly purpose: ThreadPurpose;
-  readonly latestTurnSettled: boolean;
-  readonly executionsByProposal: ReadonlyMap<string, ReadonlyArray<OrchestrationPeerLoopExecution>>;
-}
+export type NavigatorExecutionContext = NavigatorExecutionFacts;
 
 const NO_EXECUTIONS: ReadonlyArray<OrchestrationPeerLoopExecution> = [];
 
@@ -108,18 +97,14 @@ function ProposalExecutionArea({
     environmentId: context.environmentId,
     linkCount: executions.length,
   });
-  const availability = executeProposalAvailability({
-    purpose: context.purpose,
-    isDurableThread: true,
-    latestTurnSettled: context.latestTurnSettled,
-    proposal,
-    executionCount: executions.length,
-    executing: state.pending,
-    // What the last attempt left behind, not merely whether it might have
-    // started something: an already-executed refusal started nothing here and
-    // still must not re-offer Execute.
-    lastAttemptDisposition: state.failure?.disposition ?? null,
-  });
+  // The one availability answer, from the one gate. The composer's confirmation
+  // asks the same question of the same object, so a card mounting with Execute
+  // offered and a phrase submitted a moment later cannot disagree. What the
+  // last attempt left behind decides it — not merely whether it might have
+  // started something: an already-executed refusal started nothing here and
+  // still must not re-offer Execute, while a provable pre-start refusal is
+  // executable again the instant this mounts.
+  const availability = navigatorExecutionAvailability({ facts: context, proposal });
 
   const onExecute = useCallback(() => {
     void execute();

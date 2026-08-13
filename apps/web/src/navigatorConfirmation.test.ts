@@ -6,7 +6,10 @@
  * "no" below is a sentence somebody will plausibly type into a Navigator
  * conversation while discussing whether to execute.
  */
-import type { OrchestrationProposedPlanId } from "@t3tools/contracts";
+import type { EnvironmentId, OrchestrationProposedPlanId } from "@t3tools/contracts";
+import { PeerLoopCommandRefusedError, ThreadId, TurnId } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/unstable/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -18,19 +21,26 @@ import {
   normalizeConfirmationText,
   routeNavigatorSend,
 } from "./navigatorConfirmation";
-import { executeProposalAvailability } from "./navigatorExecution";
+import { executeProposalAvailability, type NavigatorExecutionFacts } from "./navigatorExecution";
+import {
+  navigatorExecutionAvailability,
+  navigatorExecutionKey,
+  navigatorExecutionStore,
+} from "./state/navigatorExecutionCommand";
 
 const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
+const PLAN_TURN_ID = TurnId.make("turn-that-produced-the-plan");
 const proposal = {
   id: PLAN_ID,
   implementedAt: null,
   implementationThreadId: null,
+  turnId: PLAN_TURN_ID,
 } as const;
 
 const eligibleAvailability = executeProposalAvailability({
   purpose: "navigator",
   isDurableThread: true,
-  latestTurnSettled: true,
+  proposalSettled: true,
   proposal,
   executionCount: 0,
   executing: false,
@@ -176,7 +186,7 @@ describe("routing a send", () => {
           availability: executeProposalAvailability({
             purpose: "navigator",
             isDurableThread: true,
-            latestTurnSettled: true,
+            proposalSettled: true,
             proposal,
             executionCount: 0,
             executing: false,
@@ -191,7 +201,7 @@ describe("routing a send", () => {
         availability: executeProposalAvailability({
           purpose: "navigator",
           isDurableThread: true,
-          latestTurnSettled: true,
+          proposalSettled: true,
           proposal,
           executionCount: 1,
           executing: false,
@@ -347,5 +357,132 @@ describe("submitting when no provider is configured", () => {
     expect(composerSubmitBlocked({ providerBlocksSubmit: ordinary, isSendDisabled: false })).toBe(
       true,
     );
+  });
+});
+
+/* ----------------------------------- confirming right after a mount */
+
+/**
+ * The first `hagamos eso` on a freshly mounted proposal whose last attempt was
+ * refused.
+ *
+ * The availability here is not hand-built: it comes from
+ * `navigatorExecutionAvailability`, the same resolver the Execute buttons use,
+ * reading the same per-proposal gate. That is the point of the test — the
+ * phrase must be judged by the answer the owner can see on the card, on the
+ * first submission, with no provider turn and no refresh in between.
+ */
+describe("a confirmation on a proposal whose last attempt was refused", () => {
+  const ENVIRONMENT = "environment-local" as EnvironmentId;
+  const THREAD = ThreadId.make("thread-navigator-confirm");
+  const CONFIRM_PLAN = "plan-confirm" as OrchestrationProposedPlanId;
+  const historical = {
+    id: CONFIRM_PLAN,
+    implementedAt: null,
+    implementationThreadId: null,
+    turnId: TurnId.make("turn-that-produced-the-plan"),
+  } as const;
+
+  const facts: NavigatorExecutionFacts = {
+    environmentId: ENVIRONMENT,
+    threadId: THREAD,
+    purpose: "navigator",
+    // A conversation loaded from the server: nothing in flight.
+    unsettledTurnId: null,
+    executionsByProposal: new Map(),
+  };
+
+  const seed = async (error: unknown) => {
+    navigatorExecutionStore.reset();
+    await navigatorExecutionStore.execute(
+      navigatorExecutionKey({
+        environmentId: ENVIRONMENT,
+        threadId: THREAD,
+        proposedPlanId: CONFIRM_PLAN,
+      }),
+      { run: async () => AsyncResult.failure(Cause.fail(error)) },
+    );
+  };
+
+  /** Exactly what the composer resolves on submit. */
+  const submit = (text: string) =>
+    routeNavigatorSend({
+      text,
+      hasAttachments: false,
+      purpose: facts.purpose,
+      isDurableThread: facts.threadId !== null,
+      proposal: historical,
+      availability: navigatorExecutionAvailability({ facts, proposal: historical }),
+    });
+
+  const refused = (code: string) =>
+    new PeerLoopCommandRefusedError({ code, detail: "peer loop said no", data: null });
+
+  it("executes on the first submission after a retryable refusal", async () => {
+    for (const code of ["CONTROL_UNAVAILABLE", "PROJECT_HAS_UNFINISHED_RUN"]) {
+      await seed(refused(code));
+      const execute = vi.fn(async () => null);
+      const clearComposer = vi.fn();
+      const consumed = await consumeNavigatorConfirmation({
+        route: submit("hagamos eso"),
+        clearComposer,
+        execute,
+      });
+      // One request, on the first attempt, and the send path stops here.
+      expect(consumed, code).toBe(true);
+      expect(execute, code).toHaveBeenCalledTimes(1);
+      expect(execute, code).toHaveBeenCalledWith(historical);
+    }
+    navigatorExecutionStore.reset();
+  });
+
+  it("sends an unknown outcome's confirmation as an ordinary message", async () => {
+    // Fail closed. The words are not an override for "a run may already exist".
+    await seed(new Error("socket closed"));
+    const execute = vi.fn(async () => null);
+    const clearComposer = vi.fn();
+    const consumed = await consumeNavigatorConfirmation({
+      route: submit("hagamos eso"),
+      clearComposer,
+      execute,
+    });
+    expect(consumed).toBe(false);
+    expect(execute).not.toHaveBeenCalled();
+    expect(clearComposer).not.toHaveBeenCalled();
+    navigatorExecutionStore.reset();
+  });
+
+  it("lets the same confirmation submit with no provider configured", async () => {
+    // Executing calls Peer Loop's own operation. A retryable refusal does not
+    // change that, and the control must not be drawn disabled for it either.
+    await seed(refused("CONTROL_UNAVAILABLE"));
+    expect(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: true,
+        allowsSubmitWithoutProvider: submit("hagamos eso").kind === "execute",
+      }),
+    ).toBe(false);
+
+    await seed(new Error("socket closed"));
+    expect(
+      providerBlocksComposerSubmit({
+        noProviderAvailable: true,
+        allowsSubmitWithoutProvider: submit("hagamos eso").kind === "execute",
+      }),
+    ).toBe(true);
+    navigatorExecutionStore.reset();
+  });
+
+  it("still refuses everything that is not this exact confirmation", async () => {
+    await seed(refused("CONTROL_UNAVAILABLE"));
+    for (const text of [
+      "hagamos eso pero primero revisemos",
+      "¿hagamos eso?",
+      "/hagamos eso",
+      "what about step 3?",
+    ]) {
+      expect(submit(text), text).toEqual({ kind: "send" });
+    }
+    navigatorExecutionStore.reset();
   });
 });

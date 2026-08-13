@@ -166,11 +166,7 @@ import {
   threadCapabilities,
   visibleRightPanelSurfaces,
 } from "~/navigatorCapabilities";
-import {
-  executeProposalAvailability,
-  groupExecutionsByProposal,
-  type ExecutableProposal,
-} from "~/navigatorExecution";
+import { groupExecutionsByProposal } from "~/navigatorExecution";
 import {
   consumeNavigatorConfirmation,
   NAVIGATOR_SEND_ROUTE,
@@ -178,15 +174,11 @@ import {
   type NavigatorSendRoute,
 } from "~/navigatorConfirmation";
 import {
-  navigatorExecutionKey,
-  navigatorExecutionStore,
+  navigatorExecutionAvailability,
   useNavigatorExecuteProposal,
   useNavigatorExecutionLinks,
 } from "~/state/navigatorExecutionCommand";
-import {
-  NavigatorProposalExecution,
-  type NavigatorExecutionContext,
-} from "./navigator/NavigatorProposalExecution";
+import { NavigatorProposalExecution } from "./navigator/NavigatorProposalExecution";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
@@ -292,6 +284,7 @@ import {
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveNavigatorExecution,
   dismissBranchMismatchForSession,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
@@ -2208,15 +2201,24 @@ function ChatViewContent(props: ChatViewProps) {
   const activePendingIsResponding = activePendingUserInput
     ? respondingUserInputRequestIds.includes(activePendingUserInput.requestId)
     : false;
-  const activeProposedPlan = useMemo(() => {
-    if (!latestTurnSettled) {
-      return null;
-    }
-    return findLatestProposedPlan(
-      activeThread?.proposedPlans ?? [],
-      activeLatestTurn?.turnId ?? null,
-    );
-  }, [activeLatestTurn?.turnId, activeThread?.proposedPlans, latestTurnSettled]);
+  /*
+   * The conversation's own latest plan, whether or not anything is running.
+   *
+   * Separate from `activeProposedPlan` below, which stays gated on the thread
+   * having settled because the plan-mode follow-up prompt is about the turn.
+   * Execution asks a different question — see `confirmableProposal` — and a
+   * plan that exists is a plan that exists, even when the server no longer
+   * points at the turn that produced it.
+   */
+  const latestProposedPlan = useMemo(
+    () =>
+      findLatestProposedPlan(activeThread?.proposedPlans ?? [], activeLatestTurn?.turnId ?? null),
+    [activeLatestTurn?.turnId, activeThread?.proposedPlans],
+  );
+  const activeProposedPlan = useMemo(
+    () => (latestTurnSettled ? latestProposedPlan : null),
+    [latestProposedPlan, latestTurnSettled],
+  );
   const sidebarProposedPlan = useMemo(
     () =>
       findSidebarProposedPlan({
@@ -2267,50 +2269,27 @@ function ChatViewContent(props: ChatViewProps) {
     () => groupExecutionsByProposal(executionLinks),
     [executionLinks],
   );
-  const navigatorExecution = useMemo<NavigatorExecutionContext | null>(
+  /*
+   * Everything the execution surfaces read, from the thread as it is hydrated.
+   *
+   * Derived by one function so the timeline card, the Plan sidebar and the
+   * composer cannot disagree — and so the derivation can be driven from a real
+   * server-shaped thread in a test, which is what caught the defect this
+   * replaces: a conversation loaded from the server has no latest-turn record
+   * once its session has stopped, and treating that as "a turn is running"
+   * withheld every proposal the conversation had ever produced.
+   */
+  const { facts: navigatorExecution, confirmableProposal } = useMemo(
     () =>
-      isNavigatorThread
-        ? {
-            environmentId,
-            threadId: durableThreadIdForExecution,
-            purpose: activeThreadPurpose,
-            latestTurnSettled,
-            executionsByProposal,
-          }
-        : null,
-    [
-      activeThreadPurpose,
-      durableThreadIdForExecution,
-      environmentId,
-      executionsByProposal,
-      isNavigatorThread,
-      latestTurnSettled,
-    ],
+      deriveNavigatorExecution({
+        environmentId,
+        thread: activeThread ?? null,
+        isServerThread,
+        executionsByProposal,
+      }),
+    [activeThread, environmentId, executionsByProposal, isServerThread],
   );
   const executeNavigatorProposal = useNavigatorExecuteProposal();
-  /*
-   * The one proposal a confirmation phrase could be about.
-   *
-   * `activeProposedPlan` is already the thread's own latest plan, gated on the
-   * turn having settled; `hasActionableProposedPlan` drops one a coding thread
-   * has implemented. Anything else — a plan carried over from another thread, a
-   * turn still running, no plan at all — leaves this null, and a confirmation
-   * phrase is then just something the owner said.
-   */
-  const confirmableProposal = useMemo<ExecutableProposal | null>(
-    () =>
-      isNavigatorThread &&
-      durableThreadIdForExecution !== null &&
-      hasActionableProposedPlan(activeProposedPlan) &&
-      activeProposedPlan !== null
-        ? {
-            id: activeProposedPlan.id,
-            implementedAt: activeProposedPlan.implementedAt,
-            implementationThreadId: activeProposedPlan.implementationThreadId,
-          }
-        : null,
-    [activeProposedPlan, durableThreadIdForExecution, isNavigatorThread],
-  );
   /*
    * Is this send an exact confirmation of the current proposal?
    *
@@ -2320,43 +2299,26 @@ function ChatViewContent(props: ChatViewProps) {
    */
   const navigatorSendRouteFor = useCallback(
     (input: { readonly text: string; readonly hasAttachments: boolean }): NavigatorSendRoute => {
-      if (confirmableProposal === null || durableThreadIdForExecution === null) {
+      if (navigatorExecution === null || confirmableProposal === null) {
         return NAVIGATOR_SEND_ROUTE;
       }
-      // Read at action time, not at render time: a failure or a pending request
-      // that landed since the last render must still block this.
-      const executionState = navigatorExecutionStore.read(
-        navigatorExecutionKey({
-          environmentId,
-          threadId: durableThreadIdForExecution,
-          proposedPlanId: confirmableProposal.id,
-        }),
-      );
       return routeNavigatorSend({
         text: input.text,
         hasAttachments: input.hasAttachments,
-        purpose: activeThreadPurpose,
-        isDurableThread: true,
+        purpose: navigatorExecution.purpose,
+        isDurableThread: navigatorExecution.threadId !== null,
         proposal: confirmableProposal,
-        availability: executeProposalAvailability({
-          purpose: activeThreadPurpose,
-          isDurableThread: true,
-          latestTurnSettled,
+        // THE CARDS' OWN ANSWER, NOT A SECOND COPY OF IT. The same facts object
+        // the timeline and the Plan sidebar decide from, resolved against the
+        // same per-proposal gate — and resolved at action time, so a failure or
+        // a pending request that landed since the last render still counts.
+        availability: navigatorExecutionAvailability({
+          facts: navigatorExecution,
           proposal: confirmableProposal,
-          executionCount: executionsByProposal.get(confirmableProposal.id)?.length ?? 0,
-          executing: executionState.pending,
-          lastAttemptDisposition: executionState.failure?.disposition ?? null,
         }),
       });
     },
-    [
-      activeThreadPurpose,
-      confirmableProposal,
-      durableThreadIdForExecution,
-      environmentId,
-      executionsByProposal,
-      latestTurnSettled,
-    ],
+    [confirmableProposal, navigatorExecution],
   );
   /*
    * Whether this exact text may submit with no provider configured.

@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   MessageId,
+  type OrchestrationProposedPlanId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -9,6 +10,8 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import type { Thread, ThreadShell } from "../types";
+import { NO_EXECUTION_ATTEMPT, proposalExecutionAvailability } from "../navigatorExecution";
+import { isLatestTurnSettled } from "../session-logic";
 import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
@@ -18,6 +21,7 @@ import {
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveNavigatorExecution,
   dismissBranchMismatchForSession,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
@@ -132,6 +136,162 @@ describe("buildLoadingThreadFromShell", () => {
       activities: [],
       checkpoints: [],
     });
+  });
+});
+
+describe("deriveNavigatorExecution", () => {
+  const planId = "plan-1" as OrchestrationProposedPlanId;
+  const planTurnId = TurnId.make("turn-plan");
+
+  const historicalPlan = {
+    id: planId,
+    threadId,
+    turnId: planTurnId,
+    planMarkdown: "# Split the migration",
+    createdAt: "2026-03-29T00:00:05.000Z",
+    updatedAt: "2026-03-29T00:00:05.000Z",
+    implementedAt: null,
+    implementationThreadId: null,
+  } as unknown as Thread["proposedPlans"][number];
+
+  const stoppedSession = { ...readySession, status: "stopped" as const };
+
+  /**
+   * A Navigator conversation as the server hands it back, not as a fixture
+   * would like it: the session has stopped, so the projection cleared the
+   * thread's latest-turn pointer, and the plan the owner is looking at is the
+   * output of a turn nothing points at any more.
+   */
+  const rehydratedNavigatorThread = makeThread({
+    purpose: "navigator",
+    latestTurn: null,
+    session: stoppedSession,
+    proposedPlans: [historicalPlan],
+  });
+
+  const derive = (thread: Thread, isServerThread = true) =>
+    deriveNavigatorExecution({
+      environmentId,
+      thread,
+      isServerThread,
+      executionsByProposal: new Map(),
+    });
+
+  it("keeps a settled historical proposal executable on a rehydrated thread", () => {
+    /*
+     * THE REGRESSION. `isLatestTurnSettled` is false here — there is no latest
+     * turn to be settled — and gating execution on it is what made a mounted
+     * conversation offer nothing and send `hagamos eso` to the provider until
+     * an unrelated turn happened to restore the pointer.
+     */
+    expect(
+      isLatestTurnSettled(rehydratedNavigatorThread.latestTurn, rehydratedNavigatorThread.session),
+    ).toBe(false);
+
+    const derived = derive(rehydratedNavigatorThread);
+    expect(derived.facts?.unsettledTurnId).toBeNull();
+    expect(derived.confirmableProposal).toEqual({
+      id: planId,
+      implementedAt: null,
+      implementationThreadId: null,
+      turnId: planTurnId,
+    });
+    expect(
+      proposalExecutionAvailability({
+        facts: derived.facts!,
+        proposal: derived.confirmableProposal,
+        attempt: NO_EXECUTION_ATTEMPT,
+      }),
+    ).toEqual({ canExecute: true, blockedReason: null });
+  });
+
+  it("withholds a proposal whose own turn is still producing", () => {
+    const producing = makeThread({
+      purpose: "navigator",
+      latestTurn: { ...completedTurn, turnId: planTurnId, completedAt: null, state: "running" },
+      session: { ...readySession, status: "running", activeTurnId: planTurnId },
+      proposedPlans: [historicalPlan],
+    });
+    const derived = derive(producing);
+    expect(derived.facts?.unsettledTurnId).toBe(planTurnId);
+    // No confirmable target while a turn is in flight, and the card refuses too.
+    expect(derived.confirmableProposal).toBeNull();
+    expect(
+      proposalExecutionAvailability({
+        facts: derived.facts!,
+        proposal: {
+          id: planId,
+          implementedAt: null,
+          implementationThreadId: null,
+          turnId: planTurnId,
+        },
+        attempt: NO_EXECUTION_ATTEMPT,
+      }),
+    ).toEqual({ canExecute: false, blockedReason: "proposal-not-settled" });
+  });
+
+  it("keeps an older proposal's own card usable while a different turn runs", () => {
+    // The running turn is not the one that produced this plan, so the plan
+    // itself is final. The phrase still has no unambiguous target.
+    const otherTurn = TurnId.make("turn-later");
+    const derived = derive(
+      makeThread({
+        purpose: "navigator",
+        latestTurn: { ...completedTurn, turnId: otherTurn, completedAt: null, state: "running" },
+        session: { ...readySession, status: "running", activeTurnId: otherTurn },
+        proposedPlans: [historicalPlan],
+      }),
+    );
+    expect(derived.confirmableProposal).toBeNull();
+    expect(
+      proposalExecutionAvailability({
+        facts: derived.facts!,
+        proposal: {
+          id: planId,
+          implementedAt: null,
+          implementationThreadId: null,
+          turnId: planTurnId,
+        },
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).canExecute,
+    ).toBe(true);
+  });
+
+  it("derives nothing at all for a coding conversation", () => {
+    const derived = derive(makeThread({ proposedPlans: [historicalPlan] }));
+    expect(derived).toEqual({ facts: null, confirmableProposal: null });
+  });
+
+  it("has no durable thread to execute against in a draft", () => {
+    const derived = derive(rehydratedNavigatorThread, false);
+    expect(derived.facts?.threadId).toBeNull();
+    expect(derived.confirmableProposal).toBeNull();
+    expect(
+      proposalExecutionAvailability({
+        facts: derived.facts!,
+        proposal: {
+          id: planId,
+          implementedAt: null,
+          implementationThreadId: null,
+          turnId: planTurnId,
+        },
+        attempt: NO_EXECUTION_ATTEMPT,
+      }).blockedReason,
+    ).toBe("draft-conversation");
+  });
+
+  it("does not offer a proposal a coding thread already implemented", () => {
+    const derived = derive(
+      makeThread({
+        purpose: "navigator",
+        latestTurn: null,
+        session: stoppedSession,
+        proposedPlans: [
+          { ...historicalPlan, implementedAt: "2026-03-01T00:00:00.000Z" } as typeof historicalPlan,
+        ],
+      }),
+    );
+    expect(derived.confirmableProposal).toBeNull();
   });
 });
 

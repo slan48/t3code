@@ -18,6 +18,7 @@ import {
   findSidebarProposedPlan,
   hasActionableProposedPlan,
   isLatestTurnSettled,
+  unsettledTurnId,
   workEntryIndicatesToolFailure,
   workEntryIndicatesToolNeutralStatus,
   workEntryIndicatesToolSuccess,
@@ -1623,6 +1624,66 @@ describe("isLatestTurnSettled", () => {
         null,
       ),
     ).toBe(false);
+  });
+});
+
+describe("unsettledTurnId", () => {
+  const turn = TurnId.make("turn-1");
+
+  it("names nothing for a conversation the server has stopped", () => {
+    /*
+     * THE SHAPE A REHYDRATED THREAD ACTUALLY HAS. The projection writes the
+     * session's `activeTurnId` into the thread's latest-turn pointer, and that
+     * is null for every session that is not running — so a conversation with
+     * nine completed turns comes back from the server with no latest turn at
+     * all. `isLatestTurnSettled` reads that as "not settled", which is right
+     * for "is this conversation busy" and catastrophic for anything gated on
+     * it per item: it withheld every proposal the conversation ever produced
+     * until an unrelated provider turn repopulated the field.
+     */
+    const stopped = { status: "stopped", activeTurnId: null } as const;
+    expect(isLatestTurnSettled(null, stopped)).toBe(false);
+    expect(unsettledTurnId(null, stopped)).toBeNull();
+  });
+
+  it("names the running turn while a session is producing one", () => {
+    expect(unsettledTurnId(null, { status: "running", activeTurnId: turn })).toBe(turn);
+    expect(
+      unsettledTurnId(
+        {
+          turnId: TurnId.make("turn-0"),
+          startedAt: "2026-02-27T21:00:00.000Z",
+          completedAt: "2026-02-27T21:00:09.000Z",
+        },
+        { status: "running", activeTurnId: turn },
+      ),
+    ).toBe(turn);
+  });
+
+  it("names a turn that started and never finished", () => {
+    // The session record is gone or idle, but this turn was never closed out.
+    expect(
+      unsettledTurnId(
+        { turnId: turn, startedAt: "2026-02-27T21:10:00.000Z", completedAt: null },
+        { status: "ready", activeTurnId: null },
+      ),
+    ).toBe(turn);
+  });
+
+  it("names nothing for a completed turn, with or without a session", () => {
+    const completed = {
+      turnId: turn,
+      startedAt: "2026-02-27T21:10:00.000Z",
+      completedAt: "2026-02-27T21:10:06.000Z",
+    } as const;
+    expect(unsettledTurnId(completed, { status: "ready", activeTurnId: null })).toBeNull();
+    expect(unsettledTurnId(completed, null)).toBeNull();
+  });
+
+  it("does not claim a turn it cannot place is running", () => {
+    // Neither timestamp: unplaceable, and inventing "running" here is exactly
+    // the guess that hid finished work.
+    expect(unsettledTurnId({ turnId: turn, startedAt: null, completedAt: null }, null)).toBeNull();
   });
 });
 

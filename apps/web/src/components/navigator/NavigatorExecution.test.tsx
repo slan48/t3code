@@ -10,12 +10,14 @@ import type {
   EnvironmentId,
   OrchestrationPeerLoopExecution,
   OrchestrationProposedPlanId,
+  PeerLoopRunStateFile,
   PeerLoopRunSummary,
 } from "@t3tools/contracts";
 import {
   PeerLoopCommandRefusedError,
   PeerLoopExecutionCoordinationError,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import {
   RouterProvider,
@@ -29,7 +31,11 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
-import { describeExecution, type NavigatorExecutionDetail } from "~/navigatorExecution";
+import {
+  describeExecution,
+  describeExecutionDetail,
+  type NavigatorExecutionDetail,
+} from "~/navigatorExecution";
 import { navigatorExecutionKey, navigatorExecutionStore } from "~/state/navigatorExecutionCommand";
 import { ProposedPlanCard } from "../chat/ProposedPlanCard";
 import {
@@ -99,21 +105,57 @@ const summary = (overrides: Partial<PeerLoopRunSummary> = {}): PeerLoopRunSummar
   ...overrides,
 });
 
+/** Peer Loop's durable run state, as an attach hands it over. */
+const runState = (overrides: Partial<PeerLoopRunStateFile> = {}): PeerLoopRunStateFile =>
+  ({
+    schemaVersion: 1,
+    runId: "run-77",
+    projectPath: "/repos/demo",
+    state: "done",
+    iteration: 4,
+    createdAt: "2026-03-01T09:00:00.000Z",
+    updatedAt: "2026-03-01T10:05:00.000Z",
+    ownerPolicyText: "",
+    builderSessionId: null,
+    reviewerThreadId: null,
+    repo: null,
+    lastBuilderTask: "do not read me",
+    lastBuilderReport: "do not read me either",
+    lastReviewerDecision: null,
+    queuedOwnerMessages: [],
+    inFlight: null,
+    haltReason: null,
+    stopRequested: false,
+    adapters: {
+      reviewer: "codex",
+      reviewerVersion: null,
+      builder: "claude-code",
+      builderVersion: null,
+    },
+    safetyLimit: null,
+    lastSequence: 20,
+    ...overrides,
+  }) as PeerLoopRunStateFile;
+
 const context = (
   overrides: Partial<NavigatorExecutionContext> = {},
 ): NavigatorExecutionContext => ({
   environmentId: ENVIRONMENT_ID,
   threadId: THREAD_ID,
   purpose: "navigator",
-  latestTurnSettled: true,
+  // A conversation loaded from the server: nothing in flight.
+  unsettledTurnId: null,
   executionsByProposal: new Map(),
   ...overrides,
 });
+
+const PLAN_TURN_ID = TurnId.make("turn-that-produced-the-plan");
 
 const proposal = {
   id: PLAN_ID,
   implementedAt: null,
   implementationThreadId: null,
+  turnId: PLAN_TURN_ID,
 } as const;
 
 /* ------------------------------------------------------------- action */
@@ -146,14 +188,24 @@ describe("the Execute action", () => {
     expect(markup).not.toContain("Execute with Peer Loop");
   });
 
-  it("does not offer it while the turn is unsettled", async () => {
+  it("does not offer it while this proposal's own turn is still producing", async () => {
     const markup = await render(
       <NavigatorProposalExecution
-        context={context({ latestTurnSettled: false })}
+        context={context({ unsettledTurnId: PLAN_TURN_ID })}
         proposal={proposal}
       />,
     );
     expect(markup).not.toContain("Execute with Peer Loop");
+  });
+
+  it("offers it while a different turn runs, because this plan is final", async () => {
+    const markup = await render(
+      <NavigatorProposalExecution
+        context={context({ unsettledTurnId: TurnId.make("turn-something-else") })}
+        proposal={proposal}
+      />,
+    );
+    expect(markup).toContain("Execute with Peer Loop");
   });
 
   it("does not offer it for a proposal a coding thread already implemented", async () => {
@@ -164,6 +216,7 @@ describe("the Execute action", () => {
           id: PLAN_ID,
           implementedAt: "2026-02-01T00:00:00.000Z",
           implementationThreadId: null,
+          turnId: PLAN_TURN_ID,
         }}
       />,
     );
@@ -256,6 +309,30 @@ describe("a failure the owner has to act on", () => {
     );
     expect(markup).toContain("already been executed");
     expect(markup).toContain('href="/peer-loop/run-12"');
+    navigatorExecutionStore.reset();
+  });
+
+  it("mounts a CONTROL_UNAVAILABLE refusal with the action still offered", async () => {
+    // THE FIRST PAINT AFTER A MOUNT, with the refusal already in the gate.
+    // `CONTROL_UNAVAILABLE` is a provable pre-start refusal: another process
+    // holds the project, nothing started, and the owner may press again the
+    // moment it lets go. Nothing about mounting is allowed to withhold it, and
+    // no new turn or refresh happens before this render.
+    await seedFailure(
+      new PeerLoopCommandRefusedError({
+        code: "CONTROL_UNAVAILABLE",
+        detail: "another process is driving this project",
+        data: null,
+      }),
+    );
+    const markup = await render(
+      <NavigatorProposalExecution context={context()} proposal={proposal} />,
+    );
+    expect(markup).toContain("Execute with Peer Loop");
+    // The notice stays beside it: the owner still has to know why the last
+    // press did nothing.
+    expect(markup).toContain("Another process is driving this project");
+    expect(markup).toContain("CONTROL_UNAVAILABLE");
     navigatorExecutionStore.reset();
   });
 
@@ -487,6 +564,71 @@ describe("a finished child execution", () => {
     const markup = await doneCard({ kind: "completion-missing" });
     expect(markup).toContain("Done");
     expect(markup).toContain("recorded no structured completion summary");
+  });
+
+  it("renders the finished run's own reading, not the question it was waiting on", async () => {
+    // The two readings a DONE card can be holding, rendered. The one taken
+    // while the run was still waiting on the owner produces neither a question
+    // nor a completion, which is exactly the card an owner was left looking at
+    // when the snapshot did not move with the run.
+    const detailFrom = (state: PeerLoopRunStateFile) =>
+      describeExecutionDetail({
+        status: describeExecution({
+          link: link({ runId: "run-77" }),
+          runs: [summary({ state: "done", updatedAt: "2026-03-01T10:05:00.000Z" })],
+          unreadable: [],
+          nowMs: NOW_MS,
+        }).status,
+        snapshot: { status: "ready", state },
+      });
+
+    const stale = await doneCard(
+      detailFrom(
+        runState({
+          state: "owner_required",
+          updatedAt: "2026-03-01T10:01:00.000Z",
+          lastReviewerDecision: {
+            decision: "OWNER_REQUIRED",
+            summary: "Blocked on a choice.",
+            ownerQuestion: "Which database should the backfill target?",
+            whyOwnerIsRequired: "Only the owner can settle it.",
+            options: ["Primary", "Replica"],
+          },
+        }),
+      ),
+    );
+    expect(stale).toContain("Done");
+    expect(stale).toContain("recorded no structured completion summary");
+    expect(stale).not.toContain("Which database should the backfill target?");
+
+    const refreshed = await doneCard(
+      detailFrom(
+        runState({
+          state: "done",
+          updatedAt: "2026-03-01T10:05:00.000Z",
+          lastReviewerDecision: {
+            decision: "DONE",
+            summary: "Backfill shipped.",
+            finalState: "Green on main.",
+          },
+          repo: {
+            head: "abc123def456",
+            branch: "main",
+            worktreeDigest: null,
+            isGitRepo: true,
+            capturedAt: "2026-03-01T10:05:00.000Z",
+          },
+        }),
+      ),
+    );
+    expect(refreshed).toContain("Done");
+    expect(refreshed).toContain("Backfill shipped.");
+    expect(refreshed).toContain("Final state: Green on main.");
+    expect(refreshed).toContain("abc123def456");
+    expect(refreshed).toContain("main");
+    // Neither the old question nor the "no completion" sentence survives it.
+    expect(refreshed).not.toContain("Which database should the backfill target?");
+    expect(refreshed).not.toContain("recorded no structured completion summary");
   });
 
   it("keeps the DONE status when the snapshot could not be read", async () => {

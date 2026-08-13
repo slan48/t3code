@@ -27,6 +27,7 @@ import type {
   OrchestrationPeerLoopExecution,
   OrchestrationProposedPlanId,
   PeerLoopExecuteProposalResult,
+  PeerLoopRunStateFile,
   PeerLoopRunSummary,
   ThreadId,
 } from "@t3tools/contracts";
@@ -36,13 +37,19 @@ import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 
 import {
   buildExecuteProposalRequest,
   describeCoordinationError,
+  NO_EXECUTION_ATTEMPT,
   NO_EXECUTION_SNAPSHOT,
+  proposalExecutionAvailability,
   selectNavigatorSnapshotAtom,
+  type ExecutableProposal,
+  type ExecuteProposalAvailability,
+  type NavigatorExecutionAttempt,
+  type NavigatorExecutionFacts,
   type NavigatorExecutionSnapshot,
   describePeerLoopExecutionError,
   EXECUTION_RESULT_UNKNOWN,
@@ -316,6 +323,46 @@ export function useNavigatorExecution(input: NavigatorExecutionTarget) {
 }
 
 /**
+ * What the gate remembers about one proposal's last attempt.
+ *
+ * Read from the store rather than from a render, because the two surfaces ask
+ * at different moments: a card asks while rendering and a confirmation phrase
+ * asks while submitting. The store is the same in both.
+ */
+export function readNavigatorExecutionAttempt(input: {
+  readonly facts: NavigatorExecutionFacts;
+  readonly proposal: ExecutableProposal | null;
+}): NavigatorExecutionAttempt {
+  const { threadId, environmentId } = input.facts;
+  if (input.proposal === null || threadId === null) return NO_EXECUTION_ATTEMPT;
+  const state = navigatorExecutionStore.read(
+    navigatorExecutionKey({ environmentId, threadId, proposedPlanId: input.proposal.id }),
+  );
+  return { pending: state.pending, disposition: state.failure?.disposition ?? null };
+}
+
+/**
+ * Whether this proposal may be executed, answered once for every surface.
+ *
+ * THE SINGLE AVAILABILITY ANSWER. Both Execute buttons and the composer's
+ * confirmation call this with the conversation's one facts object, so a card
+ * that mounts offering the action and a phrase submitted the next moment cannot
+ * reach different conclusions about the same proposal. Nothing is cached: a
+ * proposal whose last attempt was a provable pre-start refusal is executable on
+ * the first render after a mount, with no turn and no refresh in between.
+ */
+export function navigatorExecutionAvailability(input: {
+  readonly facts: NavigatorExecutionFacts;
+  readonly proposal: ExecutableProposal | null;
+}): ExecuteProposalAvailability {
+  return proposalExecutionAvailability({
+    facts: input.facts,
+    proposal: input.proposal,
+    attempt: readNavigatorExecutionAttempt(input),
+  });
+}
+
+/**
  * The retained links for one conversation, and the durable ones they merge into.
  *
  * Reads every proposal's entry rather than one, because the conversation shows
@@ -480,24 +527,35 @@ const navigatorSnapshotAtomFor = (environmentId: EnvironmentId, runId: string) =
 type NavigatorSnapshotAtom = ReturnType<typeof navigatorSnapshotAtomFor> | typeof NO_SNAPSHOT_ATOM;
 
 /**
- * Who gets to refresh a shared snapshot when its run summary moves, and for how
- * long the answer is remembered.
+ * Who re-reads a shared snapshot, so that one revision costs one `run.attach`.
  *
- * Both copies of an execution see the same new `updatedAt` in the same tick and
- * would both refresh the atom they share — two `run.attach` calls for one
- * change. The first to claim a (run, revision) pair does it; the second finds
- * the pair already claimed and does nothing.
+ * Both copies of an execution see the same reading and the same new `updatedAt`
+ * in the same tick and would both refresh the atom they share. The first to
+ * claim a (run, revision) pair does it; every later caller for that pair finds
+ * it claimed and does nothing. A claim against a key nobody is observing is
+ * refused — there is no card on screen to read for.
+ *
+ * NOTHING HERE DECIDES WHETHER A READ IS NEEDED. That was the defect: this
+ * remembered which revision each card had *seen* and treated a card's first
+ * sighting as a reading, because mounting the atom reads it. A card whose first
+ * sighting landed on a revision change — the Plan sidebar opening onto a run
+ * that had just finished, a timeline row scrolling back in — then recorded the
+ * new revision while reading nothing, and the copy holding the older reading
+ * found the pair claimed and stood down. The DONE status arrived over the
+ * OWNER_REQUIRED snapshot underneath it and nothing replaced it. Whether a
+ * reading is behind is answered from the reading itself, in
+ * {@link snapshotReadingIsBehind}; this only settles who acts on it.
  *
  * OWNERSHIP IS REFERENCE-COUNTED, because a plain map here is a leak: one entry
  * per environment/run that an owner ever looked at, kept for the lifetime of
  * the tab. Each mounted observer retains, each unmount releases, and the last
- * release drops the entry. A claim against an unretained key is refused rather
- * than creating one, so a stray call cannot resurrect the leak.
+ * release drops the entry. A claim against an unretained key creates nothing,
+ * so a stray call cannot resurrect the leak.
  *
  * React's StrictMode development mount runs setup → cleanup → setup, which
- * takes the count 1 → 0 → 1 and forgets the remembered revision in between.
- * That is harmless: the observer that re-retains has not seen a *new* revision,
- * so it does not refresh — it only re-remembers the one it already had.
+ * takes the count 1 → 0 → 1 and forgets which pairs were claimed. That is
+ * harmless: a forgotten claim only lets a card ask again, and it asks only
+ * while the reading it holds is genuinely behind the run list.
  */
 export function createSnapshotRefreshLedger() {
   const entries = new Map<string, { observers: number; revision: string | null }>();
@@ -517,7 +575,7 @@ export function createSnapshotRefreshLedger() {
      * True for the first retained caller of each (key, revision).
      *
      * False for every later caller of the same pair, and false for a key
-     * nobody is observing — there is no card on screen to refresh for.
+     * nobody is observing — there is no card on screen to read for.
      */
     claim: (key: string, revision: string): boolean => {
       const entry = entries.get(key);
@@ -526,6 +584,8 @@ export function createSnapshotRefreshLedger() {
       entry.revision = revision;
       return true;
     },
+    /** The revision a read has already been issued for, if anyone is looking. */
+    claimed: (key: string): string | null => entries.get(key)?.revision ?? null,
     observers: (key: string): number => entries.get(key)?.observers ?? 0,
     size: (): number => entries.size,
     reset: (): void => entries.clear(),
@@ -541,15 +601,64 @@ export const navigatorSnapshotKey = (input: {
 }): string => `${input.environmentId.length}:${input.environmentId}:${input.runId}`;
 
 /**
+ * Whether the snapshot a card is holding was taken before the run list moved.
+ *
+ * THE READING SAYS WHEN IT WAS TAKEN. Peer Loop stamps its run state file with
+ * the same `updatedAt` its run list reports, so a card can compare the two
+ * rather than reason about which copy mounted the shared atom first, whether a
+ * node survived a run passing through a working state, or how long an unused
+ * one lingers. Those were all guesses, and every one of them was wrong in some
+ * ordering.
+ *
+ * Holding nothing yet is not behind: the read that mounting started is the
+ * answer, and a second one would be the duplicate this avoids. A reading at or
+ * after the listed revision is not behind either — an attach lands after the
+ * summary that prompted it and routinely comes back newer.
+ *
+ * Two stamps that cannot be compared are treated as behind, which costs at most
+ * one extra read: {@link createSnapshotRefreshLedger} allows one per revision.
+ */
+export function snapshotReadingIsBehind(reading: string | null, revision: string): boolean {
+  if (reading === null) return false;
+  if (reading === revision) return false;
+  const held = Date.parse(reading);
+  const listed = Date.parse(revision);
+  if (Number.isNaN(held) || Number.isNaN(listed)) return true;
+  return held < listed;
+}
+
+/**
+ * One mounted card, reporting the reading it holds and the revision it is being
+ * asked to show.
+ *
+ * The body of the hook's effect, lifted out of React so the behaviour that
+ * matters — which copy re-reads, and when — can be driven directly, against the
+ * real atom, in the order React commits it. Nothing else about it is different.
+ */
+export function observeSnapshotRevision(input: {
+  /** Null when this card wants no snapshot at all. Nothing is read or claimed. */
+  readonly key: string | null;
+  /** Peer Loop's `updatedAt` from the run list. Null when there is no summary. */
+  readonly revision: string | null;
+  /** The `updatedAt` of the snapshot this card is holding, if it holds one. */
+  readonly reading: string | null;
+  readonly refresh: () => void;
+}): void {
+  if (input.key === null || input.revision === null) return;
+  if (!snapshotReadingIsBehind(input.reading, input.revision)) return;
+  if (snapshotRefreshLedger.claim(input.key, input.revision)) input.refresh();
+}
+
+/**
  * The structured snapshot behind one child execution, when it is worth reading.
  *
  * `wanted` is the caller's answer to "does this run's attention state have
  * structured detail an owner needs" — DONE and OWNER_REQUIRED, and nothing
  * else. When it is false this reads an atom that queries nothing.
  *
- * `revision` is the run summary's own `updatedAt`. A change to it re-reads the
- * snapshot exactly once across every mounted copy; nothing here polls, and
- * nothing subscribes to the run's activity.
+ * `revision` is the run summary's own `updatedAt`. A snapshot stamped before it
+ * is re-read exactly once across every mounted copy, whichever copy notices;
+ * nothing here polls, and nothing subscribes to the run's activity.
  */
 export function useNavigatorExecutionSnapshot(input: {
   readonly environmentId: EnvironmentId | null;
@@ -573,32 +682,47 @@ export function useNavigatorExecutionSnapshot(input: {
       ? navigatorSnapshotKey({ environmentId: String(environmentId), runId })
       : null;
 
+  const snapshot = useMemo(
+    () => navigatorSnapshotOf({ wanted, environmentId, result }),
+    [environmentId, result, wanted],
+  );
+
   // Ownership, on its own effect and keyed only on the entry. A revision change
   // must not churn the reference count — and must not momentarily drop it to
-  // zero, which would discard the very revision the claim below compares to.
+  // zero, which would let both copies read for one change.
   useEffect(() => {
     if (ledgerKey === null) return;
     snapshotRefreshLedger.retain(ledgerKey);
     return () => snapshotRefreshLedger.release(ledgerKey);
   }, [ledgerKey]);
 
-  const observedRevision = useRef<string | null>(null);
+  // WHETHER THIS CARD IS BEHIND IS A FACT ABOUT WHAT IT IS HOLDING, not about
+  // which copy mounted the shared atom first. A run that finishes, or stops for
+  // the owner a second time, is a reading stamped before the summary above it —
+  // whichever copy notices says so, and exactly one of them re-reads.
+  const reading = snapshot.state?.updatedAt ?? null;
   useEffect(() => {
-    if (ledgerKey === null || revision === null) return;
-    const first = observedRevision.current === null;
-    const changed = observedRevision.current !== revision;
-    observedRevision.current = revision;
-    const claimed = snapshotRefreshLedger.claim(ledgerKey, revision);
-    // Mounting the atom already issues the read; only a later revision needs a
-    // refresh, and only the first copy to notice it performs one.
-    if (!first && changed && claimed) refresh();
-  }, [ledgerKey, refresh, revision]);
+    observeSnapshotRevision({ key: ledgerKey, revision, reading, refresh });
+  }, [ledgerKey, reading, refresh, revision]);
 
-  return useMemo(() => {
-    if (!wanted || environmentId === null) return NO_EXECUTION_SNAPSHOT;
-    if (AsyncResult.isFailure(result)) return { status: "failed", state: null };
-    const value = Option.getOrNull(AsyncResult.value(result));
-    if (value === null) return { status: "loading", state: null };
-    return { status: "ready", state: value.state };
-  }, [environmentId, result, wanted]);
+  return snapshot;
+}
+
+/**
+ * What a card sees, from whatever the snapshot atom currently holds.
+ *
+ * A card that wants no snapshot has none — not an empty one — because "this run
+ * has no structured detail worth reading" and "the read failed" are different
+ * things to say. A failure leaves the run-list status above it untouched.
+ */
+export function navigatorSnapshotOf(input: {
+  readonly wanted: boolean;
+  readonly environmentId: EnvironmentId | null;
+  readonly result: AsyncResult.AsyncResult<{ readonly state: PeerLoopRunStateFile }, unknown>;
+}): NavigatorExecutionSnapshot {
+  if (!input.wanted || input.environmentId === null) return NO_EXECUTION_SNAPSHOT;
+  if (AsyncResult.isFailure(input.result)) return { status: "failed", state: null };
+  const value = Option.getOrNull(AsyncResult.value(input.result));
+  if (value === null) return { status: "loading", state: null };
+  return { status: "ready", state: value.state };
 }

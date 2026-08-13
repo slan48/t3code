@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   isProviderDriverKind,
+  type OrchestrationPeerLoopExecution,
   ProjectId,
   type ModelSelection,
   type ProviderDriverKind,
@@ -8,8 +9,15 @@ import {
   type ScopedProjectRef,
   type ScopedThreadRef,
   type ThreadId,
+  type ThreadPurpose,
   type TurnId,
 } from "@t3tools/contracts";
+import type { ExecutableProposal, NavigatorExecutionFacts } from "../navigatorExecution";
+import {
+  findLatestProposedPlan,
+  hasActionableProposedPlan,
+  unsettledTurnId,
+} from "../session-logic";
 import { type ChatMessage, type SessionPhase, type Thread, type ThreadShell } from "../types";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
@@ -99,6 +107,83 @@ export function buildLocalDraftThread(
     peerLoopExecutions: [],
   };
 }
+
+/**
+ * The thread facts executing a proposal depends on. A subset, so a test can
+ * hand this the shape the server really hydrates rather than an ideal one.
+ */
+export type NavigatorExecutionThread = Pick<
+  Thread,
+  "id" | "purpose" | "latestTurn" | "session" | "proposedPlans"
+>;
+
+export interface NavigatorExecutionDerivation {
+  /** Null for anything that is not a Navigator conversation. */
+  readonly facts: NavigatorExecutionFacts | null;
+  /** The one proposal a confirmation phrase could be about, or null. */
+  readonly confirmableProposal: ExecutableProposal | null;
+}
+
+/**
+ * Everything the execution surfaces read, derived once from the hydrated thread.
+ *
+ * WHAT MAKES THIS A FUNCTION RATHER THAN SIX LINES IN THE COMPONENT: the inputs
+ * it has to be right about are exactly the ones a mounted conversation supplies
+ * and a hand-written fixture does not. A thread loaded from the server has
+ * `latestTurn: null` whenever its session has stopped — the projection clears
+ * that pointer with the session's `activeTurnId` — so every decision that
+ * treated a missing latest turn as "still running" withheld proposals the
+ * conversation had long finished producing. Driving this from a real hydrated
+ * shape is the only way that stays fixed.
+ */
+export function deriveNavigatorExecution(input: {
+  readonly environmentId: EnvironmentId;
+  readonly thread: NavigatorExecutionThread | null;
+  /** False for a draft: there is no durable thread to execute against. */
+  readonly isServerThread: boolean;
+  readonly executionsByProposal: ReadonlyMap<string, ReadonlyArray<OrchestrationPeerLoopExecution>>;
+}): NavigatorExecutionDerivation {
+  const purpose: ThreadPurpose = input.thread?.purpose ?? "coding";
+  if (purpose !== "navigator") return NO_NAVIGATOR_EXECUTION;
+
+  const threadId = input.isServerThread ? (input.thread?.id ?? null) : null;
+  const inFlightTurnId = unsettledTurnId(
+    input.thread?.latestTurn ?? null,
+    input.thread?.session ?? null,
+  );
+  const facts: NavigatorExecutionFacts = {
+    environmentId: input.environmentId,
+    threadId,
+    purpose,
+    unsettledTurnId: inFlightTurnId,
+    executionsByProposal: input.executionsByProposal,
+  };
+
+  // WHILE A TURN IS IN FLIGHT THERE IS NO "THE PROPOSAL". A phrase names the
+  // conversation's current plan, and mid-turn that is the thing being
+  // rewritten. An Execute button names the card it is attached to, which stays
+  // unambiguous — so only this, the phrase's target, is withheld.
+  const latest = findLatestProposedPlan(
+    input.thread?.proposedPlans ?? [],
+    input.thread?.latestTurn?.turnId ?? null,
+  );
+  const confirmableProposal =
+    threadId !== null && inFlightTurnId === null && hasActionableProposedPlan(latest) && latest
+      ? {
+          id: latest.id,
+          implementedAt: latest.implementedAt,
+          implementationThreadId: latest.implementationThreadId,
+          turnId: latest.turnId,
+        }
+      : null;
+
+  return { facts, confirmableProposal };
+}
+
+const NO_NAVIGATOR_EXECUTION: NavigatorExecutionDerivation = {
+  facts: null,
+  confirmableProposal: null,
+};
 
 export function buildLoadingThreadFromShell(shell: ThreadShell): Thread {
   return {

@@ -33,6 +33,7 @@ import type {
   PeerLoopRunSummary,
   ThreadId,
   ThreadPurpose,
+  TurnId,
 } from "@t3tools/contracts";
 
 import { formatRelative } from "./agentRunFormat";
@@ -113,6 +114,13 @@ export interface ExecutableProposal {
   readonly id: OrchestrationProposedPlanId;
   readonly implementedAt: string | null;
   readonly implementationThreadId: string | null;
+  /**
+   * The turn that produced it, which is how "can this still change" is asked.
+   *
+   * Null for a plan whose turn the read model does not carry: unplaceable, and
+   * therefore not claimable as the output of whatever is running now.
+   */
+  readonly turnId: TurnId | null;
 }
 
 /**
@@ -127,8 +135,15 @@ export function executeProposalAvailability(input: {
   readonly purpose: ThreadPurpose | undefined;
   /** True only for a thread the server has: a draft has no durable id. */
   readonly isDurableThread: boolean;
-  /** False while the turn that produced the proposal is still running. */
-  readonly latestTurnSettled: boolean;
+  /**
+   * False while THIS PROPOSAL'S OWN producing turn can still change it.
+   *
+   * Not "the conversation is idle". A thread-wide answer was what withheld
+   * every historical proposal on a rehydrated conversation, because a settled
+   * thread arrives from the server with no latest-turn record at all — see
+   * `unsettledTurnId` in `session-logic`.
+   */
+  readonly proposalSettled: boolean;
   readonly proposal: ExecutableProposal | null;
   /** Links already recorded for this proposal, durable or just returned. */
   readonly executionCount: number;
@@ -147,7 +162,7 @@ export function executeProposalAvailability(input: {
   if (input.purpose !== "navigator") return blocked("not-a-navigator-thread");
   if (!input.isDurableThread) return blocked("draft-conversation");
   if (input.proposal === null) return blocked("no-proposal");
-  if (!input.latestTurnSettled) return blocked("proposal-not-settled");
+  if (!input.proposalSettled) return blocked("proposal-not-settled");
   if (input.executionCount > 0) return blocked("already-executed");
   if (input.proposal.implementedAt !== null || input.proposal.implementationThreadId !== null) {
     return blocked("already-implemented");
@@ -171,6 +186,107 @@ export function showsExecutionArea(input: {
   readonly isDurableThread: boolean;
 }): boolean {
   return input.purpose === "navigator" && input.isDurableThread;
+}
+
+/**
+ * What the conversation knows about executing, derived once and handed down.
+ *
+ * ONE OBJECT, EVERY SURFACE. The Execute button in the timeline, the one in the
+ * Plan sidebar and the composer's confirmation all decide from this and nothing
+ * of their own — see {@link proposalExecutionAvailability}. Deliberately free of
+ * anything Peer Loop reports: it travels through the timeline's row context, and
+ * putting a five-second poll in it would re-render every row in the
+ * conversation.
+ */
+export interface NavigatorExecutionFacts {
+  readonly environmentId: EnvironmentId;
+  /** Null for a draft conversation: there is nothing durable to execute. */
+  readonly threadId: ThreadId | null;
+  readonly purpose: ThreadPurpose;
+  /**
+   * The turn still producing, or null when nothing is.
+   *
+   * DELIBERATELY NOT "IS THE THREAD SETTLED". That question cannot be answered
+   * from a rehydrated conversation — the server clears its latest-turn pointer
+   * whenever a session stops running — and answering it wrongly withheld every
+   * proposal a conversation had ever produced until an unrelated provider turn
+   * happened to repopulate the field.
+   */
+  readonly unsettledTurnId: TurnId | null;
+  readonly executionsByProposal: ReadonlyMap<string, ReadonlyArray<OrchestrationPeerLoopExecution>>;
+}
+
+/**
+ * Whether this proposal's own producing turn can still change it.
+ *
+ * A proposal from a turn that is not the one in flight is final, whatever else
+ * the conversation is doing, and a conversation with nothing in flight has no
+ * unfinished proposals at all.
+ */
+export function proposalIsSettled(input: {
+  readonly proposal: ExecutableProposal;
+  readonly unsettledTurnId: TurnId | null;
+}): boolean {
+  if (input.unsettledTurnId === null) return true;
+  if (input.proposal.turnId === null) return true;
+  return input.proposal.turnId !== input.unsettledTurnId;
+}
+
+/** What the per-proposal gate remembers about the last attempt. */
+export interface NavigatorExecutionAttempt {
+  /** True while this client's own request is outstanding. */
+  readonly pending: boolean;
+  /** Null when nothing has been attempted, or nothing failed. */
+  readonly disposition: ExecutionRetryDisposition | null;
+}
+
+/** Nothing attempted. What a proposal's first mount looks like. */
+export const NO_EXECUTION_ATTEMPT: NavigatorExecutionAttempt = {
+  pending: false,
+  disposition: null,
+};
+
+/**
+ * Whether this proposal may be executed, from the conversation's facts and the
+ * gate's own record of what the last attempt left behind.
+ *
+ * ONE PLACE THAT TURNS THE CONVERSATION'S FACTS INTO A PER-PROPOSAL ANSWER.
+ * Settledness in particular is derived here rather than passed in, because
+ * passing it in is how a thread-wide "is the conversation busy" ended up
+ * deciding a per-proposal question — and on a rehydrated conversation, where
+ * the server carries no latest-turn pointer at all, that answer withheld every
+ * proposal the thread had ever produced.
+ *
+ * A retryable refusal is nowhere in this: `CONTROL_UNAVAILABLE` and
+ * `PROJECT_HAS_UNFINISHED_RUN` are provable pre-start refusals, so a proposal
+ * carrying one is executable the moment it mounts, with no turn, no
+ * regeneration and no refresh in between. Only `unknown` and `inspect-existing`
+ * withhold the action, and they do it here, once, for every surface.
+ */
+export function proposalExecutionAvailability(input: {
+  readonly facts: NavigatorExecutionFacts;
+  /** Null when the conversation has no proposal a confirmation could be about. */
+  readonly proposal: ExecutableProposal | null;
+  readonly attempt: NavigatorExecutionAttempt;
+}): ExecuteProposalAvailability {
+  return executeProposalAvailability({
+    purpose: input.facts.purpose,
+    isDurableThread: input.facts.threadId !== null,
+    proposalSettled:
+      input.proposal === null
+        ? false
+        : proposalIsSettled({
+            proposal: input.proposal,
+            unsettledTurnId: input.facts.unsettledTurnId,
+          }),
+    proposal: input.proposal,
+    executionCount:
+      input.proposal === null
+        ? 0
+        : (input.facts.executionsByProposal.get(input.proposal.id)?.length ?? 0),
+    executing: input.attempt.pending,
+    lastAttemptDisposition: input.attempt.disposition,
+  });
 }
 
 /* ------------------------------------------------------------- request */
@@ -351,7 +467,10 @@ export type NavigatorExecutionStatus =
       readonly iteration: number;
       /** Peer Loop's own `updatedAt`, already relative. Null if unparseable. */
       readonly updatedLabel: string | null;
-      /** Peer Loop's structured `updatedAt`. The snapshot's refresh trigger. */
+      /**
+       * Peer Loop's structured `updatedAt`. What a snapshot is measured against:
+       * a reading stamped before this one is a reading of an earlier run.
+       */
       readonly updatedAt: string;
       readonly queuedOwnerMessages: number;
     }
