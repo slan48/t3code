@@ -537,12 +537,18 @@ const NavigatorExecutionDetailBlock = memo(function NavigatorExecutionDetailBloc
 });
 
 /**
- * One button per option Peer Loop recorded.
+ * A button per option this card presents.
+ *
+ * BOUNDED THE WAY EVERY OTHER PEER LOOP SURFACE BOUNDS OPTIONS, so a Reviewer
+ * that produced a dozen does not turn a conversation into a form. Whatever is
+ * past the limit is reachable where every option always is: the run's own page,
+ * one link below.
  *
  * THE INDEX ON THE BUTTON IS PEER LOOP'S OWN. An option too long to read is
- * shortened and an empty one is not drawn, and neither changes the number sent
- * — the server resolves the text by that number out of a reading it takes for
- * itself, so a renumbered click would answer with a different sentence.
+ * shortened, an empty one is not drawn, and one past the limit is not drawn —
+ * none of that changes the number sent, because the server resolves the text by
+ * that number out of a reading it takes for itself, and a renumbered click
+ * would answer with a different sentence.
  *
  * Every button is disabled while any answer for this run is in flight. The two
  * copies of this card share one gate, so a second click cannot become a second

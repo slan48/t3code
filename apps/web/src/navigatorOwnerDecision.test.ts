@@ -23,6 +23,20 @@ import {
   presentOwnerDecisionOptions,
   type NavigatorExecutionSnapshot,
 } from "./navigatorExecution";
+import {
+  describeOwnerDecisionFromRecord,
+  PEER_LOOP_OWNER_OPTION_LIMIT,
+} from "./peerLoopPresentation";
+
+/** What the inspector's own list would show, for the same raw options. */
+const boundedOwnerOptionsForTest = (options: ReadonlyArray<string>): ReadonlyArray<string> =>
+  describeOwnerDecisionFromRecord({
+    decision: "OWNER_REQUIRED",
+    summary: "s",
+    ownerQuestion: "q",
+    whyOwnerIsRequired: "w",
+    options,
+  })?.options ?? [];
 
 const THREAD_ID = ThreadId.make("thread-navigator-1");
 const RUN_ID = "20260812T062443Z-4eb56b42";
@@ -235,6 +249,76 @@ describe("drawing options without renumbering them", () => {
     );
     // The empty option is dropped from the buttons; the survivors keep 1 and 2.
     expect(presentOwnerDecisionOptions(action?.options ?? []).map((o) => o.index)).toEqual([1, 2]);
+  });
+});
+
+describe("the bound every Peer Loop surface applies", () => {
+  const many = (count: number) =>
+    Array.from({ length: count }, (_, index) => `Option ${String(index)}`);
+
+  it("draws no more options than the shared limit allows", () => {
+    const shown = presentOwnerDecisionOptions(many(12).map((label, index) => ({ index, label })));
+    expect(shown).toHaveLength(PEER_LOOP_OWNER_OPTION_LIMIT);
+    // The ninth and everything after it is not drawn — and not renumbered into
+    // view either. The run's own page lists them all.
+    expect(shown.at(-1)).toEqual({ index: 7, label: "Option 7" });
+    expect(shown.map((option) => option.label)).not.toContain("Option 8");
+  });
+
+  it("does not backfill from beyond the limit when an early option is empty", () => {
+    /*
+     * THE ORDER THAT MATTERS. Take the limit first, then drop what cannot be
+     * drawn — filtering first would promote the ninth option into view and make
+     * the card disagree with the inspector about what the Reviewer offered.
+     */
+    const options = many(10).map((label, index) => ({
+      index,
+      label: index === 2 ? "   " : label,
+    }));
+    const shown = presentOwnerDecisionOptions(options);
+    expect(shown).toHaveLength(PEER_LOOP_OWNER_OPTION_LIMIT - 1);
+    // Every survivor keeps its own number, the empty one leaves a hole rather
+    // than shifting anything, and option 8 stayed out.
+    expect(shown.map((option) => option.index)).toEqual([0, 1, 3, 4, 5, 6, 7]);
+    expect(shown.map((option) => option.label)).not.toContain("Option 8");
+  });
+
+  it("still fingerprints every raw option, including the ones not drawn", () => {
+    // The bound is presentation. The decision is what Peer Loop wrote, and the
+    // server recomputes the fingerprint from all of it.
+    const options = many(12);
+    const action = describeAction({
+      snapshot: ready({
+        lastReviewerDecision: { ...DECISION, options },
+      } as Partial<PeerLoopRunStateFile>),
+    });
+    expect(action?.options).toHaveLength(12);
+    expect(action?.fingerprint).toBe(
+      peerLoopDecisionFingerprint({
+        ownerQuestion: DECISION.ownerQuestion,
+        whyOwnerIsRequired: DECISION.whyOwnerIsRequired,
+        options,
+        iteration: 2,
+      }),
+    );
+    // And a decision truncated to what is drawn would name something else.
+    expect(action?.fingerprint).not.toBe(
+      peerLoopDecisionFingerprint({
+        ownerQuestion: DECISION.ownerQuestion,
+        whyOwnerIsRequired: DECISION.whyOwnerIsRequired,
+        options: options.slice(0, PEER_LOOP_OWNER_OPTION_LIMIT),
+        iteration: 2,
+      }),
+    );
+  });
+
+  it("agrees with the presentation module's own bound", () => {
+    // One rule, two call sites: the inspector's list and these buttons take the
+    // same first eight, so an owner sees the same options in both places.
+    const options = many(12).map((label, index) => ({ index, label }));
+    expect(presentOwnerDecisionOptions(options).map((option) => option.label)).toEqual(
+      boundedOwnerOptionsForTest(many(12)),
+    );
   });
 });
 

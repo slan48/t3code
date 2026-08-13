@@ -43,6 +43,7 @@ import {
   describeOwnerDecisionFromRecord,
   describeRunAttention,
   existingRunIdFromRefusal,
+  PEER_LOOP_OWNER_OPTION_LIMIT,
   type PeerLoopAttentionKey,
   type PeerLoopAttentionPresentation,
   type PeerLoopCompletion,
@@ -703,18 +704,29 @@ export function describeOwnerDecisionAction(input: {
 export const NAVIGATOR_OPTION_DISPLAY_CHARS = 160;
 
 /**
- * The options a card draws, with their own indices intact.
+ * The options a card draws, bounded the way every other Peer Loop surface
+ * bounds them, with their own indices intact.
  *
- * An option Peer Loop recorded as empty has nothing to put on a button, so it
- * is not drawn — and every other option keeps the number it came with. That is
- * the whole reason this returns the index rather than relying on the caller's
- * own loop counter.
+ * SAME RULE AS `boundedOptions` IN THE PRESENTATION MODULE, in the same order:
+ * the first {@link PEER_LOOP_OWNER_OPTION_LIMIT} are taken, then the ones with
+ * nothing to put on a button are dropped. Taking the limit first is what makes
+ * the two agree — filtering first would quietly promote a ninth option into
+ * view on a decision that happened to record an empty one, so the card and the
+ * inspector would disagree about what the Reviewer offered.
+ *
+ * NOTHING IS BACKFILLED, and an option beyond the limit is not lost: the run's
+ * own page lists every option Peer Loop recorded, and the card links to it.
+ *
+ * Every surviving option keeps the number it came with. That is the whole
+ * reason this returns an index rather than relying on a caller's loop counter:
+ * the server resolves the text by that number out of the decision it re-reads,
+ * so a renumbered click would answer with a different sentence.
  */
 export function presentOwnerDecisionOptions(
   options: ReadonlyArray<NavigatorOwnerDecisionOption>,
 ): ReadonlyArray<NavigatorOwnerDecisionOption> {
   const shown: Array<NavigatorOwnerDecisionOption> = [];
-  for (const option of options) {
+  for (const option of options.slice(0, PEER_LOOP_OWNER_OPTION_LIMIT)) {
     const trimmed = option.label.trim();
     if (trimmed.length === 0) continue;
     shown.push({
