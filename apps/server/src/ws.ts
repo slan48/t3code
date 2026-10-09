@@ -50,6 +50,7 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  type NavigatorApprovalClassificationRpcInput,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -77,6 +78,7 @@ import { requireSourceControlMutationAllowed } from "./orchestration/sourceContr
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
+import * as NavigatorApprovalClassificationCoordinator from "./navigatorApproval/ClassificationCoordinator.ts";
 import {
   observeRpcEffect as instrumentRpcEffect,
   observeRpcStream as instrumentRpcStream,
@@ -129,6 +131,14 @@ const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchComma
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(5);
+
+/** Keep the RPC adapter thin: authorization and observability wrap this call at the WS site. */
+export const makeNavigatorApprovalClassificationRpcHandler =
+  (
+    coordinator: NavigatorApprovalClassificationCoordinator.NavigatorApprovalClassificationCoordinator["Service"],
+  ) =>
+  (input: NavigatorApprovalClassificationRpcInput) =>
+    coordinator.classifyProposalApproval(input);
 
 export const resolveAvailableEditorsForConfig = <A, E, R>(
   discovery: Effect.Effect<ReadonlyArray<A>, E, R>,
@@ -381,6 +391,8 @@ const makeWsRpcLayer = (
         yield* PeerLoopExecutionCoordinator.PeerLoopExecutionCoordinator;
       const peerLoopOwnerDecisionCoordinator =
         yield* PeerLoopOwnerDecisionCoordinator.PeerLoopOwnerDecisionCoordinator;
+      const navigatorApprovalClassificationCoordinator =
+        yield* NavigatorApprovalClassificationCoordinator.NavigatorApprovalClassificationCoordinator;
       const portDiscovery = yield* PortScanner.PortDiscovery;
       const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
@@ -2056,6 +2068,14 @@ const makeWsRpcLayer = (
             WS_METHODS.peerLoopAnswerOwnerDecision,
             peerLoopOwnerDecisionCoordinator.answerOwnerDecision(input),
             { "rpc.aggregate": "peer-loop" },
+          ),
+        [WS_METHODS.navigatorClassifyProposalApproval]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.navigatorClassifyProposalApproval,
+            makeNavigatorApprovalClassificationRpcHandler(
+              navigatorApprovalClassificationCoordinator,
+            )(input),
+            { "rpc.aggregate": "navigator" },
           ),
         [WS_METHODS.previewList]: (input) =>
           observeRpcEffect(WS_METHODS.previewList, previewManager.list(input), {

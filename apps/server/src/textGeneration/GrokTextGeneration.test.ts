@@ -21,6 +21,19 @@ const decodeGrokSettings = Schema.decodeSync(GrokSettings);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../scripts/acp-mock-agent.ts");
 
+const NAVIGATOR_APPROVAL_TRAITS = {
+  expressesApproval: true,
+  addsCondition: false,
+  requestsModification: false,
+  asksQuestion: false,
+  expressesDoubt: false,
+  isNegation: false,
+  isQuotationOrHypothetical: false,
+  referencesSomethingElse: false,
+  isBareAffirmation: true,
+  confidence: "high" as const,
+};
+
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
@@ -53,7 +66,9 @@ function makeAcpGrokWrapper(dir: string, env: Record<string, string>): string {
 
 function withFakeAcpGrok<A, E, R>(
   env: Record<string, string>,
-  effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
+  effectFn: (
+    textGeneration: TextGeneration.TextGenerationProviderService,
+  ) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
     const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-grok-text-acp-"));
@@ -80,6 +95,25 @@ function readJsonRpcRequests(
 }
 
 it.layer(GrokTextGenerationTestLayer)("GrokTextGeneration", (it) => {
+  it.effect("decodes Navigator approval traits through Grok structured output", () =>
+    withFakeAcpGrok(
+      {
+        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify(NAVIGATOR_APPROVAL_TRAITS),
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.classifyNavigatorApproval({
+            cwd: process.cwd(),
+            ownerUtterance: "yes",
+            planMarkdown: "# Run the reviewed plan",
+            modelSelection: createModelSelection(ProviderInstanceId.make("grok"), "grok-build"),
+          });
+
+          expect(generated).toEqual(NAVIGATOR_APPROVAL_TRAITS);
+        }),
+    ),
+  );
+
   it.effect("uses ACP with disabled tool capabilities and forwards the requested model id", () => {
     const requestLogDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-grok-text-log-"),

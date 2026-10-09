@@ -1,4 +1,4 @@
-import { ClaudeSettings, ProviderInstanceId } from "@t3tools/contracts";
+import { ClaudeSettings, ProviderInstanceId, TextGenerationError } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -14,6 +14,19 @@ import * as TextGeneration from "./TextGeneration.ts";
 import { sanitizeThreadTitle } from "./TextGenerationUtils.ts";
 import { makeClaudeTextGeneration } from "./ClaudeTextGeneration.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
+
+const NAVIGATOR_APPROVAL_TRAITS = {
+  expressesApproval: true,
+  addsCondition: false,
+  requestsModification: false,
+  asksQuestion: false,
+  expressesDoubt: false,
+  isNegation: false,
+  isQuotationOrHypothetical: false,
+  referencesSomethingElse: false,
+  isBareAffirmation: true,
+  confidence: "high" as const,
+};
 
 const ClaudeTextGenerationTestLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-claude-text-generation-test-",
@@ -79,7 +92,9 @@ function withFakeClaudeEnv<A, E, R>(
     configDirMustBe?: string;
     claudeConfig?: Partial<ClaudeSettings>;
   },
-  effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
+  effectFn: (
+    textGeneration: TextGeneration.TextGenerationProviderService,
+  ) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -190,6 +205,29 @@ function withFakeClaudeEnv<A, E, R>(
 }
 
 it.layer(ClaudeTextGenerationTestLayer)("ClaudeTextGeneration", (it) => {
+  it.effect("decodes Navigator approval traits through Claude structured output", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({ structured_output: NAVIGATOR_APPROVAL_TRAITS }),
+        stdinMustContain: "BEGIN_UNTRUSTED_CLASSIFIER_DATA_JSON",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.classifyNavigatorApproval({
+            cwd: process.cwd(),
+            ownerUtterance: "yes",
+            planMarkdown: "# Run the reviewed plan",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("claudeAgent"),
+              "claude-haiku-4-5",
+            ),
+          });
+
+          expect(generated).toEqual(NAVIGATOR_APPROVAL_TRAITS);
+        }),
+    ),
+  );
+
   it.effect("forwards Claude thinking settings for Haiku without passing effort", () =>
     withFakeClaudeEnv(
       {

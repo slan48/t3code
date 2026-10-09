@@ -3,6 +3,7 @@ import * as Arr from "effect/Array";
 import {
   ApprovalRequestId,
   isToolLifecycleItemType,
+  type OrchestrationPeerLoopExecution,
   type OrchestrationLatestTurn,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
@@ -21,6 +22,7 @@ import type {
   ThreadSession,
   TurnDiffSummary,
 } from "./types";
+import { executionLinkKey } from "./navigatorExecution";
 
 export type ProviderPickerKind = ProviderDriverKind;
 
@@ -137,6 +139,17 @@ export type TimelineEntry =
       kind: "work";
       createdAt: string;
       entry: WorkLogEntry;
+    }
+  | {
+      /**
+       * A link-derived execution row is deliberately not a message. The
+       * durable Owner approval remains the real user message; this row is the
+       * chronological projection of the immutable proposal/run association.
+       */
+      id: string;
+      kind: "peer-loop-execution";
+      createdAt: string;
+      execution: OrchestrationPeerLoopExecution;
     };
 
 export function workLogEntryIsToolLike(entry: WorkLogEntry): boolean {
@@ -1379,6 +1392,7 @@ export function deriveTimelineEntries(
   messages: ReadonlyArray<ChatMessage>,
   proposedPlans: ReadonlyArray<ProposedPlan>,
   workEntries: ReadonlyArray<WorkLogEntry>,
+  executionLinks: ReadonlyArray<OrchestrationPeerLoopExecution> = [],
 ): TimelineEntry[] {
   const messageRows: TimelineEntry[] = messages.map((message) => ({
     id: message.id,
@@ -1398,9 +1412,46 @@ export function deriveTimelineEntries(
     createdAt: entry.createdAt,
     entry,
   }));
-  return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
-    a.createdAt.localeCompare(b.createdAt),
-  );
+  const seenExecutionKeys = new Set<string>();
+  const executionRows: TimelineEntry[] = [];
+  for (const execution of executionLinks) {
+    // Reuse the length-prefixed opaque pair key used by reconciliation, so a
+    // local/durable twin cannot become two timeline rows.
+    const executionKey = executionLinkKey(execution);
+    if (seenExecutionKeys.has(executionKey)) continue;
+    seenExecutionKeys.add(executionKey);
+    executionRows.push({
+      id: `peer-loop-execution:${executionKey}`,
+      kind: "peer-loop-execution",
+      createdAt: execution.createdAt,
+      execution,
+    });
+  }
+
+  const kindRank = (entry: TimelineEntry): number => {
+    switch (entry.kind) {
+      case "message":
+        return 0;
+      case "proposed-plan":
+        return 1;
+      case "work":
+        return 2;
+      case "peer-loop-execution":
+        return 3;
+    }
+  };
+  return [...messageRows, ...proposedPlanRows, ...workRows, ...executionRows].toSorted((a, b) => {
+    const createdAtComparison = a.createdAt.localeCompare(b.createdAt);
+    if (createdAtComparison !== 0) return createdAtComparison;
+
+    // Preserve the old message/plan/work insertion order at equal timestamps,
+    // while making the durable Owner message precede its link-derived row.
+    const rankComparison = kindRank(a) - kindRank(b);
+    if (rankComparison !== 0) return rankComparison;
+    return a.kind === "peer-loop-execution" && b.kind === "peer-loop-execution"
+      ? a.id.localeCompare(b.id)
+      : 0;
+  });
 }
 
 export function inferCheckpointTurnCountByTurnId(

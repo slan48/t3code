@@ -22,6 +22,7 @@ export * from "./orchestration.ts";
 export * from "./agentRuns.ts";
 export * from "./peerLoop.ts";
 export * from "./peerLoopExecution.ts";
+export * from "./navigatorApprovalClassification.ts";
 export * from "./t3ProjectFile.ts";
 export * from "./editor.ts";
 export * from "./project.ts";

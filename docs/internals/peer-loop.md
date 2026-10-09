@@ -563,8 +563,10 @@ Code's persistence, and there must never be. Peer Loop owns every one of those
 and answers for them live over the protocol described above; a copy here would
 be a second answer to the same question, wrong the moment the run moved. What
 the link buys is the ability to show a run as a child of the conversation it
-came from, and to still find it a week later — the durable half of a
-relationship whose mutable half is read live.
+came from, to project the same run chronologically in the timeline, and to
+still find it a week later — the durable half of a relationship whose mutable
+half is read live. The timeline acknowledgement is derived UI; it is not
+another orchestration message or a provider response.
 
 The rules, enforced in the decider because the link is immutable and there is no
 command that edits or removes one: the thread must be a `navigator` thread, the
@@ -597,12 +599,16 @@ The sequence, in order, and each step matters:
 2. **One `PeerLoopService.startRun` call.** The input is built server-side:
    `projectPath` is the project's own workspace root, `objective` is the
    proposal's `planMarkdown` verbatim, the optional safety limit is forwarded,
-   and `newRun` is never set. A client sends only a thread id, a proposal id and
-   that limit — it cannot name a directory, substitute an objective, waive Peer
-   Loop's duplicate-run preflight, or supply a run id.
+   and `newRun` is never set. A client sends only a thread id, a proposal id,
+   the exact current-plan markdown fingerprint, and (for action-originated
+   approval) the Owner's bounded text. It cannot name a directory, substitute an
+   objective, waive Peer Loop's duplicate-run preflight, or supply a run id.
 3. **Record the immutable link**, by dispatching the internal
    `thread.peer-loop-execution.link` command with the run id Peer Loop returned
-   and a server-generated command id and timestamp.
+   and server-generated command/timestamp data. When approval text is present,
+   that command carries a record-only Owner message; the decider emits the
+   message and link events together, so they project atomically. A button omits
+   the message record.
 
 #### At-most-once, and what it actually rests on
 
@@ -626,8 +632,14 @@ contains the link, and the next request through the gate sees it.
 
 That is why validation and the post-dispatch confirmation both read
 `ProjectionSnapshotQuery`, and why the coordinator has exactly **one**
-validation source. There is no separate committed-state lookup and no second
-opinion to keep in step; the projection is the authoritative read here.
+validation source. The proposal id and markdown fingerprint are compared
+against the fresh committed T3 projection read inside the per-proposal gate.
+This is not full atomicity across a later proposal mutation and the external
+`startRun` call: the gate does not hold a database transaction across that
+bridge call. The known consistency window is therefore explicit; the
+fingerprint closes stale approval before start, while a mutation after that
+read is handled by the existing link/reconciliation outcome rather than by an
+overstated atomicity claim.
 
 (The engine's in-memory command read model is computed inside that same
 transaction and assigned after it returns, still before `dispatch` resolves. It
@@ -660,9 +672,11 @@ observation methods stay read-scoped and the existing explicit controls are
 unchanged.
 
 The web surface for this is described under **Executing a proposal** and
-**Confirming in words** below: an explicit button, and a closed list of
-standalone confirmation phrases matched whole. Nothing infers agreement from
-prose — discussing execution is never authorization to execute.
+**Confirming in words** below: an explicit button, a retained exact-phrase
+fast path, and natural text governed by schema-validated traits plus
+deterministic policy. Discussing execution is never authorization to execute;
+the classifier describes traits and deterministic code combines them with the
+current proposal and ephemeral authority.
 
 ### The Navigator conversation surface
 
@@ -867,6 +881,18 @@ timeline and title generation are untouched, exactly as with the role frame:
 only the provider-visible string for that turn carries the context, and only
 when there are links to describe.
 
+Record-only Owner approvals use the same shared provider-turn boundary. On each
+later Navigator turn, the authoritative thread read model contributes the
+explicitly marked approval records as one bounded JSON data block before the
+current Owner message. JSON escaping prevents approval text from manufacturing
+prompt sections or role instructions; the current message remains separate and
+last. The records are re-derived rather than marked as delivered, so a failed
+provider send or server restart cannot permanently skip one. The block retains
+complete recent records in chronological order within its fixed context bound;
+legacy messages without `messageKind` remain ordinary provider-turn messages.
+The acknowledgement line is not part of this block and is not a durable
+orchestration message.
+
 ### Executing a proposal
 
 **The action is explicit, and the press is the confirmation.** An Execution
@@ -906,23 +932,45 @@ and dropping it because a card unmounted would re-offer Execute on the next
 render. The store exposes a read-only `size()` so a test can prove the retention
 does not grow as conversations come and go.
 
-**The request is two ids.** `buildExecuteProposalRequest` produces the
-environment wrapper and `{ threadId, proposedPlanId }`. No objective, no project
-path, no run id, no `newRun`, no owner policy and no permission mode — the
-server derives the project and the objective from its own record. Peer Loop's
-optional `safetyLimit` is not sent either: this surface does not offer the owner
-a way to choose one, and inventing a bound would be T3 Code making a Peer Loop
-decision.
+**The request is a bound identity, not an objective.**
+`buildExecuteProposalRequest` produces the environment wrapper and
+`{ threadId, proposedPlanId, proposalFingerprint }`; the exact-phrase action
+may additionally carry the exact submitted `ownerApprovalText`. Execute-button
+projections omit that text. No plan markdown, objective, project path, run id,
+provider/model, outcome or execute intent crosses the client boundary — the
+server derives the project and objective from its fresh projection. Peer Loop's
+optional `safetyLimit` remains available only where its declared contract allows
+it; the Navigator approval UI does not invent a new limit.
 
 ### Confirming in words
 
 An owner can also confirm by saying so, and that path is **another input to the
-same operation, not a second way to start a run**. A recognized phrase goes
-through the same per-proposal gate, sends the same `{ threadId, proposedPlanId }`
-request, and executes the same server-derived proposal. The owner's words are
-never sent as an objective.
+same operation, not a second way to start a run**. The owner's words are never
+sent as an objective. The web gate is deterministic policy; the classifier only
+describes schema-validated traits and never chooses an execution outcome.
 
-**The grammar is a closed list, matched whole.**
+The six stages are deliberately ordered:
+
+1. deterministic eligibility checks the Navigator purpose, durable thread,
+   attachment-free message, one current proposal, settled/actionable state and
+   execution availability;
+2. the retained five exact phrases take their deterministic fast path;
+3. known bare `sí`/`si`, `ok`, `vale` and `👍` (and the closed bare negatives)
+   resolve without a model call;
+4. a permissive cost filter accepts only non-empty, non-question utterances of
+   at most 240 Unicode code points;
+5. the authenticated `navigator.classifyProposalApproval` RPC invokes the fixed
+   Codex text-generation preset once, with a 10-second deadline, and maps every
+   error or uncertainty to `send-to-provider`;
+6. deterministic combination of the returned traits and in-memory armed
+   authority selects one of `EXECUTE`, `ASK_EXECUTION_CONFIRMATION`,
+   `DECLINE_EXECUTION` or `SEND_TO_PROVIDER`.
+
+The classifier RPC receives only thread/proposal identity, the markdown
+fingerprint, the captured Owner utterance and attachment presence. Its success
+payload is traits or `send-to-provider`, never an execute verdict.
+
+**The retained exact-phrase fast path matches five complete phrases.**
 `apps/web/src/navigatorConfirmation.ts` normalizes the composer text and
 compares it against five phrases:
 
@@ -935,14 +983,17 @@ to use it), applies NFKC, strips combining marks so `ejecutá` reads as
 trailing `.`, `!`, `…`. **`?` and `¿` are deliberately not stripped**: "let's do
 it?" is a question about doing it, not an instruction to do it.
 
-There is no model, no fuzzy match, no substring search and no sentiment
-inference, and the comparison is against the _entire_ normalized utterance. So
+There is no fuzzy match, substring search or sentiment inference in the exact
+fast path, and the comparison is against the _entire_ normalized utterance. So
 "let's do it after changing the database", "hagamos eso pero primero…", "ok
 let's do it", a quoted example, a negation, a question and a slash command are
-all ordinary conversation. **Discussing execution is never authorization** — the
-difference between a discussion and an authorization is a Peer Loop run against
-a repository, and a recognizer that tried to be helpful about qualifications
-would occasionally launch work the owner was still thinking about.
+ordinary conversation on that path. Other short natural approvals may reach the
+trait classifier; qualifications, requested modifications, questions, doubts,
+negation, quotations/hypotheticals, another referenced object, low confidence,
+or any classifier failure still return to ordinary conversation. **Discussing
+execution is never authorization** — deterministic combination is the policy,
+and a recognizer that tried to be helpful about qualifications would occasionally
+launch work the owner was still thinking about.
 
 **Four things must all be true before the text is even considered:** the
 conversation is a durable Navigator thread; the proposal is that thread's own
@@ -954,16 +1005,26 @@ through to the existing send path unchanged, and a Navigator conversation with
 no settled proposal treats the same words as conversation rather than inventing
 an objective from them.
 
-**A consumed confirmation is an action, not a message.** The composer is cleared
-and nothing else moves: no provider turn, no optimistic owner message, no
-interaction- or runtime-mode change, no navigation, and the composer stays
-available for the next thing the owner wants to say. The durable record of the
-action is the immutable proposal/run link the server writes and the child card
-that renders it. No provider message is fabricated to stand in for it — that
-would put words in the owner's own transcript that they never sent to anybody —
-and there is no second conversation store. The pending, error and partial-failure
-presentation is the button's, unchanged, and a consumed phrase is never
-automatically resubmitted.
+**A consumed confirmation is not an ordinary provider turn.** The composer is
+cleared and the exact-phrase or natural approval is sent through the shared
+execution gate. If `startRun` and the atomic link command succeed, the exact
+Owner utterance becomes a durable `role: "user"` record-only message alongside
+the immutable link; that message remains in later Navigator provider context but
+does not itself queue a provider turn. A button omits the approval record. No
+optimistic message is created, and the acknowledgement
+`Perfecto, comienzo con Peer Loop.` is derived timeline UI rather than an
+assistant/provider message. If validation or start fails, neither link nor
+approval message is durable.
+
+Armed authority is intentionally in memory and contains only the thread id,
+proposal id, markdown fingerprint and question time. It is one-use, scoped to
+the mounted conversation, expires after 120 seconds, and disappears on reload,
+navigation, proposal/version change, decline, or a provider turn started
+strictly after the question. The id plus fingerprint binding is checked again
+before execution. A fresh projection read establishes the pre-start comparison;
+the external bridge call is not wrapped in a transaction, so a later proposal
+mutation remains the documented consistency window rather than being claimed
+away.
 
 **Nothing is ever retried**, including timeouts, connection failures and
 defects. Both error families survive with their structure: a Peer Loop refusal
@@ -1094,10 +1155,11 @@ test asserts exactly one `startRun` and zero `resumeRun`, `pauseRun`,
 `recoverRun`, `sendOwnerMessage` and `subscribeEvents` calls across the entire
 loop.
 
-Nothing else launches a run. The Execute action and the closed confirmation
-grammar described above are two inputs to one operation, and between them the
-only way a Navigator conversation starts a run; the link it records is the only
-thing T3 Code keeps about it.
+Nothing else launches a run. The Execute action, the retained exact-phrase fast
+path, and the guarded natural-approval flow are inputs to one operation; the
+classifier never starts a run or chooses an outcome. The link it records is the
+only execution association T3 Code keeps, while its immutable presence drives
+both the proposal child projection and the chronological timeline projection.
 
 **This metadata duplicates nothing about Peer Loop.** It carries no run
 lifecycle, no owner policy, no halt reason, no recovery decision and no live

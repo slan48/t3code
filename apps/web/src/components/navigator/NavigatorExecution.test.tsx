@@ -154,6 +154,7 @@ const PLAN_TURN_ID = TurnId.make("turn-that-produced-the-plan");
 
 const proposal = {
   id: PLAN_ID,
+  planMarkdown: PLAN,
   implementedAt: null,
   implementationThreadId: null,
   turnId: PLAN_TURN_ID,
@@ -167,11 +168,11 @@ describe("the Execute action", () => {
       <NavigatorProposalExecution context={context()} proposal={proposal} />,
     );
     expect(markup).toContain("Execute with Peer Loop");
-    // The press IS the confirmation, and the wording says so plainly rather
-    // than leaving the owner to infer what a button labelled Execute does.
-    expect(markup).toContain("Reviewer → Builder");
-    expect(markup).toContain("Execution Proposal above");
-    expect(markup).toContain("never infers it from the conversation");
+    // The button explicitly executes the displayed proposal; natural approval
+    // is handled by the separate guarded approval flow.
+    expect(markup).toContain("explicitly executes the displayed Execution Proposal");
+    expect(markup).toContain("Natural language approval is handled only through Navigator");
+    expect(markup).not.toContain("never infers it from the conversation");
   });
 
   it("renders nothing at all on a coding thread", async () => {
@@ -215,6 +216,7 @@ describe("the Execute action", () => {
         context={context()}
         proposal={{
           id: PLAN_ID,
+          planMarkdown: PLAN,
           implementedAt: "2026-02-01T00:00:00.000Z",
           implementationThreadId: null,
           turnId: PLAN_TURN_ID,

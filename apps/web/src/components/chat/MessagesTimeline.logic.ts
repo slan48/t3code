@@ -177,6 +177,12 @@ export type MessagesTimelineRow =
       proposedPlan: ProposedPlan;
     }
   | {
+      kind: "peer-loop-execution";
+      id: string;
+      createdAt: string;
+      execution: Extract<TimelineEntry, { kind: "peer-loop-execution" }>["execution"];
+    }
+  | {
       kind: "working";
       id: string;
       createdAt: string | null;
@@ -466,6 +472,18 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    // Link-derived execution rows have no turn id and are never folded into
+    // provider work. They remain a standalone chronological row.
+    if (timelineEntry.kind === "peer-loop-execution") {
+      nextRows.push({
+        kind: "peer-loop-execution",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        execution: timelineEntry.execution,
+      });
+      continue;
+    }
+
     if (timelineEntry.kind === "work") {
       const groupedEntries = [timelineEntry.entry];
       let cursor = index + 1;
@@ -619,6 +637,11 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
+
+    case "peer-loop-execution": {
+      const be = b as typeof a;
+      return a.createdAt === be.createdAt && a.execution === be.execution;
+    }
 
     case "work":
       return Equal.equals(a.groupedEntries, (b as typeof a).groupedEntries);

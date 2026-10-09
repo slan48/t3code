@@ -264,11 +264,23 @@ export type OrchestrationProject = typeof OrchestrationProject.Type;
 export const OrchestrationMessageRole = Schema.Literals(["user", "assistant", "system"]);
 export type OrchestrationMessageRole = typeof OrchestrationMessageRole.Type;
 
+/**
+ * How a persisted message entered the conversation. Missing on legacy events
+ * means the historical provider-turn behavior; the record-only variant is
+ * reserved for server-authored Owner approval records.
+ */
+export const OrchestrationMessageKind = Schema.Literals([
+  "provider-turn",
+  "record-only-owner-approval",
+]);
+export type OrchestrationMessageKind = typeof OrchestrationMessageKind.Type;
+
 export const OrchestrationMessage = Schema.Struct({
   id: MessageId,
   role: OrchestrationMessageRole,
   text: Schema.String,
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  messageKind: Schema.optional(OrchestrationMessageKind),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
   createdAt: IsoDateTime,
@@ -917,6 +929,14 @@ const ThreadProposedPlanUpsertCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const PeerLoopExecutionApprovalMessage = Schema.Struct({
+  /** Server-generated before `startRun`; never supplied by a client. */
+  messageId: MessageId,
+  /** Preserved exactly as submitted, including harmless surrounding spaces. */
+  text: Schema.String.check(Schema.isNonEmpty()),
+  createdAt: IsoDateTime,
+});
+
 const ThreadTurnDiffCompleteCommand = Schema.Struct({
   type: Schema.Literal("thread.turn.diff.complete"),
   commandId: CommandId,
@@ -973,6 +993,8 @@ const ThreadPeerLoopExecutionLinkCommand = Schema.Struct({
   proposedPlanId: OrchestrationProposedPlanId,
   runId: TrimmedNonEmptyString,
   createdAt: IsoDateTime,
+  /** When present, the decider emits this record-only Owner message first. */
+  approvalMessage: Schema.optional(PeerLoopExecutionApprovalMessage),
 });
 
 const InternalOrchestrationCommand = Schema.Union([
@@ -1152,6 +1174,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
   role: OrchestrationMessageRole,
   text: Schema.String,
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  messageKind: Schema.optional(OrchestrationMessageKind),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
   createdAt: IsoDateTime,

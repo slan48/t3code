@@ -129,6 +129,19 @@ const DEFAULT_COMMIT_MESSAGE_INPUT = {
   modelSelection: DEFAULT_TEST_MODEL_SELECTION,
 };
 
+const NAVIGATOR_APPROVAL_TRAITS = {
+  expressesApproval: true,
+  addsCondition: false,
+  requestsModification: false,
+  asksQuestion: false,
+  expressesDoubt: false,
+  isNegation: false,
+  isQuotationOrHypothetical: false,
+  referencesSomethingElse: false,
+  isBareAffirmation: true,
+  confidence: "high" as const,
+};
+
 const OPENCODE_TEXT_GENERATION_IDLE_TTL_MS = 30_000;
 
 const OpenCodeTextGenerationTestLayer = Layer.succeed(
@@ -168,7 +181,9 @@ const EXISTING_SERVER_OPENCODE_SETTINGS = Schema.decodeSync(OpenCodeSettings)({
 
 function withOpenCodeTextGeneration<A, E, R>(
   settings: OpenCodeSettings,
-  effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
+  effectFn: (
+    textGeneration: TextGeneration.TextGenerationProviderService,
+  ) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
     const textGeneration = yield* OpenCodeTextGeneration.makeOpenCodeTextGeneration(settings);
@@ -187,6 +202,28 @@ const advanceIdleClock = Effect.gen(function* () {
 });
 
 it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGeneration", (it) => {
+  it.effect("decodes Navigator approval traits through OpenCode structured output", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.promptResult = {
+          data: {
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            parts: [{ type: "text", text: JSON.stringify(NAVIGATOR_APPROVAL_TRAITS) }],
+          },
+        };
+
+        const generated = yield* textGeneration.classifyNavigatorApproval({
+          cwd: process.cwd(),
+          ownerUtterance: "yes",
+          planMarkdown: "# Run the reviewed plan",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        });
+
+        expect(generated).toEqual(NAVIGATOR_APPROVAL_TRAITS);
+      }),
+    ),
+  );
+
   it.effect("reuses a warm server across back-to-back requests and closes it after idling", () =>
     withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
       Effect.gen(function* () {

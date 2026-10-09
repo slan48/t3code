@@ -103,6 +103,14 @@
       "types": "./src/peerLoopDecisionFingerprint.ts",
       "import": "./src/peerLoopDecisionFingerprint.ts"
     },
+    "./peerLoopProposalFingerprint": {
+      "types": "./src/peerLoopProposalFingerprint.ts",
+      "import": "./src/peerLoopProposalFingerprint.ts"
+    },
+    "./navigatorApprovalCandidate": {
+      "types": "./src/navigatorApprovalCandidate.ts",
+      "import": "./src/navigatorApprovalCandidate.ts"
+    },
     "./remote": {
       "types": "./src/remote.ts",
       "import": "./src/remote.ts"

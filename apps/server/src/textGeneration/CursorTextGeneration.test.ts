@@ -24,6 +24,19 @@ const decodeCursorSettings = Schema.decodeSync(CursorSettings);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../scripts/acp-mock-agent.ts");
 
+const NAVIGATOR_APPROVAL_TRAITS = {
+  expressesApproval: true,
+  addsCondition: false,
+  requestsModification: false,
+  asksQuestion: false,
+  expressesDoubt: false,
+  isNegation: false,
+  isQuotationOrHypothetical: false,
+  referencesSomethingElse: false,
+  isBareAffirmation: true,
+  confidence: "high" as const,
+};
+
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
@@ -56,7 +69,9 @@ function makeAcpAgentWrapper(dir: string, env: Record<string, string>): string {
 
 function withFakeAcpAgent<A, E, R>(
   env: Record<string, string>,
-  effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
+  effectFn: (
+    textGeneration: TextGeneration.TextGenerationProviderService,
+  ) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
     const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-cursor-text-acp-"));
@@ -91,6 +106,25 @@ function waitForFileContent(path: string): Effect.Effect<string> {
 }
 
 it.layer(CursorTextGenerationTestLayer)("CursorTextGeneration", (it) => {
+  it.effect("decodes Navigator approval traits through Cursor structured output", () =>
+    withFakeAcpAgent(
+      {
+        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify(NAVIGATOR_APPROVAL_TRAITS),
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.classifyNavigatorApproval({
+            cwd: process.cwd(),
+            ownerUtterance: "yes",
+            planMarkdown: "# Run the reviewed plan",
+            modelSelection: createModelSelection(ProviderInstanceId.make("cursor"), "composer-2"),
+          });
+
+          expect(generated).toEqual(NAVIGATOR_APPROVAL_TRAITS);
+        }),
+    ),
+  );
+
   it.effect("uses ACP model config options instead of raw CLI model ids", () => {
     const requestLogDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-cursor-text-log-"),

@@ -37,6 +37,7 @@ function toProjectionThreadMessage(
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     ...(row.attachments !== null ? { attachments: row.attachments } : {}),
+    ...(row.messageKind === "record-only-owner-approval" ? { messageKind: row.messageKind } : {}),
   };
 }
 
@@ -56,6 +57,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           role,
           text,
           attachments_json,
+          message_kind,
           is_streaming,
           created_at,
           updated_at
@@ -74,6 +76,15 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
               WHERE message_id = ${row.messageId}
             )
           ),
+          COALESCE(
+            ${row.messageKind ?? null},
+            (
+              SELECT message_kind
+              FROM projection_thread_messages
+              WHERE message_id = ${row.messageId}
+            ),
+            'provider-turn'
+          ),
           ${row.isStreaming ? 1 : 0},
           ${row.createdAt},
           ${row.updatedAt}
@@ -84,6 +95,10 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           turn_id = excluded.turn_id,
           role = excluded.role,
           text = excluded.text,
+          message_kind = COALESCE(
+            ${row.messageKind ?? null},
+            projection_thread_messages.message_kind
+          ),
           attachments_json = COALESCE(
             excluded.attachments_json,
             projection_thread_messages.attachments_json
@@ -107,6 +122,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           role,
           text,
           attachments_json AS "attachments",
+          message_kind AS "messageKind",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -128,6 +144,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           role,
           text,
           attachments_json AS "attachments",
+          message_kind AS "messageKind",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"

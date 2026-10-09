@@ -292,6 +292,19 @@ function createTextGeneration(
       Effect.succeed({
         title: "Update workflow",
       }),
+    classifyNavigatorApproval: () =>
+      Effect.succeed({
+        expressesApproval: false,
+        addsCondition: false,
+        requestsModification: false,
+        asksQuestion: false,
+        expressesDoubt: false,
+        isNegation: false,
+        isQuotationOrHypothetical: false,
+        referencesSomethingElse: false,
+        isBareAffirmation: false,
+        confidence: "low" as const,
+      }),
     ...overrides,
   };
 
@@ -335,6 +348,17 @@ function createTextGeneration(
           (cause) =>
             new TextGenerationError({
               operation: "generateThreadTitle",
+              detail: "fake text generation failed",
+              ...(cause !== undefined ? { cause } : {}),
+            }),
+        ),
+      ),
+    classifyNavigatorApproval: (input) =>
+      implementation.classifyNavigatorApproval(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TextGenerationError({
+              operation: "classifyNavigatorApproval",
               detail: "fake text generation failed",
               ...(cause !== undefined ? { cause } : {}),
             }),

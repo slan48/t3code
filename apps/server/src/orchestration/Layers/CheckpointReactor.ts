@@ -638,7 +638,8 @@ const make = Effect.gen(function* () {
       if (
         event.payload.role !== "user" ||
         event.payload.streaming ||
-        event.payload.turnId !== null
+        event.payload.turnId !== null ||
+        event.payload.messageKind === "record-only-owner-approval"
       ) {
         return;
       }

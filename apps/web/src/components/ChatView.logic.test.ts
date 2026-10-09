@@ -192,10 +192,12 @@ describe("deriveNavigatorExecution", () => {
     expect(derived.facts?.unsettledTurnId).toBeNull();
     expect(derived.confirmableProposal).toEqual({
       id: planId,
+      planMarkdown: historicalPlan.planMarkdown,
       implementedAt: null,
       implementationThreadId: null,
       turnId: planTurnId,
     });
+    expect(derived.currentProposal).toEqual(derived.confirmableProposal);
     expect(
       proposalExecutionAvailability({
         facts: derived.facts!,
@@ -216,11 +218,19 @@ describe("deriveNavigatorExecution", () => {
     expect(derived.facts?.unsettledTurnId).toBe(planTurnId);
     // No confirmable target while a turn is in flight, and the card refuses too.
     expect(derived.confirmableProposal).toBeNull();
+    expect(derived.currentProposal).toEqual({
+      id: planId,
+      planMarkdown: historicalPlan.planMarkdown,
+      implementedAt: null,
+      implementationThreadId: null,
+      turnId: planTurnId,
+    });
     expect(
       proposalExecutionAvailability({
         facts: derived.facts!,
         proposal: {
           id: planId,
+          planMarkdown: historicalPlan.planMarkdown,
           implementedAt: null,
           implementationThreadId: null,
           turnId: planTurnId,
@@ -232,7 +242,7 @@ describe("deriveNavigatorExecution", () => {
 
   it("keeps an older proposal's own card usable while a different turn runs", () => {
     // The running turn is not the one that produced this plan, so the plan
-    // itself is final. The phrase still has no unambiguous target.
+    // itself is final and remains a valid composer target.
     const otherTurn = TurnId.make("turn-later");
     const derived = derive(
       makeThread({
@@ -242,12 +252,19 @@ describe("deriveNavigatorExecution", () => {
         proposedPlans: [historicalPlan],
       }),
     );
-    expect(derived.confirmableProposal).toBeNull();
+    expect(derived.confirmableProposal).toEqual({
+      id: planId,
+      planMarkdown: historicalPlan.planMarkdown,
+      implementedAt: null,
+      implementationThreadId: null,
+      turnId: planTurnId,
+    });
     expect(
       proposalExecutionAvailability({
         facts: derived.facts!,
         proposal: {
           id: planId,
+          planMarkdown: historicalPlan.planMarkdown,
           implementedAt: null,
           implementationThreadId: null,
           turnId: planTurnId,
@@ -257,20 +274,38 @@ describe("deriveNavigatorExecution", () => {
     ).toBe(true);
   });
 
+  it("keeps a null-turn proposal settled while another turn runs", () => {
+    const nullTurnPlan = { ...historicalPlan, turnId: null } as typeof historicalPlan;
+    const otherTurn = TurnId.make("turn-unrelated");
+    const derived = derive(
+      makeThread({
+        purpose: "navigator",
+        latestTurn: { ...completedTurn, turnId: otherTurn, completedAt: null, state: "running" },
+        session: { ...readySession, status: "running", activeTurnId: otherTurn },
+        proposedPlans: [nullTurnPlan],
+      }),
+    );
+
+    expect(derived.currentProposal?.turnId).toBeNull();
+    expect(derived.confirmableProposal?.id).toBe(planId);
+  });
+
   it("derives nothing at all for a coding conversation", () => {
     const derived = derive(makeThread({ proposedPlans: [historicalPlan] }));
-    expect(derived).toEqual({ facts: null, confirmableProposal: null });
+    expect(derived).toEqual({ facts: null, currentProposal: null, confirmableProposal: null });
   });
 
   it("has no durable thread to execute against in a draft", () => {
     const derived = derive(rehydratedNavigatorThread, false);
     expect(derived.facts?.threadId).toBeNull();
+    expect(derived.currentProposal).toBeNull();
     expect(derived.confirmableProposal).toBeNull();
     expect(
       proposalExecutionAvailability({
         facts: derived.facts!,
         proposal: {
           id: planId,
+          planMarkdown: historicalPlan.planMarkdown,
           implementedAt: null,
           implementationThreadId: null,
           turnId: planTurnId,
@@ -291,6 +326,7 @@ describe("deriveNavigatorExecution", () => {
         ],
       }),
     );
+    expect(derived.currentProposal?.id).toBe(planId);
     expect(derived.confirmableProposal).toBeNull();
   });
 });

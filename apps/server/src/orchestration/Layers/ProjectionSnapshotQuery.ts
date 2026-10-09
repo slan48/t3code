@@ -489,6 +489,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           role,
           text,
           attachments_json AS "attachments",
+          message_kind AS "messageKind",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -942,6 +943,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           role,
           text,
           attachments_json AS "attachments",
+          message_kind AS "messageKind",
           is_streaming AS "isStreaming",
           created_at AS "createdAt",
           updated_at AS "updatedAt"
@@ -1242,6 +1244,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   role: row.role,
                   text: row.text,
                   ...(row.attachments !== null ? { attachments: row.attachments } : {}),
+                  ...(row.messageKind === "record-only-owner-approval"
+                    ? { messageKind: row.messageKind }
+                    : {}),
                   turnId: row.turnId,
                   streaming: row.isStreaming === 1,
                   createdAt: row.createdAt,
@@ -2297,6 +2302,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             id: row.messageId,
             role: row.role,
             text: row.text,
+            ...(row.messageKind === "record-only-owner-approval"
+              ? { messageKind: row.messageKind }
+              : {}),
             turnId: row.turnId,
             streaming: row.isStreaming === 1,
             createdAt: row.createdAt,

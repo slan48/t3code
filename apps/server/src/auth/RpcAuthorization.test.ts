@@ -60,6 +60,9 @@ describe("RPC authorization scopes", () => {
       // Executing a proposal calls `startRun` underneath: same agents, same
       // subscription capacity, same scope.
       WS_METHODS.peerLoopExecuteProposal,
+      // Classification consumes the fixed provider and is a conversation
+      // action, even though it cannot execute or mutate a thread.
+      WS_METHODS.navigatorClassifyProposalApproval,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }

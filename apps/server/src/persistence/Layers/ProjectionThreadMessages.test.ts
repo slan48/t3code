@@ -111,4 +111,42 @@ layer("ProjectionThreadMessageRepository", (it) => {
       assert.deepEqual(rows[0]?.attachments, []);
     }),
   );
+
+  it.effect("persists the explicit record-only message kind", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionThreadMessageRepository;
+      const threadId = ThreadId.make("thread-record-only-kind");
+      const messageId = MessageId.make("message-record-only-kind");
+      const createdAt = "2026-02-28T19:20:00.000Z";
+
+      yield* repository.upsert({
+        messageId,
+        threadId,
+        turnId: null,
+        role: "user",
+        text: "Approved",
+        messageKind: "record-only-owner-approval",
+        isStreaming: false,
+        createdAt,
+        updatedAt: createdAt,
+      });
+      yield* repository.upsert({
+        messageId,
+        threadId,
+        turnId: null,
+        role: "user",
+        text: "Approved, retained",
+        isStreaming: false,
+        createdAt,
+        updatedAt: "2026-02-28T19:20:01.000Z",
+      });
+
+      const row = yield* repository.getByMessageId({ messageId });
+      assert.equal(row._tag, "Some");
+      if (row._tag === "Some") {
+        assert.equal(row.value.text, "Approved, retained");
+        assert.equal(row.value.messageKind, "record-only-owner-approval");
+      }
+    }),
+  );
 });

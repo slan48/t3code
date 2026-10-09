@@ -30,8 +30,10 @@ import {
 
 const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
 const PLAN_TURN_ID = TurnId.make("turn-that-produced-the-plan");
+const PLAN_MARKDOWN = "# Split the migration";
 const proposal = {
   id: PLAN_ID,
+  planMarkdown: PLAN_MARKDOWN,
   implementedAt: null,
   implementationThreadId: null,
   turnId: PLAN_TURN_ID,
@@ -156,7 +158,11 @@ describe("what is discussion, not authorization", () => {
 
 describe("routing a send", () => {
   it("executes for a recognized phrase on an eligible Navigator proposal", () => {
-    expect(route()).toEqual({ kind: "execute", proposal });
+    expect(route()).toEqual({
+      kind: "execute",
+      proposal,
+      ownerApprovalText: "let's do it",
+    });
   });
 
   it("sends ordinary Navigator conversation down the existing path", () => {
@@ -221,14 +227,15 @@ describe("routing a send", () => {
 /* ------------------------------------------------------------ typing */
 
 describe("the routing contract", () => {
-  it("carries the proposal, and never the owner's text", () => {
+  it("carries the proposal and exact owner approval text", () => {
     const decision = route();
     expect(decision.kind).toBe("execute");
     if (decision.kind !== "execute") return;
-    // The objective is the server-derived proposal. The words that triggered
-    // this are not part of the decision and cannot reach the wire.
-    expect(Object.keys(decision).toSorted()).toEqual(["kind", "proposal"]);
-    expect(JSON.stringify(decision)).not.toContain("let");
+    // The objective remains the server-derived proposal. The exact words are
+    // carried only as the approval record payload; the server validates and
+    // persists them atomically with the execution link.
+    expect(Object.keys(decision).toSorted()).toEqual(["kind", "ownerApprovalText", "proposal"]);
+    expect(decision.ownerApprovalText).toBe("let's do it");
   });
 });
 
@@ -247,8 +254,9 @@ describe("consuming a routed send", () => {
     // True is what makes the caller `return` before any provider dispatch.
     expect(consumed).toBe(true);
     expect(execute).toHaveBeenCalledTimes(1);
-    // The proposal, not the owner's words. The objective stays server-derived.
-    expect(execute).toHaveBeenCalledWith(proposal);
+    // The proposal remains server-derived, while the exact consumed utterance
+    // is carried separately for atomic durable recording.
+    expect(execute).toHaveBeenCalledWith(proposal, "let's do it");
     expect(clearComposer).toHaveBeenCalledTimes(1);
   });
 
@@ -378,6 +386,7 @@ describe("a confirmation on a proposal whose last attempt was refused", () => {
   const CONFIRM_PLAN = "plan-confirm" as OrchestrationProposedPlanId;
   const historical = {
     id: CONFIRM_PLAN,
+    planMarkdown: PLAN_MARKDOWN,
     implementedAt: null,
     implementationThreadId: null,
     turnId: TurnId.make("turn-that-produced-the-plan"),
@@ -431,7 +440,7 @@ describe("a confirmation on a proposal whose last attempt was refused", () => {
       // One request, on the first attempt, and the send path stops here.
       expect(consumed, code).toBe(true);
       expect(execute, code).toHaveBeenCalledTimes(1);
-      expect(execute, code).toHaveBeenCalledWith(historical);
+      expect(execute, code).toHaveBeenCalledWith(historical, "hagamos eso");
     }
     navigatorExecutionStore.reset();
   });
@@ -503,11 +512,13 @@ describe("phrases and owner decisions", () => {
       const routed = route({ text: phrase });
       expect(routed.kind, phrase).toBe("execute");
       if (routed.kind === "execute") {
+        expect(routed.ownerApprovalText, phrase).toBe(phrase);
         // A proposal, and nothing that could name a run or an option.
         expect(Object.keys(routed.proposal).toSorted(), phrase).toEqual([
           "id",
           "implementationThreadId",
           "implementedAt",
+          "planMarkdown",
           "turnId",
         ]);
       }

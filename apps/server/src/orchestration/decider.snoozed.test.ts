@@ -243,6 +243,33 @@ it.layer(NodeServices.layer)("snoozed thread decider", (it) => {
     }),
   );
 
+  it.effect("does not treat a record-only Owner approval as queued work", () =>
+    Effect.gen(function* () {
+      const createdAt = "1969-12-31T23:59:30.000Z";
+      const approvalMessage: OrchestrationThread["messages"][number] = {
+        id: MessageId.make("server:approval-record-only"),
+        role: "user",
+        text: "Sí, procede con el plan.",
+        messageKind: "record-only-owner-approval",
+        turnId: null,
+        streaming: false,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.snooze",
+          commandId: CommandId.make("cmd-snooze-record-only"),
+          threadId: ThreadId.make("thread-1"),
+          snoozedUntil: FUTURE_WAKE,
+        },
+        readModel: makeReadModel({ messages: [approvalMessage] }),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events[0]?.type).toBe("thread.snoozed");
+    }),
+  );
+
   it.effect("rejects snoozing an archived thread", () =>
     Effect.gen(function* () {
       const error = yield* decideOrchestrationCommand({

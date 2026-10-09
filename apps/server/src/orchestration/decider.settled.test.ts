@@ -293,6 +293,32 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
     }),
   );
 
+  it.effect("does not treat a record-only Owner approval as queued work", () =>
+    Effect.gen(function* () {
+      const createdAt = "1969-12-31T23:59:30.000Z";
+      const approvalMessage: OrchestrationThread["messages"][number] = {
+        id: MessageId.make("server:approval-record-only"),
+        role: "user",
+        text: "Sí, procede con el plan.",
+        messageKind: "record-only-owner-approval",
+        turnId: null,
+        streaming: false,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-settle-record-only"),
+          threadId: ThreadId.make("thread-1"),
+        },
+        readModel: makeReadModel(null, null, null, [], [approvalMessage]),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      expect(events[0]?.type).toBe("thread.settled");
+    }),
+  );
+
   it.effect("rejects settling and unsettling archived threads", () =>
     Effect.gen(function* () {
       const settleError = yield* decideOrchestrationCommand({

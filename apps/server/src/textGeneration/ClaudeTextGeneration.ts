@@ -22,6 +22,7 @@ import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
+  buildNavigatorApprovalClassificationPrompt,
   buildPrContentPrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
@@ -85,7 +86,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle",
+      | "generateThreadTitle"
+      | "classifyNavigatorApproval",
     value: unknown,
     detail: string,
   ): Effect.Effect<string, TextGenerationError> =>
@@ -115,7 +117,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "classifyNavigatorApproval";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -367,10 +370,27 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       };
     });
 
+  const classifyNavigatorApproval: TextGeneration.TextGenerationProviderService["classifyNavigatorApproval"] =
+    Effect.fn("ClaudeTextGeneration.classifyNavigatorApproval")(function* (input) {
+      const { prompt, outputSchema } = buildNavigatorApprovalClassificationPrompt({
+        ownerUtterance: input.ownerUtterance,
+        planMarkdown: input.planMarkdown,
+      });
+
+      return yield* runClaudeJson({
+        operation: "classifyNavigatorApproval",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
-  } satisfies TextGeneration.TextGeneration["Service"];
+    classifyNavigatorApproval,
+  } satisfies TextGeneration.TextGenerationProviderService;
 });

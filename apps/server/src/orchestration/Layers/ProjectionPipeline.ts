@@ -570,6 +570,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       for (const message of messages) {
         if (
           message.role === "user" &&
+          message.messageKind !== "record-only-owner-approval" &&
           (latestUserMessageAt === null || message.createdAt > latestUserMessageAt)
         ) {
           latestUserMessageAt = message.createdAt;
@@ -925,6 +926,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             role: event.payload.role,
             text: nextText,
             ...(nextAttachments !== undefined ? { attachments: [...nextAttachments] } : {}),
+            ...(event.payload.messageKind !== undefined
+              ? { messageKind: event.payload.messageKind }
+              : {}),
             isStreaming: event.payload.streaming,
             createdAt: previousMessage?.createdAt ?? event.payload.createdAt,
             updatedAt: event.payload.updatedAt,

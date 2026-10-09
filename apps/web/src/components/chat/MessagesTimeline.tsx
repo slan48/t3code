@@ -63,9 +63,11 @@ import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { CODING_PROPOSAL_WORDING, type ProposalWording } from "~/navigatorCapabilities";
 import {
+  NavigatorLinkedExecution,
   NavigatorProposalExecution,
   type NavigatorExecutionContext,
 } from "../navigator/NavigatorProposalExecution";
+import { useNavigatorExecutionRuns } from "~/state/navigatorExecutionCommand";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
 import { shouldAutoExpandChangedFiles } from "./changedFilesPresentation";
@@ -901,6 +903,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         <AssistantTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
+      {row.kind === "peer-loop-execution" ? <PeerLoopExecutionTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
     </div>
   );
@@ -1141,6 +1144,42 @@ function ProposedPlanTimelineRow({
             />
           )
         }
+      />
+    </div>
+  );
+}
+
+/**
+ * A link-derived timeline row. The acknowledgement is derived UI: the real
+ * Owner approval is the durable user message immediately before this row,
+ * while the immutable link supplies both this chronological projection and
+ * the proposal child projection. No assistant/provider message is created.
+ */
+function PeerLoopExecutionTimelineRow({
+  row,
+}: {
+  readonly row: Extract<TimelineRow, { kind: "peer-loop-execution" }>;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const executionContext = ctx.navigatorExecution;
+  const executionRuns = useNavigatorExecutionRuns({
+    environmentId: executionContext?.environmentId ?? null,
+    linkCount: executionContext === null ? 0 : 1,
+  });
+
+  if (executionContext === null || executionContext.threadId === null) return null;
+
+  return (
+    <div className="min-w-0 px-1 py-0.5">
+      <p className="mb-2 text-sm text-muted-foreground">Perfecto, comienzo con Peer Loop.</p>
+      <NavigatorLinkedExecution
+        environmentId={executionContext.environmentId}
+        threadId={executionContext.threadId}
+        purpose={executionContext.purpose}
+        execution={row.execution}
+        runs={executionRuns.runs}
+        unreadable={executionRuns.unreadable}
+        refreshRuns={executionRuns.refresh}
       />
     </div>
   );

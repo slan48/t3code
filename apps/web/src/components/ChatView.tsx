@@ -18,6 +18,7 @@ import {
   NAVIGATOR_INTERACTION_MODE,
   NAVIGATOR_RUNTIME_MODE,
   type OrchestrationPeerLoopExecution,
+  type PeerLoopProposalFingerprint,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -45,6 +46,7 @@ import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/projectScripts";
 import { truncate } from "@t3tools/shared/String";
 import { nextTerminalId, resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabels";
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 import { Debouncer } from "@tanstack/react-pacer";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -166,18 +168,32 @@ import {
   threadCapabilities,
   visibleRightPanelSurfaces,
 } from "~/navigatorCapabilities";
-import { groupExecutionsByProposal } from "~/navigatorExecution";
+import { groupExecutionsByProposal, proposalIsSettled } from "~/navigatorExecution";
 import {
-  consumeNavigatorConfirmation,
-  NAVIGATOR_SEND_ROUTE,
-  routeNavigatorSend,
-  type NavigatorSendRoute,
-} from "~/navigatorConfirmation";
+  NAVIGATOR_ARMED_QUESTION_TTL_MS,
+  claimNavigatorApprovalSubmission,
+  createNavigatorArmedQuestionStore,
+  createNavigatorApprovalSubmissionLock,
+  navigatorApprovalCanBypassProvider,
+  navigatorExecutionStage1,
+  resolveNavigatorApprovalGate,
+} from "~/navigatorApprovalGate";
+import {
+  applyNavigatorApprovalOutcome,
+  consumeNavigatorApprovalForIneligibleSubmission,
+  isNavigatorApprovalContinuationCurrent,
+  syncNavigatorApprovalProviderTurn,
+} from "~/navigatorApprovalInteraction";
 import {
   navigatorExecutionAvailability,
   useNavigatorExecuteProposal,
   useNavigatorExecutionLinks,
 } from "~/state/navigatorExecutionCommand";
+import {
+  buildNavigatorApprovalClassificationRequest,
+  navigatorApprovalClassificationFromCommandResult,
+  navigatorApprovalCommands,
+} from "~/state/navigatorApprovalCommand";
 import { NavigatorProposalExecution } from "./navigator/NavigatorProposalExecution";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -1238,6 +1254,10 @@ function ChatViewContent(props: ChatViewProps) {
   const respondToThreadUserInput = useAtomCommand(threadEnvironment.respondToUserInput, {
     reportFailure: false,
   });
+  const classifyNavigatorApproval = useAtomCommand(
+    navigatorApprovalCommands.classifyProposalApproval,
+    { reportFailure: false, reportDefect: false },
+  );
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
@@ -1385,6 +1405,24 @@ function ChatViewContent(props: ChatViewProps) {
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const sendInFlightRef = useRef(false);
+  const navigatorApprovalStore = useMemo(() => createNavigatorArmedQuestionStore(), []);
+  const navigatorApprovalSubmissionLock = useMemo(
+    () => createNavigatorApprovalSubmissionLock(),
+    [],
+  );
+  const [navigatorApprovalRevision, setNavigatorApprovalRevision] = useState(0);
+  const [navigatorApprovalPending, setNavigatorApprovalPending] = useState(false);
+  const [navigatorApprovalNotice, setNavigatorApprovalNotice] = useState<
+    "question" | "declined" | null
+  >(null);
+  const navigatorApprovalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navigatorApprovalTimerGenerationRef = useRef(0);
+  const navigatorApprovalInFlightRef = useRef(false);
+  const navigatorApprovalRequestTokenRef = useRef(0);
+  const navigatorApprovalRouteRef = useRef({ environmentId, threadId });
+  const navigatorApprovalProposalKeyRef = useRef<string | null>(null);
+  const navigatorApprovalProposalGenerationKeyRef = useRef<string | null>(null);
+  const navigatorApprovalProposalGenerationRef = useRef(0);
   const terminalUiOpenByThreadRef = useRef<Record<string, boolean>>({});
 
   useLayoutEffect(() => {
@@ -2206,9 +2244,9 @@ function ChatViewContent(props: ChatViewProps) {
    *
    * Separate from `activeProposedPlan` below, which stays gated on the thread
    * having settled because the plan-mode follow-up prompt is about the turn.
-   * Execution asks a different question — see `confirmableProposal` — and a
-   * plan that exists is a plan that exists, even when the server no longer
-   * points at the turn that produced it.
+   * Execution keeps two views of it: `currentProposal` is the id/markdown
+   * version an armed question is bound to, while `confirmableProposal` is that
+   * version only when its own producing turn is settled and stage 1 can act.
    */
   const latestProposedPlan = useMemo(
     () =>
@@ -2279,7 +2317,11 @@ function ChatViewContent(props: ChatViewProps) {
    * once its session has stopped, and treating that as "a turn is running"
    * withheld every proposal the conversation had ever produced.
    */
-  const { facts: navigatorExecution, confirmableProposal } = useMemo(
+  const {
+    facts: navigatorExecution,
+    currentProposal,
+    confirmableProposal,
+  } = useMemo(
     () =>
       deriveNavigatorExecution({
         environmentId,
@@ -2291,49 +2333,231 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const executeNavigatorProposal = useNavigatorExecuteProposal();
   /*
-   * Is this send an exact confirmation of the current proposal?
+   * Build the approval gate's stage-1 facts from the same current proposal and
+   * availability object used by both Execute-button projections.
    *
-   * One resolver, two callers: the send path below, and the composer's
-   * disable-reason seam. Sharing it is the point — a second copy of these
-   * safeguards is a second place for them to drift apart.
+   * The proposal markdown is never supplied by the composer. It is read from
+   * this displayed, current proposal and fingerprinted for the command.
    */
-  const navigatorSendRouteFor = useCallback(
-    (input: { readonly text: string; readonly hasAttachments: boolean }): NavigatorSendRoute => {
-      if (navigatorExecution === null || confirmableProposal === null) {
-        return NAVIGATOR_SEND_ROUTE;
-      }
-      return routeNavigatorSend({
-        text: input.text,
-        hasAttachments: input.hasAttachments,
-        purpose: navigatorExecution.purpose,
-        isDurableThread: navigatorExecution.threadId !== null,
-        proposal: confirmableProposal,
-        // THE CARDS' OWN ANSWER, NOT A SECOND COPY OF IT. The same facts object
-        // the timeline and the Plan sidebar decide from, resolved against the
-        // same per-proposal gate — and resolved at action time, so a failure or
-        // a pending request that landed since the last render still counts.
-        availability: navigatorExecutionAvailability({
-          facts: navigatorExecution,
-          proposal: confirmableProposal,
-        }),
-      });
-    },
-    [confirmableProposal, navigatorExecution],
+  const currentNavigatorApprovalTarget = useMemo(() => {
+    if (durableThreadIdForExecution === null || currentProposal === null) return null;
+    return {
+      threadId: durableThreadIdForExecution,
+      proposalId: currentProposal.id,
+      fingerprint: peerLoopProposalFingerprint(
+        currentProposal.planMarkdown,
+      ) as PeerLoopProposalFingerprint,
+    };
+  }, [currentProposal, durableThreadIdForExecution]);
+  const navigatorApprovalProposalKey =
+    currentNavigatorApprovalTarget === null
+      ? null
+      : `${currentNavigatorApprovalTarget.proposalId}\u0000${currentNavigatorApprovalTarget.fingerprint}`;
+  // This render-time generation catches a version that changes away and back
+  // while a classifier is pending; final equality alone must not revive a
+  // stale asynchronous result.
+  if (navigatorApprovalProposalGenerationKeyRef.current !== navigatorApprovalProposalKey) {
+    navigatorApprovalProposalGenerationKeyRef.current = navigatorApprovalProposalKey;
+    navigatorApprovalProposalGenerationRef.current += 1;
+  }
+  const navigatorApprovalStage1InputFor = useCallback(
+    (input: { readonly text: string; readonly hasAttachments: boolean }) => ({
+      purpose: navigatorExecution?.purpose,
+      isDurableThread: navigatorExecution !== null && navigatorExecution.threadId !== null,
+      hasAttachments: input.hasAttachments,
+      utterance: input.text,
+      selectedProposalTargets:
+        currentProposal === null
+          ? []
+          : [{ proposal: currentProposal, isCurrent: true, isLatest: true }],
+      proposalSettled:
+        navigatorExecution !== null && currentProposal !== null
+          ? proposalIsSettled({
+              proposal: currentProposal,
+              unsettledTurnId: navigatorExecution.unsettledTurnId,
+            })
+          : false,
+      proposalActionable:
+        currentProposal !== null &&
+        currentProposal.implementedAt === null &&
+        currentProposal.implementationThreadId === null,
+      availability:
+        navigatorExecution !== null && currentProposal !== null
+          ? navigatorExecutionAvailability({
+              facts: navigatorExecution,
+              proposal: currentProposal,
+            })
+          : { canExecute: false },
+    }),
+    [currentProposal, navigatorExecution],
   );
+  const navigatorApprovalLiveContextRef = useRef({
+    environmentId,
+    threadId,
+    target: currentNavigatorApprovalTarget,
+    proposalGeneration: navigatorApprovalProposalGenerationRef.current,
+    stage1InputFor: navigatorApprovalStage1InputFor,
+  });
+  navigatorApprovalLiveContextRef.current = {
+    environmentId,
+    threadId,
+    target: currentNavigatorApprovalTarget,
+    proposalGeneration: navigatorApprovalProposalGenerationRef.current,
+    stage1InputFor: navigatorApprovalStage1InputFor,
+  };
   /*
-   * Whether this exact text may submit with no provider configured.
+   * Whether an eligible Navigator candidate may submit with no provider
+   * configured. If semantic classification fails closed, the existing provider
+   * check below still refuses to start anything, so ordinary conversation is
+   * never swallowed.
    *
-   * TRUE ONLY FOR AN ELIGIBLE CONFIRMATION. Executing a proposal calls Peer
-   * Loop's own operation and does not need the Navigator conversation's
-   * provider at all, so refusing the press because a provider is missing
-   * refuses the one action that would still work. Ordinary conversation keeps
-   * exactly the behaviour it has: no provider, no turn.
+   * Natural-language candidates remain blocked when the provider is absent,
+   * because their mandatory SEND_TO_PROVIDER fallback could not be delivered.
    */
   const allowsSubmitWithoutProvider = useCallback(
-    (input: { readonly text: string; readonly hasAttachments: boolean }): boolean =>
-      navigatorSendRouteFor(input).kind === "execute",
-    [navigatorSendRouteFor],
+    (input: { readonly text: string; readonly hasAttachments: boolean }): boolean => {
+      const target = currentNavigatorApprovalTarget;
+      return navigatorApprovalCanBypassProvider({
+        stage1: navigatorApprovalStage1InputFor(input),
+        hasArmedQuestion: target !== null && navigatorApprovalStore.read(target) !== null,
+      });
+    },
+    [currentNavigatorApprovalTarget, navigatorApprovalStage1InputFor, navigatorApprovalStore],
   );
+
+  const clearNavigatorApprovalTimer = useCallback(() => {
+    navigatorApprovalTimerGenerationRef.current += 1;
+    if (navigatorApprovalTimerRef.current !== null) {
+      clearTimeout(navigatorApprovalTimerRef.current);
+      navigatorApprovalTimerRef.current = null;
+    }
+  }, []);
+  const clearNavigatorApprovalNotice = useCallback(() => {
+    clearNavigatorApprovalTimer();
+    setNavigatorApprovalNotice(null);
+    setNavigatorApprovalPending(false);
+    setNavigatorApprovalRevision((revision) => revision + 1);
+  }, [clearNavigatorApprovalTimer]);
+  const dismissNavigatorApprovalQuestion = useCallback(() => {
+    clearNavigatorApprovalTimer();
+    setNavigatorApprovalNotice(null);
+    setNavigatorApprovalRevision((revision) => revision + 1);
+  }, [clearNavigatorApprovalTimer]);
+  const armNavigatorApprovalQuestion = useCallback(
+    (target: NonNullable<typeof currentNavigatorApprovalTarget>) => {
+      clearNavigatorApprovalTimer();
+      const record = navigatorApprovalStore.arm(target);
+      const timerGeneration = navigatorApprovalTimerGenerationRef.current;
+      setNavigatorApprovalNotice("question");
+      setNavigatorApprovalRevision((revision) => revision + 1);
+      navigatorApprovalTimerRef.current = setTimeout(() => {
+        if (navigatorApprovalTimerGenerationRef.current !== timerGeneration) return;
+        navigatorApprovalTimerRef.current = null;
+        if (navigatorApprovalStore.read(target)?.askedAt !== record.askedAt) return;
+        navigatorApprovalStore.invalidateThread(target.threadId);
+        setNavigatorApprovalNotice(null);
+        setNavigatorApprovalRevision((revision) => revision + 1);
+      }, NAVIGATOR_ARMED_QUESTION_TTL_MS);
+    },
+    [clearNavigatorApprovalTimer, navigatorApprovalStore],
+  );
+  const showNavigatorApprovalDeclined = useCallback(() => {
+    clearNavigatorApprovalTimer();
+    const timerGeneration = navigatorApprovalTimerGenerationRef.current;
+    setNavigatorApprovalNotice("declined");
+    setNavigatorApprovalRevision((revision) => revision + 1);
+    navigatorApprovalTimerRef.current = setTimeout(() => {
+      if (navigatorApprovalTimerGenerationRef.current !== timerGeneration) return;
+      navigatorApprovalTimerRef.current = null;
+      setNavigatorApprovalNotice(null);
+      setNavigatorApprovalRevision((revision) => revision + 1);
+    }, 2_500);
+  }, [clearNavigatorApprovalTimer]);
+
+  const currentNavigatorArmedQuestion = useMemo(
+    () =>
+      currentNavigatorApprovalTarget === null
+        ? null
+        : navigatorApprovalStore.read(currentNavigatorApprovalTarget),
+    [currentNavigatorApprovalTarget, navigatorApprovalRevision, navigatorApprovalStore],
+  );
+  const showNavigatorApprovalQuestion =
+    navigatorApprovalNotice === "question" && currentNavigatorArmedQuestion !== null;
+
+  // A mounted ChatView owns this authority. Route changes invalidate the old
+  // thread/environment and cancel any in-flight classification's UI result.
+  useEffect(() => {
+    const previous = navigatorApprovalRouteRef.current;
+    if (previous.environmentId !== environmentId || previous.threadId !== threadId) {
+      navigatorApprovalStore.invalidateThread(previous.threadId);
+      navigatorApprovalSubmissionLock.release();
+      navigatorApprovalRequestTokenRef.current += 1;
+      navigatorApprovalInFlightRef.current = false;
+      clearNavigatorApprovalNotice();
+    }
+    navigatorApprovalRouteRef.current = { environmentId, threadId };
+  }, [
+    clearNavigatorApprovalNotice,
+    environmentId,
+    navigatorApprovalStore,
+    navigatorApprovalSubmissionLock,
+    threadId,
+  ]);
+
+  useEffect(
+    () => () => {
+      clearNavigatorApprovalTimer();
+      navigatorApprovalStore.invalidateThread(navigatorApprovalRouteRef.current.threadId);
+      navigatorApprovalSubmissionLock.release();
+      navigatorApprovalRequestTokenRef.current += 1;
+    },
+    [clearNavigatorApprovalTimer, navigatorApprovalStore, navigatorApprovalSubmissionLock],
+  );
+
+  // The authority names the current proposal version. A new id or markdown
+  // fingerprint removes the old question before another submission can use it.
+  useEffect(() => {
+    const previousKey = navigatorApprovalProposalKeyRef.current;
+    if (previousKey !== null && previousKey !== navigatorApprovalProposalKey) {
+      navigatorApprovalStore.invalidateThread(threadId);
+      // Same-thread proposal mutations invalidate authority but must not
+      // cancel a captured submission. Its result falls through to the
+      // ordinary provider path with the original text and attachments.
+      dismissNavigatorApprovalQuestion();
+    }
+    navigatorApprovalProposalKeyRef.current = navigatorApprovalProposalKey;
+  }, [
+    dismissNavigatorApprovalQuestion,
+    navigatorApprovalProposalKey,
+    navigatorApprovalStore,
+    threadId,
+  ]);
+
+  // Classification is not a provider turn. Only a provider turn with a start
+  // time strictly later than the question can invalidate its authority.
+  useEffect(() => {
+    if (activeThreadId === null || activeLatestTurn === null || activeLatestTurn.startedAt === null)
+      return;
+    const startedAt = Date.parse(activeLatestTurn.startedAt);
+    if (Number.isNaN(startedAt)) return;
+    const questionRemainsVisible = syncNavigatorApprovalProviderTurn({
+      store: navigatorApprovalStore,
+      threadId: activeThreadId,
+      target: currentNavigatorApprovalTarget,
+      startedAt,
+      questionVisible: navigatorApprovalNotice === "question",
+    });
+    if (navigatorApprovalNotice === "question" && !questionRemainsVisible) {
+      dismissNavigatorApprovalQuestion();
+    }
+  }, [
+    activeLatestTurn?.startedAt,
+    activeThreadId,
+    currentNavigatorApprovalTarget,
+    dismissNavigatorApprovalQuestion,
+    navigatorApprovalNotice,
+    navigatorApprovalStore,
+  ]);
   /*
    * The sidebar shows whichever proposal the turn is about, and that can be a
    * plan carried over from another thread. Only this conversation's own
@@ -2610,8 +2834,13 @@ function ChatViewContent(props: ChatViewProps) {
   }, [attachmentPreviewHandoffByMessageId, displayServerMessages, optimisticUserMessages]);
   const timelineEntries = useMemo(
     () =>
-      deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+      deriveTimelineEntries(
+        timelineMessages,
+        activeThread?.proposedPlans ?? [],
+        workLogEntries,
+        executionLinks,
+      ),
+    [activeThread?.proposedPlans, executionLinks, timelineMessages, workLogEntries],
   );
   const [dockedDraftHeroThreadKey, setDockedDraftHeroThreadKey] = useState<string | null>(null);
   const draftHeroDockRequested =
@@ -4518,12 +4747,45 @@ function ChatViewContent(props: ChatViewProps) {
     }
     void handleSwitchCheckoutToThread();
   }, [gitStatusQuery.data?.hasWorkingTreeChanges, handleSwitchCheckoutToThread]);
+  const navigatorApprovalBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    if (navigatorApprovalPending) {
+      return {
+        id: "navigator-approval:checking",
+        variant: "info",
+        icon: <CheckCircle2Icon />,
+        title: "Checking whether this approves the proposal…",
+        description: "The composer will continue safely if it is not an approval.",
+      };
+    }
+    if (showNavigatorApprovalQuestion) {
+      return {
+        id: "navigator-approval:question",
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: "Execute the current proposal with Peer Loop?",
+        description: "Reply yes to execute this proposal; reply no to decline.",
+      };
+    }
+    if (navigatorApprovalNotice === "declined") {
+      return {
+        id: "navigator-approval:declined",
+        variant: "info",
+        icon: <CheckCircle2Icon />,
+        title: "Execution declined",
+        description: "No Peer Loop run was started.",
+      };
+    }
+    return null;
+  }, [navigatorApprovalNotice, navigatorApprovalPending, showNavigatorApprovalQuestion]);
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
+    const navigatorApprovalItems =
+      navigatorApprovalBannerItem === null ? [] : [navigatorApprovalBannerItem];
     const parkedThreadItems = parkedThreadBannerItem === null ? [] : [parkedThreadBannerItem];
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
-      return [...systemComposerBannerItems, ...parkedThreadItems];
+      return [...navigatorApprovalItems, ...systemComposerBannerItems, ...parkedThreadItems];
     }
     return [
+      ...navigatorApprovalItems,
       ...systemComposerBannerItems,
       {
         id: `branch-mismatch:${activeBranchMismatchKey}`,
@@ -4571,6 +4833,7 @@ function ChatViewContent(props: ChatViewProps) {
     handleRestoreThreadBranch,
     isRestoringThreadBranch,
     localCheckoutBranchMismatch,
+    navigatorApprovalBannerItem,
     parkedThreadBannerItem,
     showBranchMismatchBanner,
     systemComposerBannerItems,
@@ -4873,7 +5136,9 @@ function ChatViewContent(props: ChatViewProps) {
       isConnecting ||
       threadDetailLoading ||
       activeEnvironmentUnavailable ||
-      sendInFlightRef.current
+      sendInFlightRef.current ||
+      navigatorApprovalInFlightRef.current ||
+      navigatorApprovalSubmissionLock.isLocked()
     )
       return;
     if (activePendingProgress) {
@@ -4910,52 +5175,169 @@ function ChatViewContent(props: ChatViewProps) {
         composerReviewComments.length,
     });
     /*
-     * A standalone confirmation of the current Execution Proposal.
-     *
-     * CHECKED BEFORE THE PROVIDER-AVAILABILITY RETURN, and before the plan
-     * follow-up branch that would otherwise swallow it as a refinement turn.
-     * Executing calls Peer Loop's own operation and does not need the Navigator
-     * conversation's provider at all, so refusing the press because a provider
-     * is missing would refuse the one action that still works. Ordinary
-     * conversation keeps its existing behaviour: the provider check below is
-     * unchanged for everything that is not an exact eligible confirmation.
-     *
-     * Everything above this point is a pure read — the send context, the
-     * prompt ref, and the derived send state — so reordering the check moved
-     * no side effect earlier.
+     * One six-stage gate for exact confirmations, deterministic bare replies,
+     * and natural approval candidates. Stage 1 uses the same current proposal
+     * and per-proposal availability as both Execute buttons. The model only
+     * describes schema-validated traits; deterministic code combines those
+     * traits with armed authority and chooses the final outcome.
      */
-    const navigatorSendRoute = navigatorSendRouteFor({
-      text: trimmed,
+    const navigatorApprovalInput = {
+      text: promptForSend,
       hasAttachments: composerSendContextHasAttachments(sendCtx),
+    };
+    const navigatorApprovalStage1Input = navigatorApprovalStage1InputFor(navigatorApprovalInput);
+    const approvalClaim = claimNavigatorApprovalSubmission({
+      stage1: navigatorApprovalStage1Input,
+      lock: navigatorApprovalSubmissionLock,
     });
-    /*
-     * Consumed as an action, not sent as a message.
-     *
-     * Nothing else moves: no provider turn, no optimistic owner message, no
-     * mode change, no navigation. The durable record of this action is the
-     * immutable proposal/run link the server writes and the child card that
-     * renders it — fabricating a message to stand in for it would put words
-     * in the owner's transcript that they never sent to anybody.
-     */
-    const consumedNavigatorConfirmation = await consumeNavigatorConfirmation({
-      route: navigatorSendRoute,
-      clearComposer: () => {
-        promptRef.current = "";
-        clearComposerDraftContent(composerDraftTarget);
-        composerRef.current?.resetCursorState();
-      },
-      // The same gate both Execute buttons use. A press and a phrase in the
-      // same tick resolve to one key and produce one RPC.
-      execute: (confirmed) => {
-        if (durableThreadIdForExecution === null) return Promise.resolve(null);
-        return executeNavigatorProposal({
-          environmentId,
-          threadId: durableThreadIdForExecution,
-          proposedPlanId: confirmed.id,
+    if (approvalClaim.stage1.eligible && !approvalClaim.lockHeld) return;
+    const approvalLockHeld = approvalClaim.lockHeld;
+    const approvalTargetAtSend = currentNavigatorApprovalTarget;
+    const approvalProposalGeneration = navigatorApprovalProposalGenerationRef.current;
+    const armedAtSend =
+      approvalTargetAtSend === null ? null : navigatorApprovalStore.read(approvalTargetAtSend);
+
+    const clearNavigatorComposer = () => {
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+    };
+    const clearNavigatorApprovalTransient = () => {
+      if (navigatorApprovalNotice !== null || navigatorApprovalPending || armedAtSend !== null) {
+        clearNavigatorApprovalNotice();
+      }
+    };
+    if (!approvalClaim.stage1.eligible) {
+      // Stage 1 is already a synchronous answer. Consume stale authority and
+      // dismiss its transient question before entering the existing provider
+      // path; awaiting the full gate here would reopen duplicate-send races.
+      consumeNavigatorApprovalForIneligibleSubmission({
+        stage1: approvalClaim.stage1,
+        targetAtSend: approvalTargetAtSend,
+        threadId,
+        store: navigatorApprovalStore,
+        hasTransientQuestion:
+          navigatorApprovalNotice !== null || navigatorApprovalPending || armedAtSend !== null,
+        clearTransient: clearNavigatorApprovalTransient,
+      });
+    } else {
+      const approvalRequestToken = ++navigatorApprovalRequestTokenRef.current;
+      let classificationStarted = false;
+      let navigatorApprovalResult: Awaited<ReturnType<typeof resolveNavigatorApprovalGate>>;
+      try {
+        navigatorApprovalResult = await resolveNavigatorApprovalGate({
+          ...navigatorApprovalStage1Input,
+          hasArmedQuestion: armedAtSend !== null,
+          onClassificationStarted: () => {
+            classificationStarted = true;
+            navigatorApprovalInFlightRef.current = true;
+            setNavigatorApprovalPending(true);
+          },
+          classify: async () => {
+            if (approvalTargetAtSend === null) return null;
+            const request = buildNavigatorApprovalClassificationRequest({
+              environmentId,
+              input: {
+                threadId: approvalTargetAtSend.threadId,
+                proposedPlanId: approvalTargetAtSend.proposalId,
+                proposalFingerprint: approvalTargetAtSend.fingerprint,
+                ownerUtterance: promptForSend,
+                hasAttachments: navigatorApprovalInput.hasAttachments,
+              },
+            });
+            const commandResult = await classifyNavigatorApproval(request);
+            const classification = navigatorApprovalClassificationFromCommandResult(commandResult);
+            return classification.outcome === "classified" ? classification.traits : null;
+          },
         });
-      },
-    });
-    if (consumedNavigatorConfirmation) return;
+      } catch {
+        // A local gate defect is still fail-closed and must not strand the
+        // synchronous claim or turn an approval into an execution attempt.
+        navigatorApprovalResult = { outcome: "SEND_TO_PROVIDER", proposal: null };
+      } finally {
+        if (
+          classificationStarted &&
+          approvalRequestToken === navigatorApprovalRequestTokenRef.current
+        ) {
+          navigatorApprovalInFlightRef.current = false;
+          setNavigatorApprovalPending(false);
+        }
+      }
+      if (approvalRequestToken !== navigatorApprovalRequestTokenRef.current) {
+        if (approvalLockHeld) navigatorApprovalSubmissionLock.release();
+        return;
+      }
+
+      const liveContext = navigatorApprovalLiveContextRef.current;
+      const liveContextIsCurrent = isNavigatorApprovalContinuationCurrent({
+        submittedEnvironmentId: environmentId,
+        submittedThreadId: threadId,
+        currentEnvironmentId: liveContext.environmentId,
+        currentThreadId: liveContext.threadId,
+      });
+      const proposalVersionUnchanged =
+        liveContextIsCurrent && liveContext.proposalGeneration === approvalProposalGeneration;
+      let handledNavigatorApproval: boolean;
+      try {
+        handledNavigatorApproval = await applyNavigatorApprovalOutcome({
+          result: navigatorApprovalResult,
+          targetAtSend: approvalTargetAtSend,
+          currentTarget: proposalVersionUnchanged ? liveContext.target : null,
+          targetVersionUnchanged: proposalVersionUnchanged,
+          currentStage1Eligible: liveContextIsCurrent
+            ? navigatorExecutionStage1(liveContext.stage1InputFor(navigatorApprovalInput)).eligible
+            : false,
+          armedAtSend,
+          threadId: durableThreadIdForExecution,
+          store: navigatorApprovalStore,
+          submittedText: promptForSend,
+          clearComposer: clearNavigatorComposer,
+          clearTransient: clearNavigatorApprovalTransient,
+          armQuestion: armNavigatorApprovalQuestion,
+          showDeclined: showNavigatorApprovalDeclined,
+          execute: (proposal, ownerApprovalText) => {
+            if (durableThreadIdForExecution === null) return Promise.resolve(null);
+            return executeNavigatorProposal({
+              environmentId,
+              threadId: durableThreadIdForExecution,
+              proposedPlanId: proposal.id,
+              planMarkdown: proposal.planMarkdown,
+              ownerApprovalText,
+            });
+          },
+        });
+      } catch (error) {
+        if (approvalLockHeld) navigatorApprovalSubmissionLock.release();
+        throw error;
+      }
+      if (handledNavigatorApproval) {
+        if (approvalLockHeld) navigatorApprovalSubmissionLock.release();
+        return;
+      }
+
+      // A route can change while the classifier result is being applied, before
+      // the passive route-cancellation effect advances the request token. Do a
+      // second identity check before handing the captured text to the provider;
+      // a same-thread proposal mutation is intentionally allowed through.
+      const continuationContext = navigatorApprovalLiveContextRef.current;
+      if (
+        approvalRequestToken !== navigatorApprovalRequestTokenRef.current ||
+        !isNavigatorApprovalContinuationCurrent({
+          submittedEnvironmentId: environmentId,
+          submittedThreadId: threadId,
+          currentEnvironmentId: continuationContext.environmentId,
+          currentThreadId: continuationContext.threadId,
+        })
+      ) {
+        if (approvalLockHeld) navigatorApprovalSubmissionLock.release();
+        return;
+      }
+
+      // The ordinary path owns the captured text from here. Release before the
+      // provider availability check so a fail-closed result cannot deadlock the
+      // next approval interaction.
+      if (approvalLockHeld) navigatorApprovalSubmissionLock.release();
+    }
 
     // Ordinary conversation still needs somewhere to send it.
     if (!sendCtx.providerAvailable) return;
@@ -6332,7 +6714,13 @@ function ChatViewContent(props: ChatViewProps) {
                             phase={phase}
                             isConnecting={isConnecting}
                             isSendBusy={isSendBusy}
-                            sendDisabledReason={threadDetailLoading ? "Messages loading" : null}
+                            sendDisabledReason={
+                              navigatorApprovalPending
+                                ? "Checking whether this approves the proposal…"
+                                : threadDetailLoading
+                                  ? "Messages loading"
+                                  : null
+                            }
                             allowsSubmitWithoutProvider={allowsSubmitWithoutProvider}
                             isPreparingWorktree={isPreparingWorktree}
                             environmentUnavailable={activeEnvironmentUnavailableState}

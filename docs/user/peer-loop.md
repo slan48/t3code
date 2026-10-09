@@ -134,20 +134,35 @@ is treated as one.
 
 ### Handing a proposal to Peer Loop
 
-Two ways, and they are the same action:
+Two ways, and they are the same guarded action:
 
 - press **Execute with Peer Loop** on the proposal, in the conversation or in
   the plan sidebar; or
-- say one of a short, fixed list of standalone confirmations — `let's do it` or
-  `hagamos eso`, and a couple of equally unambiguous alternatives like
-  `execute the proposal`.
+- use the composer to approve the current proposal. The five retained exact
+  phrases — `let's do it`, `lets do it`, `execute the proposal`, `hagamos eso`,
+  and `ejecuta la propuesta` — remain a fast path for unambiguous whole-message
+  confirmations.
 
-The phrase has to be the whole message, with nothing attached to it. Case,
-spacing, a typographic apostrophe and a trailing full stop are all fine.
-Anything longer, a question, a negation, a quote or a phrase with a condition
-bolted on goes to Navigator as ordinary conversation. The list is deliberately
-short: the difference between a sentence and an authorization is a Reviewer and
-a Builder working in your repository.
+The exact list is not the whole grammar. Short, non-question natural approvals
+can be checked through schema-validated approval traits. Conditions or
+qualifications, requested changes, questions, doubts, negation,
+quotes/hypotheticals, approval of another object, low confidence, and a
+classifier failure remain ordinary Navigator conversation. The model describes
+traits; T3 Code's deterministic safety rules decide what happens.
+
+The known bare replies `sí`/`si`, `ok`, `vale`, and `👍` are deliberately a
+separate safety step. The first one shows a transient question — **Execute the
+current proposal with Peer Loop?** — and does not execute or send a provider
+turn. A later affirmative answer can execute that exact proposal version. A
+known bare `no`, `nope`, or `todavía no` declines the armed question. The
+question and its authority are ephemeral: decline, expiry after two minutes,
+navigation, reload, a changed proposal, or a provider turn that started after
+the question consumes it. A provider turn that started before or exactly when
+the question was shown does not invalidate it.
+
+Every natural approval is bound to the current proposal id and its markdown
+fingerprint. If the proposal changed, T3 Code requires fresh review and
+approval; it never retries a stale approval against the new text.
 
 Either way, the objective Peer Loop receives is **the proposal you were looking
 at**, not the words you typed. A proposal that has already been executed, or
@@ -156,8 +171,19 @@ that a coding thread already implemented, does not offer the action again.
 ### Watching it from the conversation
 
 Once a run exists, it appears as a **child execution card** under the proposal
-it came from: the run, what Peer Loop says it is doing, and a link into the
-execution details.
+it came from and as a chronological execution row in the conversation. The row
+shows the acknowledgement **“Perfecto, comienzo con Peer Loop.”** directly above
+the same structured run card. Both cards use the same live run state, and the
+acknowledgement is derived UI — it is not an assistant message or provider text.
+
+An approval that actually links a run is also saved as a durable Owner message,
+so it remains visible in the conversation and in later Navigator context. That
+record-only message does not start a provider turn. If validation or starting
+the run fails, no link and no approval message are recorded.
+
+When you later send an ordinary Navigator message, that approval is shown to
+Navigator as bounded historical Owner context, separately from the new request.
+The acknowledgement line is never included as a message or as provider text.
 
 The conversation keeps working the whole time. You can ask what is happening,
 plan the next piece, or refine a different proposal while a run is going; asking
@@ -180,14 +206,15 @@ actually is. Answering twice by clicking twice is not possible; every option is
 disabled while your answer is on its way, in both the conversation and the Plan
 sidebar.
 
-Typing a confirmation phrase never answers a question. `let's do it` and its
-siblings execute a proposal and nothing else.
+Typing a confirmation phrase never answers a Peer Loop Reviewer question.
+`let's do it` and its siblings execute a proposal and nothing else; the
+separate transient approval question belongs only to the bare-reply flow.
 
-Everything else Navigator still only reads: it never approves, resumes, recovers,
-pauses or sends a free-text owner message, and it will tell you that rather than
-claim it did. **Approving, pausing, resuming and resolving an interrupted turn
-happen in the execution details**, using the controls described earlier on this
-page.
+Outside the guarded proposal-approval flow, Navigator still only reads: it
+never approves, resumes, recovers, pauses or sends a free-text Owner message to
+Peer Loop, and it will tell you that rather than claim it did. **Approving,
+pausing, resuming and resolving an interrupted run happen in the execution
+details**, using the controls described earlier on this page.
 
 ### When an Execute does not come back
 

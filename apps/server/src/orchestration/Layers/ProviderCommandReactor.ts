@@ -44,7 +44,10 @@ import {
   ServerSettingsService,
 } from "../../serverSettings.ts";
 import { NavigatorExecutionContext } from "../../peerLoop/NavigatorExecutionContext.ts";
-import { providerMessageTextForThread } from "../navigatorProviderFrame.ts";
+import {
+  navigatorOwnerApprovalHistoryForThread,
+  providerMessageTextForThread,
+} from "../navigatorProviderFrame.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
@@ -1100,12 +1103,14 @@ const make = Effect.gen(function* () {
       );
 
     /*
-     * What this conversation's own Peer Loop runs are doing, if it has any.
+     * What this conversation's own Peer Loop runs are doing, if it has any,
+     * and which record-only Owner approvals belong in historical context.
      *
      * Read here, at the shared boundary, for the same reason the frame is: one
-     * read, one shape, every adapter. It never fails and never blocks — a
-     * coding thread and a Navigator thread with no links return null without
-     * touching Peer Loop at all.
+     * read, one shape, every adapter. The run context never fails and never
+     * blocks; the approval history is a pure read-model projection. A coding
+     * thread and a Navigator thread with no links/approvals return no extra
+     * sections without touching Peer Loop for context.
      */
     const navigatorExecutionContextText = yield* navigatorExecutionContext.forThread({
       id: thread.id,
@@ -1113,6 +1118,10 @@ const make = Effect.gen(function* () {
       projectId: thread.projectId,
       peerLoopExecutions: thread.peerLoopExecutions,
     });
+    const navigatorOwnerApprovalHistoryText = navigatorOwnerApprovalHistoryForThread(
+      thread.purpose,
+      thread.messages,
+    );
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
@@ -1128,6 +1137,7 @@ const make = Effect.gen(function* () {
         thread.purpose,
         message.text,
         navigatorExecutionContextText,
+        navigatorOwnerApprovalHistoryText,
       ),
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined

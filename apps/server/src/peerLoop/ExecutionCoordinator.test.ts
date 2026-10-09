@@ -43,6 +43,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
@@ -150,7 +151,11 @@ const startResult = (runId: string): PeerLoopStartResult =>
     },
   }) as PeerLoopStartResult;
 
-const EXECUTE: PeerLoopExecuteProposalInput = { threadId: THREAD_ID, proposedPlanId: "plan-1" };
+const EXECUTE: PeerLoopExecuteProposalInput = {
+  threadId: THREAD_ID,
+  proposedPlanId: "plan-1",
+  proposalFingerprint: peerLoopProposalFingerprint(PLAN_MARKDOWN),
+};
 
 /* --------------------------------------------------------------- harness */
 
@@ -215,6 +220,22 @@ const makeHarness = Effect.fn("makeHarness")(function* (options: HarnessOptions 
       thread.id === command.threadId
         ? {
             ...thread,
+            messages:
+              command.approvalMessage === undefined
+                ? thread.messages
+                : [
+                    ...thread.messages,
+                    {
+                      id: command.approvalMessage.messageId,
+                      role: "user" as const,
+                      text: command.approvalMessage.text,
+                      messageKind: "record-only-owner-approval" as const,
+                      turnId: null,
+                      streaming: false,
+                      createdAt: command.approvalMessage.createdAt,
+                      updatedAt: command.approvalMessage.createdAt,
+                    },
+                  ],
             peerLoopExecutions: [
               ...thread.peerLoopExecutions,
               {
@@ -324,6 +345,7 @@ const linkCommands = (recorder: Recorder) =>
   );
 
 const isCoordinationError = Schema.is(PeerLoopExecutionCoordinationError);
+const OWNER_APPROVAL_TEXT = "  Sí, procede con el plan.  ";
 
 /* ----------------------------------------------------------------- tests */
 
@@ -378,10 +400,49 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: the happy path", 
         assert.strictEqual(link.threadId, THREAD_ID);
         assert.strictEqual(link.proposedPlanId, "plan-1");
         assert.strictEqual(link.runId, "run-1");
+        assert.strictEqual(Object.hasOwn(link, "approvalMessage"), false);
         // Server-generated, not client-supplied.
         assert.ok(link.commandId.startsWith("server:peer-loop-execute:"));
         assert.strictEqual(link.createdAt, result.execution.createdAt);
       }
+    }),
+  );
+
+  it.effect("records exact composer approval text in the compound link command", () =>
+    Effect.gen(function* () {
+      const { coordinator, recorder } = yield* makeHarness();
+
+      const result = yield* coordinator.executeProposal({
+        ...EXECUTE,
+        ownerApprovalText: OWNER_APPROVAL_TEXT,
+      });
+
+      const links = yield* linkCommands(recorder);
+      const link = links[0];
+      assert.ok(link?.type === "thread.peer-loop-execution.link");
+      if (link?.type !== "thread.peer-loop-execution.link") return;
+      assert.ok(link.approvalMessage !== undefined);
+      if (link.approvalMessage === undefined) return;
+      assert.ok(link.approvalMessage.messageId.startsWith("server:peer-loop-owner-approval:"));
+      assert.strictEqual(link.approvalMessage.text, OWNER_APPROVAL_TEXT);
+      assert.strictEqual(link.approvalMessage.createdAt <= result.execution.createdAt, true);
+
+      const projected = (yield* Ref.get(recorder.projected)).find(
+        (thread) => thread.id === THREAD_ID,
+      );
+      const message = projected?.messages.find(
+        (entry) => entry.id === link.approvalMessage?.messageId,
+      );
+      assert.deepStrictEqual(message, {
+        id: link.approvalMessage.messageId,
+        role: "user",
+        text: OWNER_APPROVAL_TEXT,
+        messageKind: "record-only-owner-approval",
+        turnId: null,
+        streaming: false,
+        createdAt: link.approvalMessage.createdAt,
+        updatedAt: link.approvalMessage.createdAt,
+      });
     }),
   );
 
@@ -429,6 +490,37 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: refused before st
 
   it.effect("refuses a proposal that is not on the thread", () =>
     expectNoStart({}, { ...EXECUTE, proposedPlanId: "plan-missing" }, "proposal-not-found"),
+  );
+
+  it.effect("refuses a stale fingerprint before starting or dispatching a link", () =>
+    Effect.gen(function* () {
+      const { coordinator, recorder } = yield* makeHarness();
+      // The request still carries F1, but the same proposal id now projects F2.
+      yield* Ref.update(recorder.projected, (threads) =>
+        threads.map((thread) =>
+          thread.id === THREAD_ID
+            ? { ...thread, proposedPlans: [plan({ planMarkdown: `${PLAN_MARKDOWN}\n` })] }
+            : thread,
+        ),
+      );
+
+      const error = yield* Effect.flip(
+        coordinator.executeProposal({ ...EXECUTE, ownerApprovalText: OWNER_APPROVAL_TEXT }),
+      );
+
+      assert.ok(isCoordinationError(error));
+      if (isCoordinationError(error)) {
+        assert.strictEqual(error.reason, "proposal-changed");
+        assert.strictEqual(error.mayHaveStarted, false);
+        assert.ok(error.detail.includes("fresh owner review and approval"));
+      }
+      assert.deepStrictEqual(yield* Ref.get(recorder.startCalls), []);
+      assert.deepStrictEqual(yield* linkCommands(recorder), []);
+      assert.deepStrictEqual(
+        (yield* Ref.get(recorder.projected)).find((thread) => thread.id === THREAD_ID)?.messages,
+        [],
+      );
+    }),
   );
 
   it.effect("refuses a proposal that already has a run, and names it", () =>
@@ -490,6 +582,7 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: Peer Loop's own a
   it.effect("passes a duplicate-run refusal through with its code intact", () =>
     Effect.gen(function* () {
       const { coordinator, recorder } = yield* makeHarness({
+        // The run refuses before the compound link command can be created.
         startRun: () =>
           Effect.fail(
             new PeerLoopCommandRefusedError({
@@ -500,7 +593,9 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: Peer Loop's own a
           ),
       });
 
-      const error = yield* Effect.flip(coordinator.executeProposal(EXECUTE));
+      const error = yield* Effect.flip(
+        coordinator.executeProposal({ ...EXECUTE, ownerApprovalText: OWNER_APPROVAL_TEXT }),
+      );
       assert.strictEqual(error._tag, "PeerLoopCommandRefusedError");
       assert.strictEqual(
         error._tag === "PeerLoopCommandRefusedError" ? error.code : null,
@@ -508,6 +603,10 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: Peer Loop's own a
       );
       // A refused start produced no run, so there is nothing to link.
       assert.deepStrictEqual(yield* linkCommands(recorder), []);
+      assert.deepStrictEqual(
+        (yield* Ref.get(recorder.projected)).find((thread) => thread.id === THREAD_ID)?.messages,
+        [],
+      );
     }),
   );
 
@@ -543,7 +642,10 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: partial failure",
         applyLink: true,
       });
 
-      const result = yield* coordinator.executeProposal(EXECUTE);
+      const result = yield* coordinator.executeProposal({
+        ...EXECUTE,
+        ownerApprovalText: OWNER_APPROVAL_TEXT,
+      });
       assert.strictEqual(result.run.runId, "run-1");
       assert.deepStrictEqual(result.execution, {
         runId: "run-1",
@@ -553,6 +655,13 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: partial failure",
       // One start, one link attempt. The re-read is a read.
       assert.strictEqual((yield* Ref.get(recorder.startCalls)).length, 1);
       assert.strictEqual((yield* linkCommands(recorder)).length, 1);
+      const projected = (yield* Ref.get(recorder.projected)).find(
+        (thread) => thread.id === THREAD_ID,
+      );
+      assert.strictEqual(
+        projected?.messages.some((message) => message.text === OWNER_APPROVAL_TEXT),
+        true,
+      );
     }),
   );
 
@@ -563,7 +672,9 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: partial failure",
         applyLink: false,
       });
 
-      const error = yield* Effect.flip(coordinator.executeProposal(EXECUTE));
+      const error = yield* Effect.flip(
+        coordinator.executeProposal({ ...EXECUTE, ownerApprovalText: OWNER_APPROVAL_TEXT }),
+      );
       assert.ok(isCoordinationError(error));
       if (isCoordinationError(error)) {
         assert.strictEqual(error.reason, "link-not-confirmed");
@@ -574,6 +685,10 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: partial failure",
       }
       assert.strictEqual((yield* Ref.get(recorder.startCalls)).length, 1);
       assert.strictEqual((yield* linkCommands(recorder)).length, 1);
+      assert.deepStrictEqual(
+        (yield* Ref.get(recorder.projected)).find((thread) => thread.id === THREAD_ID)?.messages,
+        [],
+      );
     }),
   );
 });
@@ -690,7 +805,11 @@ it.layer(NodeServices.layer)("peer loop execution coordinator: concurrency", (it
       yield* Effect.all(
         [
           coordinator.executeProposal(EXECUTE),
-          coordinator.executeProposal({ ...EXECUTE, proposedPlanId: "plan-2" }),
+          coordinator.executeProposal({
+            ...EXECUTE,
+            proposedPlanId: "plan-2",
+            proposalFingerprint: peerLoopProposalFingerprint(PLAN_MARKDOWN),
+          }),
         ],
         { concurrency: 2 },
       );

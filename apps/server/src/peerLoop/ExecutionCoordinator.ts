@@ -11,7 +11,9 @@
  *      timeout is never retried: Peer Loop may already have started the run and
  *      a second start would fork a session.
  *   3. **Record the immutable link.** One internal orchestration command with
- *      the run id Peer Loop returned.
+ *      the run id Peer Loop returned. Composer-originated approvals carry a
+ *      server-authored record-only Owner message in that same compound
+ *      command; Execute-button calls retain the link-only form.
  *
  * It is a coordinator, not an engine. It holds no run state, mirrors nothing
  * Peer Loop reports, and has no lifecycle of its own — after step 3 it is done
@@ -36,10 +38,19 @@
  * Serializing per proposal rather than globally keeps two different proposals
  * from queueing behind each other's bridge spawn.
  *
+ * VERSION BINDING:
+ * The proposal fingerprint is compared with the exact markdown in the fresh,
+ * committed T3 projection read inside this gate. That rejects stale client
+ * approvals before UUID generation, `startRun` or link dispatch. This is not a
+ * transaction spanning the later external bridge call: a proposal can still
+ * be mutated after validation and before `startRun`, so this comparison does
+ * not claim full atomicity across that consistency window.
+ *
  * @module PeerLoopExecutionCoordinator
  */
 import {
   CommandId,
+  MessageId,
   PeerLoopExecutionCoordinationError,
   type OrchestrationPeerLoopExecution,
   type OrchestrationProject,
@@ -59,6 +70,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { PeerLoopService } from "./Service.ts";
@@ -99,6 +111,8 @@ const FAILURE_DETAILS: Readonly<Record<PeerLoopExecutionFailureReason, string>> 
   "not-a-navigator-thread":
     "That thread is a coding thread. Only a navigator thread's execution proposals start Peer Loop runs. Nothing was started.",
   "proposal-not-found": "That proposal does not exist on that thread. Nothing was started.",
+  "proposal-changed":
+    "That proposal changed after it was approved. Nothing was started; the refreshed proposal requires a fresh owner review and approval before trying again.",
   "proposal-already-executed":
     "That proposal has already been executed as a Peer Loop run. Nothing was started; open the existing run instead.",
   "proposal-already-implemented":
@@ -231,6 +245,13 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
       return yield* fail("proposal-not-found");
     }
 
+    // Bind approval to the exact markdown the fresh projection contains. This
+    // is deliberately before UUID generation, Peer Loop and link dispatch, so
+    // a stale approval leaves no run and no association behind.
+    if (peerLoopProposalFingerprint(plan.planMarkdown) !== input.proposalFingerprint) {
+      return yield* fail("proposal-changed");
+    }
+
     const existingLink = thread.peerLoopExecutions.find(
       (execution) => execution.proposedPlanId === input.proposedPlanId,
     );
@@ -270,17 +291,26 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
     readonly threadId: PeerLoopExecuteProposalInput["threadId"];
     readonly proposedPlanId: PeerLoopExecuteProposalInput["proposedPlanId"];
     readonly runId: string;
+    readonly approvalMessageId?: MessageId;
   }) {
     const threadOption = yield* snapshotQuery
       .getThreadDetailById(input.threadId)
       .pipe(Effect.orElseSucceed(() => Option.none<OrchestrationThread>()));
     if (Option.isNone(threadOption)) return null;
-    return (
+    const execution =
       threadOption.value.peerLoopExecutions.find(
-        (execution) =>
-          execution.runId === input.runId && execution.proposedPlanId === input.proposedPlanId,
-      ) ?? null
-    );
+        (candidate) =>
+          candidate.runId === input.runId && candidate.proposedPlanId === input.proposedPlanId,
+      ) ?? null;
+    if (execution === null || input.approvalMessageId === undefined) return execution;
+    return threadOption.value.messages.some(
+      (message) =>
+        message.id === input.approvalMessageId &&
+        message.role === "user" &&
+        message.messageKind === "record-only-owner-approval",
+    )
+      ? execution
+      : null;
   });
 
   /* ---------------------------------------------------------- execute */
@@ -293,10 +323,11 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
   > {
     const validated = yield* validate(input);
 
-    // Built here and nowhere else. The client supplied a thread and a proposal;
-    // the project root is the project's own, the objective is the agreed plan
-    // exactly as written, and `newRun` is absent because bypassing Peer Loop's
-    // duplicate-run preflight is Peer Loop's decision to offer, not ours.
+    // Built here and nowhere else. The client supplied a thread, proposal id and
+    // markdown fingerprint; the project root is the project's own, the
+    // objective is the freshly read agreed plan exactly as written, and `newRun`
+    // is absent because bypassing Peer Loop's duplicate-run preflight is Peer
+    // Loop's decision to offer, not ours.
     // Minted before the run starts. A crypto failure afterwards would leave a
     // real run with no way to record it — the one outcome worth spending a
     // line to avoid.
@@ -310,6 +341,35 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
         }),
       ),
     );
+
+    // Mint every id before the external call. If the compound link later needs
+    // this record, a crypto failure must not strand a run with no durable way
+    // to name the approval message.
+    const approvalMessageId =
+      input.ownerApprovalText === undefined
+        ? undefined
+        : yield* crypto.randomUUIDv4.pipe(
+            Effect.map((uuid) => MessageId.make(`server:peer-loop-owner-approval:${uuid}`)),
+            Effect.mapError(() =>
+              coordinationFailure({
+                reason: "coordination-failed",
+                threadId: input.threadId,
+                proposedPlanId: input.proposedPlanId,
+              }),
+            ),
+          );
+    const approvalCreatedAt =
+      input.ownerApprovalText === undefined ? undefined : DateTime.formatIso(yield* DateTime.now);
+    const approvalMessage =
+      approvalMessageId !== undefined &&
+      approvalCreatedAt !== undefined &&
+      input.ownerApprovalText !== undefined
+        ? {
+            messageId: approvalMessageId,
+            text: input.ownerApprovalText,
+            createdAt: approvalCreatedAt,
+          }
+        : undefined;
 
     const startInput: PeerLoopStartRunInput = {
       projectPath: validated.project.workspaceRoot,
@@ -337,6 +397,7 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
         proposedPlanId: input.proposedPlanId,
         runId: run.runId,
         createdAt: linkedAt,
+        ...(approvalMessage === undefined ? {} : { approvalMessage }),
       })
       .pipe(
         Effect.as(true),
@@ -355,6 +416,7 @@ export const make = Effect.fn("peerLoop.ExecutionCoordinator.make")(function* ()
       threadId: input.threadId,
       proposedPlanId: input.proposedPlanId,
       runId: run.runId,
+      ...(approvalMessageId !== undefined ? { approvalMessageId } : {}),
     });
     if (confirmed !== null) {
       return { run, execution: confirmed };

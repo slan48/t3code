@@ -46,6 +46,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 
 import {
   describeExecution,
@@ -1618,7 +1619,11 @@ describe("a historical proposal on a conversation the owner came back to", () =>
               commands.executeProposal,
               {
                 environmentId: ENVIRONMENT,
-                input: { threadId: MOUNT_THREAD, proposedPlanId: MOUNT_PLAN },
+                input: {
+                  threadId: MOUNT_THREAD,
+                  proposedPlanId: MOUNT_PLAN,
+                  proposalFingerprint: peerLoopProposalFingerprint(historicalPlan.planMarkdown),
+                },
               } as never,
               { reportFailure: false, reportDefect: false },
             ) as never,
@@ -1644,6 +1649,7 @@ describe("a historical proposal on a conversation the owner came back to", () =>
       facts,
       proposal: {
         id: MOUNT_PLAN,
+        planMarkdown: historicalPlan.planMarkdown,
         implementedAt: null,
         implementationThreadId: null,
         turnId: PLAN_TURN,
@@ -1692,7 +1698,11 @@ describe("a historical proposal on a conversation the owner came back to", () =>
       expect(mounted.card).toEqual({ canExecute: true, blockedReason: null });
       // The card and the composer agree, because it is one answer.
       expect(mounted.composer).toEqual(mounted.card);
-      expect(mounted.route).toEqual({ kind: "execute", proposal: mounted.confirmable });
+      expect(mounted.route).toEqual({
+        kind: "execute",
+        proposal: mounted.confirmable,
+        ownerApprovalText: "hagamos eso",
+      });
       navigatorExecutionStore.reset();
     }),
   );
@@ -1727,12 +1737,18 @@ describe("a historical proposal on a conversation the owner came back to", () =>
       // Consumed as an action on the first submission: no provider send.
       expect(consumed).toBe(true);
       expect(execute).toHaveBeenCalledTimes(1);
-      expect(execute).toHaveBeenCalledWith(mounted.confirmable);
+      expect(execute).toHaveBeenCalledWith(mounted.confirmable, "hagamos eso");
       expect(clearComposer).toHaveBeenCalledTimes(1);
 
       // And what reaches Peer Loop is one request, from the one gate.
       const second = yield* attempt(refused("CONTROL_UNAVAILABLE"));
-      expect(second.requests).toEqual([{ threadId: MOUNT_THREAD, proposedPlanId: MOUNT_PLAN }]);
+      expect(second.requests).toEqual([
+        {
+          threadId: MOUNT_THREAD,
+          proposedPlanId: MOUNT_PLAN,
+          proposalFingerprint: peerLoopProposalFingerprint(historicalPlan.planMarkdown),
+        },
+      ]);
       navigatorExecutionStore.reset();
     }),
   );
@@ -1828,7 +1844,7 @@ describe("a historical proposal on a conversation the owner came back to", () =>
         isServerThread: true,
         executionsByProposal: new Map(),
       }),
-    ).toEqual({ facts: null, confirmableProposal: null });
+    ).toEqual({ facts: null, currentProposal: null, confirmableProposal: null });
 
     const draft = deriveNavigatorExecution({
       environmentId: ENVIRONMENT,
@@ -1842,6 +1858,7 @@ describe("a historical proposal on a conversation the owner came back to", () =>
         facts: draft.facts!,
         proposal: {
           id: MOUNT_PLAN,
+          planMarkdown: historicalPlan.planMarkdown,
           implementedAt: null,
           implementationThreadId: null,
           turnId: PLAN_TURN,

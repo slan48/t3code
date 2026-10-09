@@ -15,6 +15,7 @@ import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
+  buildNavigatorApprovalClassificationPrompt,
   buildPrContentPrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
@@ -52,7 +53,8 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "classifyNavigatorApproval";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -251,10 +253,27 @@ export const makeGrokTextGeneration = Effect.fn("makeGrokTextGeneration")(functi
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const classifyNavigatorApproval: TextGeneration.TextGenerationProviderService["classifyNavigatorApproval"] =
+    Effect.fn("GrokTextGeneration.classifyNavigatorApproval")(function* (input) {
+      const { prompt, outputSchema } = buildNavigatorApprovalClassificationPrompt({
+        ownerUtterance: input.ownerUtterance,
+        planMarkdown: input.planMarkdown,
+      });
+
+      return yield* runGrokJson({
+        operation: "classifyNavigatorApproval",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
-  } satisfies TextGeneration.TextGeneration["Service"];
+    classifyNavigatorApproval,
+  } satisfies TextGeneration.TextGenerationProviderService;
 });

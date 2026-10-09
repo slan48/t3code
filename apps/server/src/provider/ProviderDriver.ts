@@ -70,7 +70,7 @@ export interface ProviderInstance {
   readonly enabled: boolean;
   readonly snapshot: ServerProviderShape;
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
-  readonly textGeneration: TextGeneration.TextGeneration["Service"];
+  readonly textGeneration: TextGeneration.TextGenerationProviderService;
 }
 
 export interface ProviderContinuationIdentity {

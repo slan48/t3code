@@ -3,6 +3,7 @@ import {
   MessageId,
   ThreadId,
   TurnId,
+  type OrchestrationPeerLoopExecution,
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -1536,6 +1537,49 @@ describe("deriveTimelineEntries", () => {
         implementedAt: null,
         implementationThreadId: null,
       },
+    });
+  });
+
+  it("derives one collision-safe execution row per proposal/run link", () => {
+    const createdAt = "2026-02-23T00:00:01.000Z";
+    const ownerMessage = {
+      id: MessageId.make("owner-approval"),
+      role: "user" as const,
+      text: "Sí, procede con el plan.",
+      createdAt,
+      updatedAt: createdAt,
+      turnId: null,
+      streaming: false,
+    };
+    const first: OrchestrationPeerLoopExecution = {
+      proposedPlanId: "proposal:one",
+      runId: "run:one",
+      createdAt,
+    };
+    const second: OrchestrationPeerLoopExecution = {
+      proposedPlanId: "proposal:one",
+      runId: "run:two",
+      createdAt: "2026-02-23T00:00:02.000Z",
+    };
+
+    const entries = deriveTimelineEntries([ownerMessage], [], [], [first, first, second]);
+
+    expect(entries.map((entry) => entry.kind)).toEqual([
+      "message",
+      "peer-loop-execution",
+      "peer-loop-execution",
+    ]);
+    expect(entries[0]?.kind === "message" && entries[0].message.role).toBe("user");
+    expect(entries[1]).toMatchObject({
+      kind: "peer-loop-execution",
+      createdAt,
+      execution: first,
+    });
+    expect(entries[1]?.id).toContain(first.proposedPlanId);
+    expect(entries[1]?.id).toContain(first.runId);
+    expect(entries[2]).toMatchObject({
+      kind: "peer-loop-execution",
+      execution: second,
     });
   });
 });

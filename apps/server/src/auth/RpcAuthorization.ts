@@ -123,6 +123,9 @@ export const RPC_REQUIRED_SCOPES = {
   // Answering a run's owner decision releases a halted loop: agents act again,
   // exactly as they do for the `sendOwnerMessage` it calls underneath.
   [WS_METHODS.peerLoopAnswerOwnerDecision]: AuthOrchestrationOperateScope,
+  // Classification consumes the fixed text-generation provider and is a
+  // conversation action, even though it cannot execute or mutate a thread.
+  [WS_METHODS.navigatorClassifyProposalApproval]: AuthOrchestrationOperateScope,
 } as const satisfies Readonly<Record<WsRpcMethod, AuthEnvironmentScope>>;
 
 export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope {

@@ -1,4 +1,28 @@
+import {
+  DEFAULT_TEXT_GENERATION_MODEL,
+  DEFAULT_TEXT_GENERATION_REASONING_EFFORT,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
+import { createModelSelection } from "@t3tools/shared/model";
+
 import type { TextGenerationPolicy, TextGenerationPolicyKind } from "./TextGenerationPolicy.ts";
+
+/** The later approval orchestration layer's classifier deadline. */
+export const NAVIGATOR_APPROVAL_CLASSIFIER_TIMEOUT_MS = 10_000;
+
+/**
+ * The approval classifier is intentionally pinned to the built-in Codex
+ * instance and text-generation defaults. It must not inherit a Navigator
+ * thread's provider/model or the configurable general text-generation choice.
+ */
+export const navigatorApprovalClassifierPreset = {
+  modelSelection: createModelSelection(
+    ProviderInstanceId.make("codex"),
+    DEFAULT_TEXT_GENERATION_MODEL,
+    [{ id: "reasoningEffort", value: DEFAULT_TEXT_GENERATION_REASONING_EFFORT }],
+  ),
+  timeoutMs: NAVIGATOR_APPROVAL_CLASSIFIER_TIMEOUT_MS,
+} as const;
 
 export const defaultTextGenerationPolicy: TextGenerationPolicy = {
   kind: "default",

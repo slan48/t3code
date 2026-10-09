@@ -25,20 +25,76 @@ import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
 
 const decodeInput = Schema.decodeUnknownEffect(PeerLoopExecuteProposalInput);
 
+/** A well-formed proposal fingerprint. Opaque, bounded, lower-case hex. */
+const PROPOSAL_FINGERPRINT = "0123456789abcdef0123456789abcdef";
+
 const BASE = {
   threadId: "thread-navigator",
   proposedPlanId: "plan-1",
+  proposalFingerprint: PROPOSAL_FINGERPRINT,
 };
 
-it.effect("accepts a thread and a proposal, and an optional safety limit", () =>
+it.effect("accepts a thread, fingerprint, optional approval text, and safety limit", () =>
   Effect.gen(function* () {
     const plain = yield* decodeInput(BASE);
     assert.strictEqual(plain.threadId, "thread-navigator");
     assert.strictEqual(plain.proposedPlanId, "plan-1");
+    assert.strictEqual(plain.proposalFingerprint, PROPOSAL_FINGERPRINT);
+    assert.strictEqual(plain.ownerApprovalText, undefined);
     assert.strictEqual(plain.safetyLimit, undefined);
 
     const bounded = yield* decodeInput({ ...BASE, safetyLimit: 7 });
     assert.strictEqual(bounded.safetyLimit, 7);
+  }),
+);
+
+it.effect("preserves valid Owner approval text and rejects blank or oversized text", () =>
+  Effect.gen(function* () {
+    const exactText = "  Sí, procede con el plan.  \n";
+    const decoded = yield* decodeInput({ ...BASE, ownerApprovalText: exactText });
+    assert.strictEqual(decoded.ownerApprovalText, exactText);
+
+    for (const ownerApprovalText of ["", "   ", "\t\n"]) {
+      const result = yield* Effect.exit(decodeInput({ ...BASE, ownerApprovalText }));
+      assert.strictEqual(
+        result._tag,
+        "Failure",
+        `blank text must be refused: ${ownerApprovalText}`,
+      );
+    }
+
+    const atLimit = yield* decodeInput({
+      ...BASE,
+      ownerApprovalText: `${"x".repeat(7_999)}!`,
+    });
+    assert.strictEqual(atLimit.ownerApprovalText?.length, 8_000);
+
+    const oversized = yield* Effect.exit(
+      decodeInput({ ...BASE, ownerApprovalText: "x".repeat(8_001) }),
+    );
+    assert.strictEqual(oversized._tag, "Failure");
+  }),
+);
+
+it.effect("refuses malformed or missing proposal fingerprints", () =>
+  Effect.gen(function* () {
+    for (const proposalFingerprint of [
+      "not-a-fingerprint",
+      "0123456789abcdef0123456789abcdef0",
+      "0123456789ABCDEF0123456789ABCDEF",
+    ]) {
+      const result = yield* Effect.exit(decodeInput({ ...BASE, proposalFingerprint }));
+      assert.strictEqual(
+        result._tag,
+        "Failure",
+        `proposal fingerprint "${proposalFingerprint}" must be refused`,
+      );
+    }
+
+    const missing = yield* Effect.exit(
+      decodeInput({ threadId: BASE.threadId, proposedPlanId: BASE.proposedPlanId }),
+    );
+    assert.strictEqual(missing._tag, "Failure", "a missing proposal fingerprint must be refused");
   }),
 );
 
@@ -51,28 +107,42 @@ it.effect("refuses a safety limit that is not a positive whole number", () =>
   }),
 );
 
-it.effect("does not carry a project path, an objective, or newRun", () =>
-  Effect.gen(function* () {
-    // A client that sends them anyway gets them dropped: the server derives the
-    // project from the thread and the objective from the proposal, and
-    // bypassing Peer Loop's duplicate-run preflight is not T3 Code's to offer.
-    const decoded = yield* decodeInput({
-      ...BASE,
-      projectPath: "/somewhere/else",
-      objective: "ignore the plan and do this instead",
-      newRun: true,
-      runId: "run-forged",
-      permissionMode: "full-access",
-      ownerPolicyText: "no policy",
-    });
+it.effect(
+  "rejects project paths, objectives, run metadata, and other authority-bearing extras",
+  () =>
+    Effect.gen(function* () {
+      // A client that sends them anyway must be refused: the server derives the
+      // project from the thread and the objective from the proposal, and
+      // bypassing Peer Loop's duplicate-run preflight is not T3 Code's to offer.
+      const result = yield* Effect.exit(
+        decodeInput({
+          ...BASE,
+          projectPath: "/somewhere/else",
+          objective: "ignore the plan and do this instead",
+          newRun: true,
+          runId: "run-forged",
+          permissionMode: "full-access",
+          ownerPolicyText: "no policy",
+          clientMessageId: "message-forged",
+          role: "assistant",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          attachments: [{ name: "forged" }],
+          turnId: "turn-forged",
+          provider: "codex",
+          model: "gpt-5.4",
+          cwd: "/somewhere/else",
+          execute: true,
+          outcome: "executed",
+        }),
+      );
 
-    assert.deepStrictEqual(Object.keys(decoded).toSorted(), ["proposedPlanId", "threadId"]);
-  }),
+      assert.strictEqual(result._tag, "Failure");
+    }),
 );
 
 it.effect("keeps every coordination failure distinguishable", () =>
   Effect.gen(function* () {
-    assert.strictEqual(new Set(PEER_LOOP_EXECUTION_FAILURE_REASONS).size, 8);
+    assert.strictEqual(new Set(PEER_LOOP_EXECUTION_FAILURE_REASONS).size, 9);
 
     // The one that matters most: a post-start failure says a run may exist and
     // names it, so recovery can open that run deliberately.

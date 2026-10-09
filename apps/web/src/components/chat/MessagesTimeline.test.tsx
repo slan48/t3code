@@ -1,8 +1,21 @@
-import { CheckpointRef, EnvironmentId, MessageId, TurnId } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  EnvironmentId,
+  MessageId,
+  ThreadId,
+  TurnId,
+  type OrchestrationPeerLoopExecution,
+} from "@t3tools/contracts";
 import { createRef, type ReactNode, type Ref } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import type { LegendListRef } from "@legendapp/list/react";
+
+vi.mock("@tanstack/react-router", () => ({
+  Link: (props: { children?: ReactNode; className?: string }) => (
+    <a className={props.className}>{props.children}</a>
+  ),
+}));
 
 vi.mock("@legendapp/list/react", async () => {
   const legendListTestId = "legend-list";
@@ -162,6 +175,8 @@ beforeAll(async () => {
       classList,
       offsetHeight: 0,
     },
+    addEventListener: () => {},
+    removeEventListener: () => {},
   });
 
   ({ MessagesTimeline } = await import("./MessagesTimeline"));
@@ -238,6 +253,39 @@ describe("MessagesTimeline", () => {
     expect(compactMarkup).not.toContain("chat-timeline-scroll-fade");
     expect(fadedMarkup).toContain('class="h-10 sm:h-12"');
     expect(fadedMarkup).toContain("chat-timeline-scroll-fade");
+  });
+
+  it("renders a link-derived acknowledgement and execution row", () => {
+    const execution: OrchestrationPeerLoopExecution = {
+      proposedPlanId: "proposal-1",
+      runId: "run-1",
+      createdAt: MESSAGE_CREATED_AT,
+    };
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        navigatorExecution={{
+          environmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
+          threadId: ThreadId.make("thread-1"),
+          purpose: "navigator",
+          unsettledTurnId: null,
+          executionsByProposal: new Map(),
+        }}
+        timelineEntries={[
+          {
+            id: "peer-loop-execution:proposal-1:run-1",
+            kind: "peer-loop-execution",
+            createdAt: execution.createdAt,
+            execution,
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Perfecto, comienzo con Peer Loop.");
+    expect(markup).toContain("run-1");
+    expect(markup).toContain('data-timeline-row-kind="peer-loop-execution"');
+    expect(markup).not.toContain('data-message-id="peer-loop-execution');
   });
 
   it("keeps assistant changed-files headers sticky below the thread header", () => {

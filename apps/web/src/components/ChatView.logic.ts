@@ -12,7 +12,11 @@ import {
   type ThreadPurpose,
   type TurnId,
 } from "@t3tools/contracts";
-import type { ExecutableProposal, NavigatorExecutionFacts } from "../navigatorExecution";
+import {
+  proposalIsSettled,
+  type ExecutableProposal,
+  type NavigatorExecutionFacts,
+} from "../navigatorExecution";
 import {
   findLatestProposedPlan,
   hasActionableProposedPlan,
@@ -120,7 +124,9 @@ export type NavigatorExecutionThread = Pick<
 export interface NavigatorExecutionDerivation {
   /** Null for anything that is not a Navigator conversation. */
   readonly facts: NavigatorExecutionFacts | null;
-  /** The one proposal a confirmation phrase could be about, or null. */
+  /** The latest selected proposal version, even while its producing turn runs. */
+  readonly currentProposal: ExecutableProposal | null;
+  /** The current proposal when a new approval interaction may safely start. */
   readonly confirmableProposal: ExecutableProposal | null;
 }
 
@@ -159,29 +165,39 @@ export function deriveNavigatorExecution(input: {
     executionsByProposal: input.executionsByProposal,
   };
 
-  // WHILE A TURN IS IN FLIGHT THERE IS NO "THE PROPOSAL". A phrase names the
-  // conversation's current plan, and mid-turn that is the thing being
-  // rewritten. An Execute button names the card it is attached to, which stays
-  // unambiguous — so only this, the phrase's target, is withheld.
   const latest = findLatestProposedPlan(
     input.thread?.proposedPlans ?? [],
     input.thread?.latestTurn?.turnId ?? null,
   );
-  const confirmableProposal =
-    threadId !== null && inFlightTurnId === null && hasActionableProposedPlan(latest) && latest
+  const currentProposal =
+    threadId !== null && latest !== null
       ? {
           id: latest.id,
+          planMarkdown: latest.planMarkdown,
           implementedAt: latest.implementedAt,
           implementationThreadId: latest.implementationThreadId,
           turnId: latest.turnId,
         }
       : null;
 
-  return { facts, confirmableProposal };
+  // The version bound to an armed question is independent of temporary
+  // provider activity. New eligibility still asks whether this proposal's own
+  // producing turn is settled, so an unrelated active turn does not hide an
+  // otherwise current proposal while its own turn remains final.
+  const confirmableProposal =
+    currentProposal !== null &&
+    latest !== null &&
+    hasActionableProposedPlan(latest) &&
+    proposalIsSettled({ proposal: currentProposal, unsettledTurnId: inFlightTurnId })
+      ? currentProposal
+      : null;
+
+  return { facts, currentProposal, confirmableProposal };
 }
 
 const NO_NAVIGATOR_EXECUTION: NavigatorExecutionDerivation = {
   facts: null,
+  currentProposal: null,
   confirmableProposal: null,
 };
 

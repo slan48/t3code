@@ -5,8 +5,9 @@
  * action is rendered in two places at once — the proposal card in the timeline
  * and the Plan sidebar — so a hook-local flag would give a proposal two
  * independent gates and two presses in the same tick would start two runs. The
- * gate is keyed by conversation and proposal, so both controls are the same
- * control.
+ * gate is keyed by conversation and proposal id, while each request also carries
+ * the exact proposal markdown fingerprint, so both controls are the same
+ * version-bound control.
  *
  * The same rules as every other Peer Loop command apply, and one more:
  *
@@ -272,6 +273,10 @@ export interface NavigatorExecutionTarget {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly proposedPlanId: OrchestrationProposedPlanId;
+  /** The exact markdown displayed/approved for the proposal. */
+  readonly planMarkdown: string;
+  /** Exact Owner text consumed by the composer action path, if any. */
+  readonly ownerApprovalText?: string;
 }
 
 /**
@@ -291,7 +296,9 @@ export function useNavigatorExecuteProposal(): (
   return useCallback(
     (target) =>
       navigatorExecutionStore.execute(navigatorExecutionKey(target), {
-        // Exactly the environment wrapper and two ids. See the request builder.
+        // Buttons send only the environment wrapper plus
+        // { threadId, proposedPlanId, proposalFingerprint }; the composer may
+        // additionally carry exact approval text.
         run: () => executeProposal(buildExecuteProposalRequest(target)),
       }),
     [executeProposal],
@@ -315,10 +322,17 @@ export function useNavigatorExecution(input: NavigatorExecutionTarget) {
   );
   const state = navigatorExecutionStore.read(key);
 
-  const { environmentId, threadId, proposedPlanId } = input;
+  const { environmentId, threadId, proposedPlanId, planMarkdown, ownerApprovalText } = input;
   const execute = useCallback(
-    () => executeProposal({ environmentId, threadId, proposedPlanId }),
-    [environmentId, executeProposal, proposedPlanId, threadId],
+    () =>
+      executeProposal({
+        environmentId,
+        threadId,
+        proposedPlanId,
+        planMarkdown,
+        ...(ownerApprovalText === undefined ? {} : { ownerApprovalText }),
+      }),
+    [environmentId, executeProposal, ownerApprovalText, planMarkdown, proposedPlanId, threadId],
   );
 
   const dismissFailure = useCallback(() => navigatorExecutionStore.dismissFailure(key), [key]);

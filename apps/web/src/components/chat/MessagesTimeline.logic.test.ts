@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import type { OrchestrationPeerLoopExecution } from "@t3tools/contracts";
 import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
@@ -1175,5 +1176,38 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+
+  it("keeps link-derived execution entries as standalone non-message rows", () => {
+    const execution: OrchestrationPeerLoopExecution = {
+      proposedPlanId: "proposal-1",
+      runId: "run-1",
+      createdAt: "2026-01-01T00:00:05Z",
+    };
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "execution-row",
+          kind: "peer-loop-execution",
+          createdAt: execution.createdAt,
+          execution,
+        },
+      ],
+      isWorking: false,
+      activeTurnStartedAt: null,
+      activeContextWindow: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(rows).toEqual([
+      {
+        kind: "peer-loop-execution",
+        id: "execution-row",
+        createdAt: execution.createdAt,
+        execution,
+      },
+    ]);
   });
 });

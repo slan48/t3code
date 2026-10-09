@@ -14,6 +14,7 @@ import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
+  buildNavigatorApprovalClassificationPrompt,
   buildPrContentPrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
@@ -54,7 +55,8 @@ export const makeCursorTextGeneration = Effect.fn("makeCursorTextGeneration")(fu
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "classifyNavigatorApproval";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -259,10 +261,27 @@ export const makeCursorTextGeneration = Effect.fn("makeCursorTextGeneration")(fu
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const classifyNavigatorApproval: TextGeneration.TextGenerationProviderService["classifyNavigatorApproval"] =
+    Effect.fn("CursorTextGeneration.classifyNavigatorApproval")(function* (input) {
+      const { prompt, outputSchema } = buildNavigatorApprovalClassificationPrompt({
+        ownerUtterance: input.ownerUtterance,
+        planMarkdown: input.planMarkdown,
+      });
+
+      return yield* runCursorJson({
+        operation: "classifyNavigatorApproval",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
-  } satisfies TextGeneration.TextGeneration["Service"];
+    classifyNavigatorApproval,
+  } satisfies TextGeneration.TextGenerationProviderService;
 });

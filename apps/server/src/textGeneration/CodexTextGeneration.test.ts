@@ -21,6 +21,19 @@ const DEFAULT_TEST_MODEL_SELECTION = createModelSelection(
   "gpt-5.4-mini",
 );
 
+const NAVIGATOR_APPROVAL_TRAITS = {
+  expressesApproval: true,
+  addsCondition: false,
+  requestsModification: false,
+  asksQuestion: false,
+  expressesDoubt: false,
+  isNegation: false,
+  isQuotationOrHypothetical: false,
+  referencesSomethingElse: false,
+  isBareAffirmation: true,
+  confidence: "high" as const,
+};
+
 const CodexTextGenerationTestLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-codex-text-generation-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
@@ -192,7 +205,9 @@ function withFakeCodexEnv<A, E, R>(
     launchArgs?: string;
     environment?: NodeJS.ProcessEnv;
   },
-  effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
+  effectFn: (
+    textGeneration: TextGeneration.TextGenerationProviderService,
+  ) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -229,6 +244,49 @@ it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
           expect(generated.subject.endsWith(".")).toBe(false);
           expect(generated.body).toBe("- added migration\n- updated tests");
           expect(generated.branch).toBeUndefined();
+        }),
+    ),
+  );
+
+  it.effect("decodes Navigator approval traits through Codex structured output", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify(NAVIGATOR_APPROVAL_TRAITS),
+        stdinMustContain: "BEGIN_UNTRUSTED_CLASSIFIER_DATA_JSON",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.classifyNavigatorApproval({
+            cwd: process.cwd(),
+            ownerUtterance: "yes",
+            planMarkdown: "# Run the reviewed plan",
+            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+          });
+
+          expect(generated).toEqual(NAVIGATOR_APPROVAL_TRAITS);
+        }),
+    ),
+  );
+
+  it.effect("turns missing Navigator approval traits into TextGenerationError", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify({ ...NAVIGATOR_APPROVAL_TRAITS, confidence: undefined }),
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const error = yield* Effect.flip(
+            textGeneration.classifyNavigatorApproval({
+              cwd: process.cwd(),
+              ownerUtterance: "yes",
+              planMarkdown: "# Run the reviewed plan",
+              modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+            }),
+          );
+
+          expect(error).toBeInstanceOf(TextGenerationError);
+          expect(error.operation).toBe("classifyNavigatorApproval");
+          expect(error.detail).toContain("invalid structured output");
         }),
     ),
   );

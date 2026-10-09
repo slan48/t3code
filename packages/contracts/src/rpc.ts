@@ -100,6 +100,10 @@ import {
   PeerLoopExecutionCoordinationError,
   PeerLoopOwnerDecisionCoordinationError,
 } from "./peerLoopExecution.ts";
+import {
+  NavigatorApprovalClassificationRpcInput,
+  NavigatorApprovalClassificationRpcResult,
+} from "./navigatorApprovalClassification.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -273,6 +277,9 @@ export const WS_METHODS = {
   peerLoopSubscribeEvents: PEER_LOOP_WS_METHODS.subscribeEvents,
   peerLoopExecuteProposal: PEER_LOOP_WS_METHODS.executeProposal,
   peerLoopAnswerOwnerDecision: PEER_LOOP_WS_METHODS.answerOwnerDecision,
+
+  // Navigator approval classification (fail-closed, no execution side effect)
+  navigatorClassifyProposalApproval: "navigator.classifyProposalApproval",
 
   // Server meta
   serverProbe: "server.probe",
@@ -936,6 +943,21 @@ export const WsPeerLoopAnswerOwnerDecisionRpc = Rpc.make(WS_METHODS.peerLoopAnsw
   ]),
 });
 
+/**
+ * Classify one owner utterance against the server's fresh Navigator proposal
+ * projection. Preconditions and classifier failures are represented by the
+ * successful `send-to-provider` result; only environment authorization is an
+ * RPC error.
+ */
+export const WsNavigatorClassifyProposalApprovalRpc = Rpc.make(
+  WS_METHODS.navigatorClassifyProposalApproval,
+  {
+    payload: NavigatorApprovalClassificationRpcInput,
+    success: NavigatorApprovalClassificationRpcResult,
+    error: EnvironmentAuthorizationError,
+  },
+);
+
 export const WsPeerLoopSubscribeEventsRpc = Rpc.make(WS_METHODS.peerLoopSubscribeEvents, {
   payload: PeerLoopSubscribeEventsInput,
   success: PeerLoopSubscriptionEvent,
@@ -1050,6 +1072,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPeerLoopSubscribeEventsRpc,
   WsPeerLoopExecuteProposalRpc,
   WsPeerLoopAnswerOwnerDecisionRpc,
+  WsNavigatorClassifyProposalApprovalRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

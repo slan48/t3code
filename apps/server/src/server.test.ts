@@ -97,6 +97,7 @@ import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
+import * as NavigatorApprovalClassificationCoordinator from "./navigatorApproval/ClassificationCoordinator.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts";
@@ -355,6 +356,9 @@ const buildAppUnderTest = (options?: {
     >;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
+    navigatorApprovalClassificationCoordinator?: Partial<
+      NavigatorApprovalClassificationCoordinator.NavigatorApprovalClassificationCoordinator["Service"]
+    >;
     projectionSnapshotQuery?: Partial<ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]>;
     checkpointDiffQuery?: Partial<CheckpointDiffQuery.CheckpointDiffQuery["Service"]>;
     browserTraceCollector?: Partial<BrowserTraceCollector.BrowserTraceCollector["Service"]>;
@@ -756,6 +760,13 @@ const buildAppUnderTest = (options?: {
           Layer.mock(PeerLoopOwnerDecisionCoordinator.PeerLoopOwnerDecisionCoordinator)({
             answerOwnerDecision: () =>
               Effect.fail(new PeerLoopUnavailableError({ reason: "not configured in tests" })),
+          }),
+          Layer.mock(
+            NavigatorApprovalClassificationCoordinator.NavigatorApprovalClassificationCoordinator,
+          )({
+            classifyProposalApproval: () =>
+              Effect.succeed({ outcome: "send-to-provider" as const }),
+            ...options?.layers?.navigatorApprovalClassificationCoordinator,
           }),
           Layer.mock(PortScanner.PortDiscovery)({
             scan: () => Effect.succeed([]),

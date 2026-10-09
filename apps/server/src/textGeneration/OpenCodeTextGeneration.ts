@@ -21,6 +21,7 @@ import { resolveAttachmentPath } from "../attachmentStore.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
+  buildNavigatorApprovalClassificationPrompt,
   buildPrContentPrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
@@ -39,6 +40,7 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
   "generatePrContent",
   "generateBranchName",
   "generateThreadTitle",
+  "classifyNavigatorApproval",
 ]);
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
@@ -253,7 +255,8 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "classifyNavigatorApproval";
   }) =>
     sharedServerMutex.withPermit(
       Effect.gen(function* () {
@@ -615,10 +618,27 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       };
     });
 
+  const classifyNavigatorApproval: TextGeneration.TextGenerationProviderService["classifyNavigatorApproval"] =
+    Effect.fn("OpenCodeTextGeneration.classifyNavigatorApproval")(function* (input) {
+      const { prompt, outputSchema } = buildNavigatorApprovalClassificationPrompt({
+        ownerUtterance: input.ownerUtterance,
+        planMarkdown: input.planMarkdown,
+      });
+
+      return yield* runOpenCodeJson({
+        operation: "classifyNavigatorApproval",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
-  } satisfies TextGeneration.TextGeneration["Service"];
+    classifyNavigatorApproval,
+  } satisfies TextGeneration.TextGenerationProviderService;
 });

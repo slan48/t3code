@@ -5,7 +5,7 @@ import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderInstanceId, type NavigatorApprovalTraits } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
@@ -13,20 +13,23 @@ import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstance
 import * as TextGeneration from "./TextGeneration.ts";
 
 const makeStubTextGeneration = (
-  overrides: Partial<TextGeneration.TextGeneration["Service"]>,
-): TextGeneration.TextGeneration["Service"] =>
-  TextGeneration.TextGeneration.of({
+  overrides: Partial<TextGeneration.TextGenerationProviderService>,
+): TextGeneration.TextGenerationProviderService => ({
+  ...TextGeneration.TextGeneration.of({
     generateCommitMessage: () =>
       Effect.die("generateCommitMessage stub not configured for this test"),
     generatePrContent: () => Effect.die("generatePrContent stub not configured for this test"),
     generateBranchName: () => Effect.die("generateBranchName stub not configured for this test"),
     generateThreadTitle: () => Effect.die("generateThreadTitle stub not configured for this test"),
-    ...overrides,
-  });
+    classifyNavigatorApproval: () =>
+      Effect.die("classifyNavigatorApproval stub not configured for this test"),
+  }),
+  ...overrides,
+});
 
 const makeStubInstance = (
   instanceId: ProviderInstanceId,
-  textGeneration: TextGeneration.TextGeneration["Service"],
+  textGeneration: TextGeneration.TextGenerationProviderService,
 ): ProviderInstance =>
   ({
     instanceId,
@@ -92,6 +95,64 @@ describe("makeTextGenerationFromRegistry", () => {
 
       expect(result.branch).toBe("personal-branch");
       expect(personalCalls).toEqual(["Refactor the routing layer"]);
+    }),
+  );
+
+  it.effect("uses the fixed Codex classifier preset without accepting thread model selection", () =>
+    Effect.gen(function* () {
+      const receivedSelections: TextGeneration.NavigatorApprovalClassificationProviderInput[] = [];
+      let otherProviderCalls = 0;
+      const codex = makeStubInstance(
+        ProviderInstanceId.make("codex"),
+        makeStubTextGeneration({
+          classifyNavigatorApproval: (input) => {
+            receivedSelections.push(input);
+            return Effect.succeed({
+              expressesApproval: true,
+              addsCondition: false,
+              requestsModification: false,
+              asksQuestion: false,
+              expressesDoubt: false,
+              isNegation: false,
+              isQuotationOrHypothetical: false,
+              referencesSomethingElse: false,
+              isBareAffirmation: true,
+              confidence: "high",
+            } satisfies NavigatorApprovalTraits);
+          },
+        }),
+      );
+      const otherProvider = makeStubInstance(
+        ProviderInstanceId.make("claudeAgent"),
+        makeStubTextGeneration({
+          classifyNavigatorApproval: () => {
+            otherProviderCalls += 1;
+            return Effect.die("the non-Codex classifier must not be selected");
+          },
+        }),
+      );
+
+      const tg = TextGeneration.makeTextGenerationFromRegistry(
+        makeStubRegistry([codex, otherProvider]),
+      );
+      const result = yield* tg.classifyNavigatorApproval({
+        cwd: process.cwd(),
+        ownerUtterance: "yes",
+        planMarkdown: "# Reviewed proposal",
+      });
+
+      expect(result.isBareAffirmation).toBe(true);
+      expect(otherProviderCalls).toBe(0);
+      expect(receivedSelections).toHaveLength(1);
+      expect(receivedSelections[0]?.modelSelection).toMatchObject({
+        instanceId: "codex",
+        model: "gpt-5.6-luna",
+        options: [{ id: "reasoningEffort", value: "low" }],
+      });
+      expect(receivedSelections[0]).toMatchObject({
+        ownerUtterance: "yes",
+        planMarkdown: "# Reviewed proposal",
+      });
     }),
   );
 

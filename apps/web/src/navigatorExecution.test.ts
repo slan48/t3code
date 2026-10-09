@@ -21,6 +21,7 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
@@ -45,10 +46,12 @@ import {
   type NavigatorExecutionFacts,
   type NavigatorExecutionSnapshot,
 } from "./navigatorExecution";
+import { deriveTimelineEntries } from "./session-logic";
 
 const ENVIRONMENT_ID = "environment-local" as EnvironmentId;
 const THREAD_ID = ThreadId.make("thread-navigator-1");
 const PLAN_ID = "plan-1" as OrchestrationProposedPlanId;
+const PLAN_MARKDOWN = "# Split the migration\n\n1. Add the column.\n2. Backfill.";
 /** Fixed, so the relative-time label is deterministic. */
 const NOW_MS = Date.parse("2026-03-01T10:20:00.000Z");
 
@@ -62,6 +65,7 @@ const proposal = (
   }> = {},
 ) => ({
   id: PLAN_ID,
+  planMarkdown: PLAN_MARKDOWN,
   implementedAt: overrides.implementedAt ?? null,
   implementationThreadId: overrides.implementationThreadId ?? null,
   turnId: overrides.turnId === undefined ? PLAN_TURN_ID : overrides.turnId,
@@ -219,19 +223,43 @@ describe("execute eligibility", () => {
 /* ------------------------------------------------------------- request */
 
 describe("the request", () => {
-  it("carries the environment wrapper and two ids, and nothing forgeable", () => {
+  it("carries only the button request shape unless approval text is supplied", () => {
     const request = buildExecuteProposalRequest({
       environmentId: ENVIRONMENT_ID,
       threadId: THREAD_ID,
       proposedPlanId: PLAN_ID,
+      planMarkdown: PLAN_MARKDOWN,
     });
     expect(request).toEqual({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, proposedPlanId: PLAN_ID },
+      input: {
+        threadId: THREAD_ID,
+        proposedPlanId: PLAN_ID,
+        proposalFingerprint: peerLoopProposalFingerprint(PLAN_MARKDOWN),
+      },
     });
     // Enumerated, so a field added later has to be a deliberate decision here.
     expect(Object.keys(request).toSorted()).toEqual(["environmentId", "input"]);
-    expect(Object.keys(request.input).toSorted()).toEqual(["proposedPlanId", "threadId"]);
+    expect(Object.keys(request.input).toSorted()).toEqual([
+      "proposalFingerprint",
+      "proposedPlanId",
+      "threadId",
+    ]);
+
+    const composerRequest = buildExecuteProposalRequest({
+      environmentId: ENVIRONMENT_ID,
+      threadId: THREAD_ID,
+      proposedPlanId: PLAN_ID,
+      planMarkdown: PLAN_MARKDOWN,
+      ownerApprovalText: "  Sí, procede con el plan.  ",
+    });
+    expect(composerRequest.input.ownerApprovalText).toBe("  Sí, procede con el plan.  ");
+    expect(Object.keys(composerRequest.input).toSorted()).toEqual([
+      "ownerApprovalText",
+      "proposalFingerprint",
+      "proposedPlanId",
+      "threadId",
+    ]);
     for (const forbidden of [
       "objective",
       "projectPath",
@@ -265,6 +293,18 @@ describe("local and durable links", () => {
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]).toBe(durable[0]);
     expect(localLinkIsDurable(durable, fresh)).toBe(true);
+  });
+
+  it("feeds one timeline execution entry from a reconciled local/durable twin", () => {
+    const fresh = link({ runId: "run-77" });
+    const durable = [link({ runId: "run-77", createdAt: "2026-03-01T10:00:01.000Z" })];
+    const entries = deriveTimelineEntries([], [], [], reconcileExecutionLinks(durable, [fresh]));
+
+    expect(entries.filter((entry) => entry.kind === "peer-loop-execution")).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "peer-loop-execution",
+      execution: durable[0],
+    });
   });
 
   it("keeps a different run for the same proposal rather than swallowing it", () => {
@@ -469,11 +509,22 @@ describe("coordination failures", () => {
     expect(failure.presentation.detail).toContain("Open that execution");
   });
 
+  it("requires fresh review and approval when the proposal changed", () => {
+    const failure = describeCoordinationError(coordination("proposal-changed"));
+    expect(failure.mayHaveStarted).toBe(false);
+    expect(failure.disposition).toBe("retryable");
+    expect(failure.presentation.title).toContain("changed");
+    expect(failure.presentation.detail).toContain("fresh review and approval");
+    expect(failure.presentation.detail).toContain("refreshed proposal");
+    expect(failure.presentation.detail).not.toContain("press Execute again");
+  });
+
   it("says plainly that nothing started when nothing did", () => {
     for (const reason of [
       "navigator-thread-not-found",
       "not-a-navigator-thread",
       "proposal-not-found",
+      "proposal-changed",
       "proposal-already-implemented",
       "project-not-found",
       "coordination-failed",

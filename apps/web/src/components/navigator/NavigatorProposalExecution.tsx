@@ -1,10 +1,11 @@
 /**
  * The Execute action and the child executions of one Execution Proposal.
  *
- * ONE COMPONENT, RENDERED TWICE. The proposal appears both in the conversation
- * timeline and in the Plan sidebar, and both need the same action — so it is
- * the same component reading the same per-proposal gate. Two visible buttons,
- * one intent, one RPC.
+ * ONE EXECUTION VIEW, REUSED ACROSS PROJECTIONS. The proposal child and the
+ * chronological timeline row both render the same linked-run projection, so
+ * they read the same snapshot family and card presentation. The Execute action
+ * still appears in the conversation and Plan sidebar, sharing one per-proposal
+ * gate: two visible buttons, one intent, one RPC.
  *
  * Everything mutable about a child run is read from Peer Loop's structured run
  * summary. This card names the run, says what Peer Loop says it is doing, and
@@ -19,6 +20,7 @@ import { Link } from "@tanstack/react-router";
 import type {
   EnvironmentId,
   OrchestrationPeerLoopExecution,
+  PeerLoopRunSummary,
   ThreadId,
   ThreadPurpose,
 } from "@t3tools/contracts";
@@ -100,6 +102,7 @@ function ProposalExecutionArea({
     environmentId: context.environmentId,
     threadId,
     proposedPlanId: proposal.id,
+    planMarkdown: proposal.planMarkdown,
   });
   const executions = context.executionsByProposal.get(proposal.id) ?? NO_EXECUTIONS;
   // NOTHING IS OBSERVED UNTIL THERE IS SOMETHING TO OBSERVE. A conversation
@@ -159,15 +162,9 @@ function ProposalExecutionArea({
           >
             {state.pending ? "Starting…" : "Execute with Peer Loop"}
           </Button>
-          {/*
-            The press is the confirmation. Nothing in this increment reads
-            agreement out of the conversation, and the wording says which plan
-            is about to be handed over so there is no ambiguity about it.
-          */}
           <p className="text-xs text-muted-foreground">
-            Starts Peer Loop&apos;s Reviewer → Builder workflow in this project, using the Execution
-            Proposal above. Pressing this is the confirmation; Navigator never infers it from the
-            conversation.
+            This explicitly executes the displayed Execution Proposal with Peer Loop. Natural
+            language approval is handled only through Navigator&apos;s guarded approval flow.
           </p>
         </div>
       ) : null}
@@ -197,12 +194,14 @@ function ProposalExecutionArea({
         <ul className="flex min-w-0 flex-col gap-2">
           {executions.map((link) => (
             <li key={`${link.proposedPlanId}:${link.runId}`} className="min-w-0">
-              <NavigatorExecutionChild
+              <NavigatorLinkedExecution
                 environmentId={context.environmentId}
                 threadId={threadId}
                 purpose={context.purpose}
                 refreshRuns={refresh}
-                presentation={describeExecution({ link, runs, unreadable, nowMs: Date.now() })}
+                execution={link}
+                runs={runs}
+                unreadable={unreadable}
               />
             </li>
           ))}
@@ -252,21 +251,31 @@ const FailureInspectorLink = memo(function FailureInspectorLink({
  * owns exactly one, and so an ordinary working run mounts an atom that queries
  * nothing at all.
  */
-const NavigatorExecutionChild = memo(function NavigatorExecutionChild({
+/**
+ * The shared linked-run projection used by both the proposal child card and
+ * the chronological execution row. Both copies use the same environment/run
+ * snapshot atom, so mounting both surfaces does not create a second attach.
+ */
+export const NavigatorLinkedExecution = memo(function NavigatorLinkedExecution({
   environmentId,
   threadId,
   purpose,
-  presentation,
+  execution,
+  runs,
+  unreadable,
   refreshRuns,
 }: {
   readonly environmentId: EnvironmentId;
   /** The conversation this run is linked to. The link is why it may answer. */
   readonly threadId: ThreadId;
   readonly purpose: ThreadPurpose;
-  readonly presentation: NavigatorExecutionPresentation;
+  readonly execution: OrchestrationPeerLoopExecution;
+  readonly runs: ReadonlyArray<PeerLoopRunSummary>;
+  readonly unreadable: ReadonlyArray<string>;
   /** Re-read the summaries once an answer lands. */
   readonly refreshRuns: () => void;
 }) {
+  const presentation = describeExecution({ link: execution, runs, unreadable, nowMs: Date.now() });
   const wanted = executionSnapshotIsUseful(presentation.status);
   const snapshot = useNavigatorExecutionSnapshot({
     environmentId,

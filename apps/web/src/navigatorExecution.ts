@@ -18,7 +18,11 @@
  *
  * PEER LOOP OWNS EVERY MUTABLE RUN FACT. The durable association T3 Code keeps
  * is a run id, a proposal id and a timestamp; state, iteration, halt reason and
- * outcome are read live from Peer Loop's list and are never copied here.
+ * outcome are read live from Peer Loop's list and are never copied here. The
+ * execute request is bound separately to the proposal id plus the exact
+ * markdown fingerprint derived from what the owner approved. The composer
+ * fast path may also carry the exact consumed Owner utterance for the server
+ * to record atomically with the link; Execute buttons omit it.
  *
  * @module NavigatorExecution
  */
@@ -35,6 +39,8 @@ import type {
   ThreadPurpose,
   TurnId,
 } from "@t3tools/contracts";
+
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 
 import { formatRelative } from "./agentRunFormat";
 import {
@@ -68,7 +74,7 @@ export type ExecuteProposalBlockedReason =
   | "no-proposal"
   /** The turn that produced it has not settled; the proposal can still change. */
   | "proposal-not-settled"
-  /** Already linked to a Peer Loop run. The child card is the answer. */
+  /** Already linked to a Peer Loop run; the link drives child and timeline projections. */
   | "already-executed"
   /** Already implemented the ordinary way, by a coding thread. */
   | "already-implemented"
@@ -113,6 +119,8 @@ const blocked = (blockedReason: ExecuteProposalBlockedReason): ExecuteProposalAv
 /** The proposal facts this decision needs. A subset, so a test can be honest. */
 export interface ExecutableProposal {
   readonly id: OrchestrationProposedPlanId;
+  /** The exact markdown displayed and approved for this proposal. */
+  readonly planMarkdown: string;
   readonly implementedAt: string | null;
   readonly implementationThreadId: string | null;
   /**
@@ -302,24 +310,38 @@ export function proposalExecutionAvailability(input: {
  * rest. Sending any of them would let a press aim a run at a directory the
  * owner never reviewed.
  *
- * Peer Loop's optional `safetyLimit` is not sent either. This surface does not
- * offer the owner a way to choose one, and inventing a bound they never asked
- * for would be T3 Code making a Peer Loop decision.
+ * The proposal fingerprint is computed from the exact markdown carried by the
+ * approved proposal. An optional exact Owner approval utterance is included
+ * only for the composer action path. Peer Loop's optional `safetyLimit` is not sent either.
+ * This surface does not offer the owner a way to choose one, and inventing a
+ * bound they never asked for would be T3 Code making a Peer Loop decision.
  */
 export function buildExecuteProposalRequest(input: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly proposedPlanId: OrchestrationProposedPlanId;
+  readonly planMarkdown: string;
+  /** Exact Owner text consumed by the composer action path, if any. */
+  readonly ownerApprovalText?: string;
 }): {
   readonly environmentId: EnvironmentId;
   readonly input: {
     readonly threadId: ThreadId;
     readonly proposedPlanId: OrchestrationProposedPlanId;
+    readonly proposalFingerprint: string;
+    readonly ownerApprovalText?: string;
   };
 } {
   return {
     environmentId: input.environmentId,
-    input: { threadId: input.threadId, proposedPlanId: input.proposedPlanId },
+    input: {
+      threadId: input.threadId,
+      proposedPlanId: input.proposedPlanId,
+      proposalFingerprint: peerLoopProposalFingerprint(input.planMarkdown),
+      ...(input.ownerApprovalText === undefined
+        ? {}
+        : { ownerApprovalText: input.ownerApprovalText }),
+    },
   };
 }
 
@@ -770,6 +792,7 @@ const COORDINATION_TITLES: Readonly<Record<PeerLoopExecutionFailureReason, strin
   "navigator-thread-not-found": "This conversation is no longer available",
   "not-a-navigator-thread": "This is not a planning conversation",
   "proposal-not-found": "This Execution Proposal is no longer available",
+  "proposal-changed": "This Execution Proposal changed",
   "proposal-already-executed": "This Execution Proposal has already been executed",
   "proposal-already-implemented": "This Execution Proposal was already implemented",
   "project-not-found": "This conversation's project is not available",
@@ -790,6 +813,8 @@ const COORDINATION_DETAILS: Readonly<Record<PeerLoopExecutionFailureReason, stri
   "not-a-navigator-thread":
     "Only a Navigator conversation's Execution Proposal can be handed to Peer Loop. Nothing was started.",
   "proposal-not-found": `The proposal is no longer on this conversation, so nothing was started. ${NEVER_RETRIED}`,
+  "proposal-changed":
+    "The proposal changed after it was approved. Nothing was started. A fresh review and approval of the refreshed proposal is required before trying again.",
   "proposal-already-executed":
     "A Peer Loop run was already started from this proposal. Open that execution rather than starting another.",
   "proposal-already-implemented":
@@ -809,6 +834,7 @@ const COORDINATION_TONES: Readonly<
   "navigator-thread-not-found": "warning",
   "not-a-navigator-thread": "neutral",
   "proposal-not-found": "warning",
+  "proposal-changed": "warning",
   "proposal-already-executed": "neutral",
   "proposal-already-implemented": "neutral",
   "project-not-found": "warning",
@@ -840,8 +866,10 @@ export function describeCoordinationError(
  * What each coordination reason leaves the owner able to do.
  *
  * Everything before `link-not-confirmed` happens before Peer Loop is called, so
- * pressing Execute again once the cause is fixed is safe — except
- * `proposal-already-executed`, where nothing started but a run exists anyway.
+ * pressing Execute again once the cause is fixed is safe. For
+ * `proposal-changed`, fixing the cause specifically means a fresh review and
+ * approval of the refreshed proposal; `proposal-already-executed` is the other
+ * exception, where nothing started but a run exists anyway.
  */
 const COORDINATION_DISPOSITIONS: Readonly<
   Record<PeerLoopExecutionFailureReason, ExecutionRetryDisposition>
@@ -849,6 +877,9 @@ const COORDINATION_DISPOSITIONS: Readonly<
   "navigator-thread-not-found": "retryable",
   "not-a-navigator-thread": "retryable",
   "proposal-not-found": "retryable",
+  // Nothing started, but the stale approval is not itself retryable: the owner
+  // must review and approve the refreshed markdown before another attempt.
+  "proposal-changed": "retryable",
   // `mayHaveStarted` is false and this is still not retryable: the run exists.
   "proposal-already-executed": "inspect-existing",
   "proposal-already-implemented": "retryable",

@@ -112,7 +112,11 @@ function hasOpenBlockingRequest(thread: {
  */
 function threadHasQueuedTurnStart(
   thread: {
-    readonly messages: ReadonlyArray<{ readonly role: string; readonly createdAt: string }>;
+    readonly messages: ReadonlyArray<{
+      readonly role: string;
+      readonly messageKind?: string | undefined;
+      readonly createdAt: string;
+    }>;
     readonly latestTurn: {
       readonly requestedAt: string;
       readonly startedAt: string | null;
@@ -124,7 +128,9 @@ function threadHasQueuedTurnStart(
 ): boolean {
   const latestUserMessageAtMs = thread.messages.reduce(
     (latest, message) =>
-      message.role === "user" ? Math.max(latest, Date.parse(message.createdAt)) : latest,
+      message.role === "user" && message.messageKind !== "record-only-owner-approval"
+        ? Math.max(latest, Date.parse(message.createdAt))
+        : latest,
     Number.NEGATIVE_INFINITY,
   );
   const latestTurnAtMs =
@@ -1165,14 +1171,52 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         proposedPlanId: command.proposedPlanId,
         runId: command.runId,
       });
-      return {
+
+      if (
+        command.approvalMessage !== undefined &&
+        command.approvalMessage.text.trim().length === 0
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "An Owner approval record cannot contain blank text.",
+        });
+      }
+
+      const approvalMessageEvent =
+        command.approvalMessage === undefined
+          ? null
+          : {
+              ...(yield* withEventBase({
+                aggregateKind: "thread",
+                aggregateId: command.threadId,
+                occurredAt: command.createdAt,
+                commandId: command.commandId,
+              })),
+              type: "thread.message-sent" as const,
+              payload: {
+                threadId: command.threadId,
+                messageId: command.approvalMessage.messageId,
+                role: "user" as const,
+                text: command.approvalMessage.text,
+                messageKind: "record-only-owner-approval" as const,
+                turnId: null,
+                streaming: false,
+                createdAt: command.approvalMessage.createdAt,
+                updatedAt: command.approvalMessage.createdAt,
+              },
+            };
+
+      const linkEvent = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
         })),
-        type: "thread.peer-loop-execution-linked",
+        ...(approvalMessageEvent === null
+          ? {}
+          : { causationEventId: approvalMessageEvent.eventId }),
+        type: "thread.peer-loop-execution-linked" as const,
         payload: {
           threadId: command.threadId,
           proposedPlanId: command.proposedPlanId,
@@ -1180,6 +1224,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           createdAt: command.createdAt,
         },
       };
+
+      return approvalMessageEvent === null ? linkEvent : [approvalMessageEvent, linkEvent];
     }
 
     case "thread.turn.diff.complete": {

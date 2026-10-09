@@ -1,22 +1,22 @@
 /**
  * Recognizing an owner's confirmation to execute the current proposal.
  *
- * DELIBERATELY NARROW, DETERMINISTIC, AND WHOLE-UTTERANCE. There is no model
- * here, no fuzzy match, no substring search and no sentiment. The composer text
- * is normalized and compared against a short closed list; anything that is not
- * exactly one of those phrases is ordinary conversation and goes to the
- * provider like every other message.
+ * Stage 2's retained fast path is deliberately narrow, deterministic, and
+ * whole-utterance. It is not the whole approval mechanism: stage 1 eligibility,
+ * known bare responses, the permissive candidate filter, schema-validated model
+ * traits, and armed authority are combined by `navigatorApprovalGate`.
  *
- * That narrowness is the safety property. "let's do it after we change the
- * database" is a discussion, not an authorization, and the difference between
- * the two is a Peer Loop run against a repository. A recognizer that tried to
- * be helpful about qualifications would be a recognizer that occasionally
- * launches work the owner was still thinking about.
+ * That narrowness remains a safety property for the bypass path. "let's do it
+ * after we change the database" is a discussion, not an authorization, and the
+ * difference between the two is a Peer Loop run against a repository. Natural
+ * language goes through trait classification and deterministic combination;
+ * the model describes traits and never chooses an outcome.
  *
  * WHAT THIS IS NOT: a second way to start a run. A recognized phrase is routed
  * into exactly the same `peerLoop.executeProposal` gate the Execute buttons
- * use, with exactly the same request. The objective is still the settled
- * proposal the server derives; the owner's words are never sent as one.
+ * use, with exactly the same request plus the exact consumed Owner utterance.
+ * The objective is still the settled proposal the server derives; the
+ * utterance is durable only if the server's atomic link command commits it.
  *
  * @module NavigatorConfirmation
  */
@@ -119,7 +119,12 @@ export const NAVIGATOR_CONFIRMATION_PHRASES: ReadonlyArray<string> = [
  */
 export type NavigatorSendRoute =
   | { readonly kind: "send" }
-  | { readonly kind: "execute"; readonly proposal: ExecutableProposal };
+  | {
+      readonly kind: "execute";
+      readonly proposal: ExecutableProposal;
+      /** Exact submitted text consumed as the action utterance. */
+      readonly ownerApprovalText: string;
+    };
 
 /** The existing path. Exported so a caller can return it without rebuilding it. */
 export const NAVIGATOR_SEND_ROUTE: NavigatorSendRoute = { kind: "send" };
@@ -158,7 +163,7 @@ export function routeNavigatorSend(input: {
   if (!input.availability.canExecute) return SEND;
   if (input.hasAttachments) return SEND;
   if (!isNavigatorExecutionConfirmation(input.text)) return SEND;
-  return { kind: "execute", proposal: input.proposal };
+  return { kind: "execute", proposal: input.proposal, ownerApprovalText: input.text };
 }
 
 /**
@@ -171,18 +176,18 @@ export function routeNavigatorSend(input: {
  *
  * The composer is cleared BEFORE the request, so the phrase is consumed as an
  * action rather than left sitting in the box where a second Enter would look
- * like a second confirmation. There is no fabricated provider message standing
- * in for it: the durable record of this action is the immutable proposal/run
- * link the server writes, and the child card that renders it.
+ * like a second confirmation. There is no fabricated provider or assistant
+ * message: the server records the Owner/user utterance only in the same atomic
+ * command that commits the immutable proposal/run link.
  */
 export async function consumeNavigatorConfirmation(input: {
   readonly route: NavigatorSendRoute;
   readonly clearComposer: () => void;
-  readonly execute: (proposal: ExecutableProposal) => Promise<unknown>;
+  readonly execute: (proposal: ExecutableProposal, ownerApprovalText: string) => Promise<unknown>;
 }): Promise<boolean> {
   if (input.route.kind !== "execute") return false;
   input.clearComposer();
-  await input.execute(input.route.proposal);
+  await input.execute(input.route.proposal, input.route.ownerApprovalText);
   return true;
 }
 
@@ -198,9 +203,9 @@ export async function consumeNavigatorConfirmation(input: {
  * callback and by each layout's disabled calculation, is what keeps those from
  * disagreeing again.
  *
- * Narrow on purpose: `allowsSubmitWithoutProvider` is true only for an exact,
- * eligible Navigator execution confirmation, which calls Peer Loop's own
- * operation and never needs this conversation's provider.
+ * Eligible Navigator gate candidates may submit without a conversation
+ * provider. The gate still has a mandatory SEND_TO_PROVIDER fallback, so an
+ * unavailable provider cannot turn classifier uncertainty into execution.
  */
 export function providerBlocksComposerSubmit(input: {
   readonly noProviderAvailable: boolean;

@@ -10,6 +10,7 @@
 import {
   CommandId,
   EventId,
+  MessageId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -123,7 +124,16 @@ const seedNavigatorThread = Effect.gen(function* () {
   });
 });
 
-const link = (runId: string, proposedPlanId: string, createdAt: string) =>
+const link = (
+  runId: string,
+  proposedPlanId: string,
+  createdAt: string,
+  approvalMessage?: {
+    readonly messageId: MessageId;
+    readonly text: string;
+    readonly createdAt: string;
+  },
+) =>
   Effect.gen(function* () {
     const engine = yield* OrchestrationEngineService;
     yield* engine.dispatch({
@@ -133,6 +143,7 @@ const link = (runId: string, proposedPlanId: string, createdAt: string) =>
       proposedPlanId,
       runId,
       createdAt,
+      ...(approvalMessage === undefined ? {} : { approvalMessage }),
     });
   });
 
@@ -249,6 +260,74 @@ it.layer(makeLayer("t3-peer-loop-link-roundtrip-"))("peer loop execution link", 
     }),
   );
 });
+
+it.layer(makeLayer("t3-peer-loop-link-record-only-"))(
+  "peer loop record-only Owner message",
+  (it) => {
+    it.effect("round-trips without starting a turn", () =>
+      Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const approvalText = "  Sí, procede con el plan.  ";
+
+        yield* seedNavigatorThread;
+        yield* link("run-record-only", "plan-1", LINKED_AT, {
+          messageId: MessageId.make("server:approval-roundtrip"),
+          text: approvalText,
+          createdAt: LINKED_AT,
+        });
+
+        const messageRows = yield* sql<{
+          readonly messageId: string;
+          readonly role: string;
+          readonly text: string;
+          readonly messageKind: string;
+          readonly turnId: string | null;
+        }>`
+          SELECT
+            message_id AS "messageId",
+            role,
+            text,
+            message_kind AS "messageKind",
+            turn_id AS "turnId"
+          FROM projection_thread_messages
+          WHERE message_id = 'server:approval-roundtrip'
+        `;
+        assert.deepStrictEqual(messageRows, [
+          {
+            messageId: "server:approval-roundtrip",
+            role: "user",
+            text: approvalText,
+            messageKind: "record-only-owner-approval",
+            turnId: null,
+          },
+        ]);
+
+        const detail = yield* snapshotQuery.getThreadDetailById(THREAD_ID);
+        assert.strictEqual(Option.isSome(detail), true);
+        if (Option.isSome(detail)) {
+          assert.deepStrictEqual(detail.value.messages, [
+            {
+              id: MessageId.make("server:approval-roundtrip"),
+              role: "user",
+              text: approvalText,
+              messageKind: "record-only-owner-approval",
+              turnId: null,
+              streaming: false,
+              createdAt: LINKED_AT,
+              updatedAt: LINKED_AT,
+            },
+          ]);
+          assert.strictEqual(detail.value.latestTurn, null);
+        }
+
+        const shellSnapshot = yield* snapshotQuery.getShellSnapshot();
+        const thread = shellSnapshot.threads.find((entry) => entry.id === THREAD_ID);
+        assert.strictEqual(thread?.latestUserMessageAt, null);
+      }),
+    );
+  },
+);
 
 it.layer(makeLayer("t3-peer-loop-link-delete-"))("peer loop execution link cleanup", (it) => {
   it.effect("drops association rows with the thread and nothing else", () =>

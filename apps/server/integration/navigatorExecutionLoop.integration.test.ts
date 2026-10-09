@@ -40,6 +40,7 @@ import {
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import { peerLoopProposalFingerprint } from "@t3tools/shared/peerLoopProposalFingerprint";
 
 import { NAVIGATOR_PROVIDER_FRAME } from "../src/orchestration/navigatorProviderFrame.ts";
 import { NAVIGATOR_CONTEXT_HEADING } from "../src/peerLoop/navigatorExecutionContextFormat.ts";
@@ -320,10 +321,13 @@ it.live("carries one proposal from conversation through execution to a finished 
 
       /* 2. Execute that exact proposal. --------------------------------------- */
 
+      const approvalText = "Sí, procede con el plan.";
       const executed = yield* harness.peerLoopExecutionCoordinator
         .executeProposal({
           threadId: NAVIGATOR_THREAD,
           proposedPlanId: plan.id,
+          proposalFingerprint: peerLoopProposalFingerprint(plan.planMarkdown),
+          ownerApprovalText: approvalText,
         })
         .pipe(Effect.orDie);
 
@@ -347,6 +351,14 @@ it.live("carries one proposal from conversation through execution to a finished 
       const link = linked.peerLoopExecutions[0]!;
       assert.equal(link.runId, RUN_ID);
       assert.equal(link.proposedPlanId, plan.id);
+      const approvalMessage = linked.messages.find(
+        (message) => message.messageKind === "record-only-owner-approval",
+      );
+      assert.equal(approvalMessage?.role, "user");
+      assert.equal(approvalMessage?.text, approvalText);
+      // Recording the approval emitted no turn-start request, so no provider
+      // call appeared between the proposal conversation and the next turn.
+      assert.equal(sentInputs(harness, NAVIGATOR_THREAD).length, 2);
 
       /* 4. Keep talking while the run works. ---------------------------------- */
 
@@ -509,7 +521,11 @@ it.live("explains an OWNER_REQUIRED run without offering to answer it", () =>
       const planId = withPlan.proposedPlans[0]!.id as OrchestrationProposedPlanId;
 
       yield* harness.peerLoopExecutionCoordinator
-        .executeProposal({ threadId: NAVIGATOR_THREAD, proposedPlanId: planId })
+        .executeProposal({
+          threadId: NAVIGATOR_THREAD,
+          proposedPlanId: planId,
+          proposalFingerprint: peerLoopProposalFingerprint(PLAN_MARKDOWN),
+        })
         .pipe(Effect.orDie);
       yield* harness.waitForThread(
         NAVIGATOR_THREAD,

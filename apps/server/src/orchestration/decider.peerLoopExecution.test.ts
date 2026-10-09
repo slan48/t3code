@@ -7,6 +7,7 @@
  */
 import {
   CommandId,
+  MessageId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -105,6 +106,10 @@ const linkCommand = (
     readonly threadId?: ThreadId;
     readonly proposedPlanId?: string;
     readonly runId?: string;
+    readonly approvalMessage?: Extract<
+      OrchestrationCommand,
+      { readonly type: "thread.peer-loop-execution.link" }
+    >["approvalMessage"];
   } = {},
 ): OrchestrationCommand => ({
   type: "thread.peer-loop-execution.link",
@@ -113,6 +118,9 @@ const linkCommand = (
   proposedPlanId: overrides.proposedPlanId ?? "plan-1",
   runId: overrides.runId ?? "run-1",
   createdAt: LINKED_AT,
+  ...(overrides.approvalMessage === undefined
+    ? {}
+    : { approvalMessage: overrides.approvalMessage }),
 });
 
 const isInvariantError = Schema.is(OrchestrationCommandInvariantError);
@@ -146,6 +154,48 @@ it.layer(NodeServices.layer)("linking a navigator proposal to a Peer Loop run", 
         });
         // An association and a timestamp. Nothing about the run itself.
         expect(Object.keys(event.payload).toSorted()).toEqual([
+          "createdAt",
+          "proposedPlanId",
+          "runId",
+          "threadId",
+        ]);
+      }
+    }),
+  );
+
+  it.effect("emits the record-only Owner message and link as one command result", () =>
+    Effect.gen(function* () {
+      const approvalMessage = {
+        messageId: MessageId.make("server:approval-1"),
+        text: "  Sí, procede con el plan.  ",
+        createdAt: LINKED_AT,
+      } as const;
+      const decided = yield* decideOrchestrationCommand({
+        command: linkCommand({ approvalMessage }),
+        readModel: makeReadModel([makeThread()]),
+      });
+      const events = Array.isArray(decided) ? decided : [decided];
+      expect(events).toHaveLength(2);
+      const message = events[0];
+      const link = events[1];
+      expect(message?.type).toBe("thread.message-sent");
+      if (message?.type === "thread.message-sent") {
+        expect(message.payload).toEqual({
+          threadId: NAVIGATOR_THREAD_ID,
+          messageId: approvalMessage.messageId,
+          role: "user",
+          text: approvalMessage.text,
+          messageKind: "record-only-owner-approval",
+          turnId: null,
+          streaming: false,
+          createdAt: approvalMessage.createdAt,
+          updatedAt: approvalMessage.createdAt,
+        });
+      }
+      expect(link?.type).toBe("thread.peer-loop-execution-linked");
+      if (link?.type === "thread.peer-loop-execution-linked") {
+        expect(link.causationEventId).toBe(message?.eventId);
+        expect(Object.keys(link.payload).toSorted()).toEqual([
           "createdAt",
           "proposedPlanId",
           "runId",

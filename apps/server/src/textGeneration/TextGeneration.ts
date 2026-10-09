@@ -1,12 +1,17 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ChatAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type {
+  ChatAttachment,
+  ModelSelection,
+  NavigatorApprovalTraits,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
-import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
+import { navigatorApprovalClassifierPreset } from "./TextGenerationPresets.ts";
 
 export type TextGenerationProvider = "codex" | "claudeAgent" | "cursor" | "grok" | "opencode";
 
@@ -73,6 +78,19 @@ export interface ThreadTitleGenerationResult {
   title: string;
 }
 
+export interface NavigatorApprovalClassificationInput {
+  cwd: string;
+  ownerUtterance: string;
+  planMarkdown: string;
+}
+
+/** Provider-internal form; the public facade supplies the fixed preset. */
+export interface NavigatorApprovalClassificationProviderInput extends NavigatorApprovalClassificationInput {
+  modelSelection: ModelSelection;
+}
+
+export type NavigatorApprovalClassificationResult = NavigatorApprovalTraits;
+
 export interface TextGenerationService {
   generateCommitMessage(
     input: CommitMessageGenerationInput,
@@ -80,6 +98,9 @@ export interface TextGenerationService {
   generatePrContent(input: PrContentGenerationInput): Promise<PrContentGenerationResult>;
   generateBranchName(input: BranchNameGenerationInput): Promise<BranchNameGenerationResult>;
   generateThreadTitle(input: ThreadTitleGenerationInput): Promise<ThreadTitleGenerationResult>;
+  classifyNavigatorApproval(
+    input: NavigatorApprovalClassificationInput,
+  ): Promise<NavigatorApprovalClassificationResult>;
 }
 
 /**
@@ -113,23 +134,44 @@ export class TextGeneration extends Context.Service<
     readonly generateThreadTitle: (
       input: ThreadTitleGenerationInput,
     ) => Effect.Effect<ThreadTitleGenerationResult, TextGenerationError>;
+
+    /** Classify owner-utterance traits against a Navigator proposal. */
+    readonly classifyNavigatorApproval: (
+      input: NavigatorApprovalClassificationInput,
+    ) => Effect.Effect<NavigatorApprovalClassificationResult, TextGenerationError>;
   }
 >()("t3/textGeneration/TextGeneration") {}
 
 /** @deprecated Use `TextGeneration["Service"]`. */
 export type TextGenerationShape = TextGeneration["Service"];
 
+/**
+ * Provider adapters receive the fixed classifier model selection from the
+ * facade. Keeping this separate prevents callers from supplying a
+ * thread-derived ModelSelection and prevents adapters from silently ignoring
+ * one.
+ */
+export type TextGenerationProviderService = Omit<
+  TextGeneration["Service"],
+  "classifyNavigatorApproval"
+> & {
+  readonly classifyNavigatorApproval: (
+    input: NavigatorApprovalClassificationProviderInput,
+  ) => Effect.Effect<NavigatorApprovalClassificationResult, TextGenerationError>;
+};
+
 type TextGenerationOp =
   | "generateCommitMessage"
   | "generatePrContent"
   | "generateBranchName"
-  | "generateThreadTitle";
+  | "generateThreadTitle"
+  | "classifyNavigatorApproval";
 
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
   operation: TextGenerationOp,
   instanceId: ProviderInstanceId,
-): Effect.Effect<ProviderInstance["textGeneration"], TextGenerationError> =>
+): Effect.Effect<TextGenerationProviderService, TextGenerationError> =>
   registry.getInstance(instanceId).pipe(
     Effect.flatMap((instance) =>
       instance
@@ -162,6 +204,19 @@ export const makeTextGenerationFromRegistry = (
     generateThreadTitle: (input) =>
       resolveInstance(registry, "generateThreadTitle", input.modelSelection.instanceId).pipe(
         Effect.flatMap((textGeneration) => textGeneration.generateThreadTitle(input)),
+      ),
+    classifyNavigatorApproval: (input) =>
+      resolveInstance(
+        registry,
+        "classifyNavigatorApproval",
+        navigatorApprovalClassifierPreset.modelSelection.instanceId,
+      ).pipe(
+        Effect.flatMap((textGeneration) =>
+          textGeneration.classifyNavigatorApproval({
+            ...input,
+            modelSelection: navigatorApprovalClassifierPreset.modelSelection,
+          }),
+        ),
       ),
   });
 

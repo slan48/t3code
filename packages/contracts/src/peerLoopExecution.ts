@@ -3,10 +3,18 @@
  *
  * This is the contract for a *coordination* operation, not a second way to
  * start a run. `peerLoop.startRun` still exists and still takes a project path
- * and an objective; this one takes a thread and a proposal, and the server
- * derives everything else from its own read model. That is the whole point:
- * the objective is the proposal the owner already agreed to, and a client
- * cannot substitute a different one.
+ * and an objective; this one takes a thread, a proposal id and the exact
+ * markdown fingerprint the owner approved, and the server derives everything
+ * else from its own read model. That is the whole point: the objective is the
+ * proposal the owner already agreed to, and a client cannot substitute a
+ * different one or reuse approval for a changed proposal.
+ *
+ * WHAT A CLIENT DELIBERATELY SENDS:
+ *
+ *   - `threadId`, `proposedPlanId` and `proposalFingerprint` — the last is
+ *     computed from the exact markdown the owner reviewed;
+ *   - optional `ownerApprovalText` — the exact composer utterance, which the
+ *     server records only as part of the atomic execution-link command;
  *
  * WHAT A CLIENT DELIBERATELY CANNOT SEND:
  *
@@ -31,6 +39,20 @@ import { OrchestrationPeerLoopExecution, OrchestrationProposedPlanId } from "./o
 import { PeerLoopOwnerMessageResult, PeerLoopStartResult } from "./peerLoop.ts";
 
 /**
+ * Hard bound for an exact Owner utterance recorded with an action-originated
+ * execution. The value is validated without trimming so the durable timeline
+ * preserves exactly what the Owner submitted.
+ */
+export const PEER_LOOP_OWNER_APPROVAL_TEXT_MAX_CHARS = 8_000;
+
+const PeerLoopOwnerApprovalText = Schema.String.check(
+  Schema.isMaxLength(PEER_LOOP_OWNER_APPROVAL_TEXT_MAX_CHARS),
+  Schema.makeFilter((value) =>
+    value.trim().length > 0 ? undefined : "Owner approval text must not be blank.",
+  ),
+);
+
+/**
  * The opaque name of one owner decision.
  *
  * Lower-case hex of a bounded length, and nothing else: a client cannot smuggle
@@ -45,13 +67,35 @@ export const PeerLoopDecisionFingerprint = Schema.String.check(
 );
 export type PeerLoopDecisionFingerprint = typeof PeerLoopDecisionFingerprint.Type;
 
+/**
+ * The opaque name of the exact markdown approved for one execution proposal.
+ *
+ * Kept separate from the owner-decision fingerprint: these bind different
+ * operations to different source text, even though both use the same bounded
+ * lowercase-hex representation.
+ */
+const PROPOSAL_FINGERPRINT_PATTERN = /^[0-9a-f]{32}$/u;
+
+export const PeerLoopProposalFingerprint = Schema.String.check(
+  Schema.isPattern(PROPOSAL_FINGERPRINT_PATTERN),
+);
+export type PeerLoopProposalFingerprint = typeof PeerLoopProposalFingerprint.Type;
+
 export const PeerLoopExecuteProposalInput = Schema.Struct({
   /** The Navigator thread the proposal lives on. */
   threadId: ThreadId,
   proposedPlanId: OrchestrationProposedPlanId,
+  /** The exact markdown the owner approved, fingerprinted by the client. */
+  proposalFingerprint: PeerLoopProposalFingerprint,
+  /**
+   * Optional exact Owner utterance for the composer action path. The server
+   * records this only if the linked execution command commits; it never starts
+   * a provider turn for this text.
+   */
+  ownerApprovalText: Schema.optional(PeerLoopOwnerApprovalText),
   /** Peer Loop's own optional iteration bound, forwarded untouched. */
   safetyLimit: Schema.optional(PositiveInt),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type PeerLoopExecuteProposalInput = typeof PeerLoopExecuteProposalInput.Type;
 
 /**
@@ -91,6 +135,8 @@ export const PEER_LOOP_EXECUTION_FAILURE_REASONS = [
   "project-not-found",
   /** The read model could not be read. Nothing was started. */
   "coordination-failed",
+  /** The proposal changed after the supplied owner approval. Nothing started. */
+  "proposal-changed",
   /** The run started and the link could not be confirmed. See `runId`. */
   "link-not-confirmed",
 ] as const;

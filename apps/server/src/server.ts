@@ -47,6 +47,7 @@ import * as AgentRunsService from "./agentRuns/Service.ts";
 import * as PeerLoopExecutionCoordinator from "./peerLoop/ExecutionCoordinator.ts";
 import * as PeerLoopOwnerDecisionCoordinator from "./peerLoop/OwnerDecisionCoordinator.ts";
 import * as NavigatorExecutionContext from "./peerLoop/NavigatorExecutionContext.ts";
+import * as NavigatorApprovalClassificationCoordinator from "./navigatorApproval/ClassificationCoordinator.ts";
 import * as PeerLoopService from "./peerLoop/Service.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -393,6 +394,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
       PeerLoopExecutionCoordinator.layer,
       PeerLoopOwnerDecisionCoordinator.layer,
       NavigatorExecutionContext.layer,
+      NavigatorApprovalClassificationCoordinator.layer,
       ServerSettingsLayerLive,
     ),
   ),

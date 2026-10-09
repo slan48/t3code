@@ -172,6 +172,8 @@ describe("ProviderCommandReactor", () => {
     readonly peerLoopUnreadable?: ReadonlyArray<string>;
     /** Durable snapshots by run id, for the read-only `attachRun`. */
     readonly peerLoopSnapshots?: Readonly<Record<string, PeerLoopRunStateFile | "fail">>;
+    /** Make the first provider send fail, then allow later sends. */
+    readonly failFirstSendTurn?: boolean;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -253,12 +255,23 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
-    const sendTurn = vi.fn((_: unknown) =>
-      Effect.succeed({
+    let sendTurnAttempts = 0;
+    const sendTurn = vi.fn((_: unknown) => {
+      sendTurnAttempts += 1;
+      if (input?.failFirstSendTurn === true && sendTurnAttempts === 1) {
+        return Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: "codex",
+            method: "thread.turn.start",
+            detail: "injected provider send failure",
+          }),
+        );
+      }
+      return Effect.succeed({
         threadId: ThreadId.make("thread-1"),
         turnId: asTurnId("turn-1"),
-      }),
-    );
+      });
+    });
     const interruptTurn = vi.fn((_: unknown) => Effect.void);
     const respondToRequest = vi.fn<ProviderServiceShape["respondToRequest"]>(() => Effect.void);
     const respondToUserInput = vi.fn<ProviderServiceShape["respondToUserInput"]>(() => Effect.void);
@@ -2977,6 +2990,230 @@ describe("ProviderCommandReactor", () => {
      * the orchestration read model stored.
      */
     const OWNER_TEXT = "Compare the two migration approaches for me.";
+
+    it("keeps a record-only approval in history without creating a provider turn", async () => {
+      const harness = await createHarness({ threadPurpose: "navigator" });
+      const now = "2026-01-01T00:00:00.000Z";
+      const approvalText = "Sí, procede con el plan.";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.proposed-plan.upsert",
+          commandId: CommandId.make("cmd-record-only-plan"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlan: {
+            id: "plan-record-only" as never,
+            turnId: null,
+            planMarkdown: "# Execute this",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.peer-loop-execution.link",
+          commandId: CommandId.make("cmd-record-only-link"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlanId: "plan-record-only" as never,
+          runId: "run-record-only",
+          createdAt: now,
+          approvalMessage: {
+            messageId: asMessageId("server:provider-history-approval"),
+            text: approvalText,
+            createdAt: now,
+          },
+        }),
+      );
+
+      // The compound link event has no turn-started event, so the provider is
+      // untouched while the visible Owner message is projected.
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      let readModel = await harness.readModel();
+      let thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      expect(thread?.latestTurn).toBeNull();
+      expect(thread?.messages.map((message) => message.text)).toEqual([approvalText]);
+      expect(thread?.messages[0]?.messageKind).toBe("record-only-owner-approval");
+
+      const laterText = "Now compare the rollout risks.";
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-later-provider-turn"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("provider-history-later-turn"),
+            role: "user",
+            text: laterText,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      const providerInput = sent?.input ?? "";
+      expect(providerInput).toContain(approvalText);
+      expect(providerInput).toContain(laterText);
+      expect(providerInput.indexOf(approvalText)).toBeLessThan(providerInput.indexOf(laterText));
+      expect(providerInput).not.toContain("Perfecto, comienzo con Peer Loop.");
+
+      readModel = await harness.readModel();
+      thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+      const history = thread?.messages.map((message) => message.text) ?? [];
+      expect(history).toHaveLength(2);
+      expect(history).toEqual(expect.arrayContaining([approvalText, laterText]));
+      expect(thread?.messages.some((message) => message.role === "user")).toBe(true);
+    });
+
+    it("sends multiple durable approvals in read-model order", async () => {
+      const harness = await createHarness({ threadPurpose: "navigator" });
+      const now = "2026-01-01T00:00:00.000Z";
+      const approvals = ["Sí, procede con el primer plan.", "Vale, ejecuta la revisión."];
+
+      for (const [index, approvalText] of approvals.entries()) {
+        const planId = `plan-record-only-${index}`;
+        await harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.proposed-plan.upsert",
+            commandId: CommandId.make(`cmd-record-only-plan-${index}`),
+            threadId: ThreadId.make("thread-1"),
+            proposedPlan: {
+              id: planId as never,
+              turnId: null,
+              planMarkdown: `# Execute ${index}`,
+              implementedAt: null,
+              implementationThreadId: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+            createdAt: now,
+          }),
+        );
+        await harness.runEffect(
+          harness.engine.dispatch({
+            type: "thread.peer-loop-execution.link",
+            commandId: CommandId.make(`cmd-record-only-link-${index}`),
+            threadId: ThreadId.make("thread-1"),
+            proposedPlanId: planId as never,
+            runId: `run-record-only-${index}`,
+            createdAt: now,
+            approvalMessage: {
+              messageId: asMessageId(`server:provider-history-approval-${index}`),
+              text: approvalText,
+              createdAt: now,
+            },
+          }),
+        );
+      }
+
+      const currentText = "Compare those two completed approvals.";
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-later-provider-turn-multiple-history"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("provider-history-multiple-later-turn"),
+            role: "user",
+            text: currentText,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+      const sent = harness.sendTurn.mock.calls[0]?.[0] as { readonly input?: string } | undefined;
+      const providerInput = sent?.input ?? "";
+      expect(providerInput.indexOf(approvals[0] ?? "")).toBeLessThan(
+        providerInput.indexOf(approvals[1] ?? ""),
+      );
+      expect(providerInput.indexOf(approvals[1] ?? "")).toBeLessThan(
+        providerInput.lastIndexOf(currentText),
+      );
+      expect(providerInput).not.toContain("Perfecto, comienzo con Peer Loop.");
+    });
+
+    it("re-derives approval history after a provider send failure", async () => {
+      const harness = await createHarness({
+        threadPurpose: "navigator",
+        failFirstSendTurn: true,
+      });
+      const now = "2026-01-01T00:00:00.000Z";
+      const approvalText = "Sí, procede con el plan.";
+
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.proposed-plan.upsert",
+          commandId: CommandId.make("cmd-record-only-retry-plan"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlan: {
+            id: "plan-record-only-retry" as never,
+            turnId: null,
+            planMarkdown: "# Retry context",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      await harness.runEffect(
+        harness.engine.dispatch({
+          type: "thread.peer-loop-execution.link",
+          commandId: CommandId.make("cmd-record-only-retry-link"),
+          threadId: ThreadId.make("thread-1"),
+          proposedPlanId: "plan-record-only-retry" as never,
+          runId: "run-record-only-retry",
+          createdAt: now,
+          approvalMessage: {
+            messageId: asMessageId("server:provider-history-retry-approval"),
+            text: approvalText,
+            createdAt: now,
+          },
+        }),
+      );
+
+      const dispatchTurn = (commandId: string, messageId: string, text: string) =>
+        harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(commandId),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId(messageId),
+            role: "user",
+            text,
+            attachments: [],
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        });
+
+      await harness.runEffect(dispatchTurn("cmd-provider-fails", "provider-fails", "First try"));
+      await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+      await harness.runEffect(
+        dispatchTurn("cmd-provider-retries", "provider-retries", "Second try"),
+      );
+      await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+
+      const retryInput = (
+        harness.sendTurn.mock.calls[1]?.[0] as { readonly input?: string } | undefined
+      )?.input;
+      expect(retryInput).toContain(approvalText);
+      expect(retryInput).toContain("Second try");
+      expect(retryInput).not.toContain("Perfecto, comienzo con Peer Loop.");
+    });
 
     it("frames the provider message while persisting the owner's text unchanged", async () => {
       const harness = await createHarness({ threadPurpose: "navigator" });

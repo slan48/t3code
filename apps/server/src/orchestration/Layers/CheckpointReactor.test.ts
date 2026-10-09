@@ -275,6 +275,7 @@ describe("CheckpointReactor", () => {
   async function createHarness(options?: {
     readonly hasSession?: boolean;
     readonly seedFilesystemCheckpoints?: boolean;
+    readonly threadPurpose?: "coding" | "navigator";
     readonly projectWorkspaceRoot?: string;
     readonly threadWorktreePath?: string | null;
     readonly threadBranch?: string | null;
@@ -308,6 +309,8 @@ describe("CheckpointReactor", () => {
     const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
       prefix: "t3-checkpoint-reactor-test-",
     });
+    const threadWorktreePath =
+      options?.threadWorktreePath !== undefined ? options.threadWorktreePath : cwd;
     const vcsStatusBroadcasterLayer = Layer.succeed(VcsStatusBroadcaster, {
       getStatus: () => Effect.die("getStatus should not be called in this test"),
       refreshLocalStatus: (cwd: string) =>
@@ -381,15 +384,16 @@ describe("CheckpointReactor", () => {
           threadId: ThreadId.make("thread-1"),
           projectId: asProjectId("project-1"),
           title: "Thread",
-          purpose: "coding",
+          purpose: options?.threadPurpose ?? "coding",
           modelSelection: {
             instanceId: ProviderInstanceId.make("codex"),
             model: "gpt-5-codex",
           },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          interactionMode:
+            options?.threadPurpose === "navigator" ? "plan" : DEFAULT_PROVIDER_INTERACTION_MODE,
           runtimeMode: "approval-required",
           branch: options?.threadBranch ?? null,
-          worktreePath: options?.threadWorktreePath ?? cwd,
+          worktreePath: options?.threadPurpose === "navigator" ? null : threadWorktreePath,
           createdAt,
         })
         .pipe(
@@ -409,7 +413,7 @@ describe("CheckpointReactor", () => {
                   interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
                   runtimeMode: "approval-required",
                   branch: null,
-                  worktreePath: options?.threadWorktreePath ?? cwd,
+                  worktreePath: threadWorktreePath,
                   createdAt,
                 }),
               )
@@ -842,6 +846,54 @@ describe("CheckpointReactor", () => {
         "README.md",
       ),
     ).toBe("v1\n");
+  });
+
+  it("does not capture a pre-turn baseline for a record-only Owner approval", async () => {
+    const harness = await createHarness({
+      hasSession: false,
+      seedFilesystemCheckpoints: false,
+      threadWorktreePath: null,
+      threadPurpose: "navigator",
+    });
+    const createdAt = "2026-01-01T00:00:00.000Z";
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.proposed-plan.upsert",
+        commandId: CommandId.make("cmd-proposal-for-record-only"),
+        threadId: ThreadId.make("thread-1"),
+        proposedPlan: {
+          id: "plan-record-only",
+          turnId: null,
+          planMarkdown: "# plan",
+          implementedAt: null,
+          implementationThreadId: null,
+          createdAt,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      }),
+    );
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.peer-loop-execution.link",
+        commandId: CommandId.make("cmd-record-only-link"),
+        threadId: ThreadId.make("thread-1"),
+        proposedPlanId: "plan-record-only",
+        runId: "run-record-only",
+        createdAt,
+        approvalMessage: {
+          messageId: MessageId.make("server:record-only-checkpoint"),
+          text: "Sí, procede con el plan.",
+          createdAt,
+        },
+      }),
+    );
+
+    await harness.drain();
+    expect(
+      gitRefExists(harness.cwd, checkpointRefForThreadTurn(ThreadId.make("thread-1"), 0)),
+    ).toBe(false);
   });
 
   it("captures turn completion checkpoint from project workspace root when provider session cwd is unavailable", async () => {
